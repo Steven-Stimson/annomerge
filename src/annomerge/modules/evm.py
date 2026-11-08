@@ -327,11 +327,15 @@ def _evm_run_one(genome_fa: Path, combined: Path, evidence: dict,
     return out
 
 
-def miniprot_to_protein_gff(miniprot_gff: Path, out_gff3: Path) -> Path:
+def miniprot_to_protein_gff(miniprot_gff: Path, out_gff3: Path,
+                            membership: dict | None = None) -> Path:
     """Convert miniprot mRNA/CDS GFF3 to EVM PROTEIN evidence (match/match_part).
-
     Protein coordinates per match_part are reconstructed from CDS order and
     phase (approximation, sufficient for EVM weighting).
+
+    membership: protein id -> homolog set label. When provided (multi-set
+    homolog input), each evidence line's source becomes 'miniprot_<label>'
+    so EVM can weight each set separately via the weights file.
     """
     if lazy([out_gff3], desc="miniprot->EVM protein gff"):
         return out_gff3
@@ -357,7 +361,6 @@ def miniprot_to_protein_gff(miniprot_gff: Path, out_gff3: Path) -> Path:
                 if m and m.group(1) in feats:
                     feats[m.group(1)]["cds"].append(
                         (int(f[3]), int(f[4]), int(f[7]) if f[7] != "." else 0))
-
     n_match = 0
     with open(out_gff3, "w") as out:
         out.write("##gff-version 3\n")
@@ -371,27 +374,37 @@ def miniprot_to_protein_gff(miniprot_gff: Path, out_gff3: Path) -> Path:
                 aa = (e - s + 1 - (phase if i == 0 else 0)) // 3
                 parts.append((s, e, ppos, ppos + max(aa, 1) - 1))
                 ppos += max(aa, 1)
-            out.write(f"{r['seqid']}\tminiprot\tmatch\t{r['s']}\t{r['e']}\t.\t"
+            label = membership.get(r["prot"]) if membership else None
+            src = f"miniprot_{label}" if label else "miniprot"
+            out.write(f"{r['seqid']}\t{src}\tmatch\t{r['s']}\t{r['e']}\t.\t"
                       f"{r['strand']}\t.\tID={mid}.match;Name={r['prot']};"
                       f"Target={r['prot']} 1 {r['plen']}\n")
             for j, (s, e, ps, pe) in enumerate(parts):
                 # EVM requires ID= on EVERY evidence line; Parent= links children
-                out.write(f"{r['seqid']}\tminiprot\tmatch_part\t{s}\t{e}\t.\t"
+                out.write(f"{r['seqid']}\t{src}\tmatch_part\t{s}\t{e}\t.\t"
                           f"{r['strand']}\t.\tID={mid}.part{j};"
                           f"Parent={mid}.match;Target={r['prot']} {ps} {pe}\n")
             n_match += 1
-    log.info("EVM protein evidence: %d matches", n_match)
+    log.info("EVM protein evidence: %d matches (%s)", n_match,
+             "per-set sources" if membership else "single source")
     return out_gff3
 
 
 # ---------------------------------------------------------------- weights + run
-
 def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
             stringtie_gtf: Path, miniprot_gff: Path, goldset_dir: Path,
             threads: int, min_intron: int = 20,
             w_gold: int = 10, w_transcript: int = 8, w_protein: int = 6,
-            evm_parts: int = 1) -> dict:
-    """preds: {name: (gff3_path, evm_weight)} — already filtered by scoring."""
+            evm_parts: int = 1,
+            protein_set_weights: dict | None = None,
+            protein_membership: dict | None = None) -> dict:
+    """preds: {name: (gff3_path, evm_weight)} — already filtered by scoring.
+
+    protein_set_weights: {label: weight} — when given with >1 entries, the
+    protein evidence carries per-set sources 'miniprot_<label>' (via
+    protein_membership: {protein: label}) and the weights file gets one
+    PROTEIN line per set, so closer relatives count more inside EVM.
+    """
     d = ensure_dir(evm_dir)
     log.info("module 4/5 [evm]: %d predictions + transcripts + proteins + goldset",
              len(preds))
@@ -410,9 +423,11 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
         g = lift_goldset(goldset_dir, stringtie_gtf, d, d / "goldset.genome.gff3",
                          genome_fa=vi.genome)
         evidence["goldset"] = rewrite_source(g, "goldset", d / "goldset.src.gff3")
+    multi = protein_set_weights and len(protein_set_weights) > 1
     if miniprot_gff and Path(miniprot_gff).exists():
         evidence["miniprot"] = miniprot_to_protein_gff(
-            Path(miniprot_gff), d / "protein.gff3")
+            Path(miniprot_gff), d / "protein.gff3",
+            membership=protein_membership if multi else None)
     pred_files = {}
     for name, (gff, w) in preds.items():
         pred_files[name] = (rewrite_source(Path(gff), name, d / f"pred.{name}.gff3"), w)
@@ -426,7 +441,10 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
         lines.append(f"ABINITIO_PREDICTION\tgoldset\t{w_gold}")
     if "stringtie" in evidence:
         lines.append(f"TRANSCRIPT\tstringtie\t{w_transcript}")
-    if "miniprot" in evidence:
+    if multi:
+        for label, w in protein_set_weights.items():
+            lines.append(f"PROTEIN\tminiprot_{label}\t{w}")
+    elif "miniprot" in evidence:
         lines.append(f"PROTEIN\tminiprot\t{w_protein}")
     wfile.write_text("\n".join(lines) + "\n")
     log.info("weights:\n%s", wfile.read_text().strip())

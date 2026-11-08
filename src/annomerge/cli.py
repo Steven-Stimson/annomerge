@@ -95,7 +95,7 @@ def _run_evidence_pipeline(
 def merge(
     genome: Optional[str] = typer.Option(None, "-g", help="MANDATORY (unless -c): reference genome FASTA"),
     predictors: Optional[str] = typer.Option(None, "-P", help="MANDATORY (unless -c): de novo predictions, name=path comma list"),
-    homologs: Optional[str] = typer.Option(None, "-p", help="MANDATORY (unless -c): homolog protein FASTA, comma list OK (header: >id|species=Genus_species; multiple files cached merged under outdir/input/)"),
+    homologs: Optional[str] = typer.Option(None, "-p", help="MANDATORY (unless -c): homolog protein FASTA, 'label=path' comma list OK (e.g. -p near=near.pep,far=far.fa; unlabeled -> filename stem). headers: >id|species=Genus_species. Multiple sets get per-set miniprot runs + relatedness-weighted evidence"),
     rna_list: Optional[str] = typer.Option(None, "-r", help="RNA list file (fastq/bam/gtf tags)"),
     bam: Optional[str] = typer.Option(None, "--bam", help="sorted+indexed RNA-seq BAM(s), comma list"),
     transcripts: Optional[str] = typer.Option(None, "--transcripts", help="StringTie transcripts GTF/GFF"),
@@ -232,6 +232,15 @@ def merge(
     hom_res = results.get("homolog") or {}
     rna_res = results.get("rna") or {}
     from .modules.evm import run_evm
+    # homolog-set relatedness weights: per-set EVM protein evidence weights and
+    # per-protein weights for confidence assessment (multi-set homolog input)
+    set_w = hom_res.get("set_weights") or {}
+    membership = hom_res.get("membership") or {}
+    multi = len(set_w) > 1
+    protein_evm_weights = ({lab: max(1, min(12, round(w_protein_evm * w)))
+                            for lab, w in set_w.items()} if multi else None)
+    protein_weights = ({p: set_w.get(lab, 1.0) for p, lab in membership.items()}
+                       if multi else None)
     evm_res = run_evm(
         vi, out / "06.merge", evm_preds,
         stringtie_gtf=stringtie_gtf,
@@ -239,7 +248,9 @@ def merge(
         goldset_dir=goldset_dir,
         threads=threads, min_intron=min_intron_evm,
         w_gold=w_gold_evm, w_transcript=w_transcript_evm, w_protein=w_protein_evm,
-        evm_parts=(evm_parts if evm_parts > 0 else threads))
+        evm_parts=(evm_parts if evm_parts > 0 else threads),
+        protein_set_weights=protein_evm_weights,
+        protein_membership=membership if multi else None)
     integ_gff3 = evm_res["evm_gff3"]
     integ_gff3 = evm_res["evm_gff3"]
     integ_d = out / "06.merge"
@@ -299,7 +310,8 @@ def merge(
         final_d / "goldset.genome.gff3" if (final_d / "goldset.genome.gff3").exists()
         else integ_d / "goldset.genome.gff3",
         final_d / "sanity_filter.tsv",
-        assess_d / "confidence.tsv")
+        assess_d / "confidence.tsv",
+        protein_weights=protein_weights)
     typer.secho(f"confidence tiers: {conf_stats or 'skipped (exists)'}", fg="green")
     # module 7/8: report (run summary + stats + completeness + accuracy + charts)
     import shlex, sys

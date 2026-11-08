@@ -228,11 +228,19 @@ def _diamond_blastp(query: Path, db_faa: Path, out_tsv: Path, threads: int,
     return out_tsv
 
 
-def full_length_match_rate(blast_tsv: Path, min_cov: float = 0.9) -> tuple[float, set, dict]:
-    """Fraction of query proteins with >=1 hit satisfying bidirectional coverage."""
+def full_length_match_rate(blast_tsv: Path, min_cov: float = 0.9,
+                           subject_weights: dict | None = None) -> tuple[float, set, dict]:
+    """Fraction of query proteins with >=1 hit satisfying bidirectional coverage.
+
+    subject_weights: {subject_id: weight} — relatedness weights of homolog
+    sets (0.5-2.0). When given, each matched query contributes
+    weight(subject)/2 (so support from the closest possible set = 1.0 and
+    the score stays in [0,1]); unmatched contribute 0.
+    """
     qtotal = set()
     matched = set()
     hits: dict[str, list] = {}
+    wsum = 0.0
     with open(blast_tsv) as fh:
         for line in fh:
             f = line.rstrip("\n").split("\t")
@@ -246,20 +254,31 @@ def full_length_match_rate(blast_tsv: Path, min_cov: float = 0.9) -> tuple[float
                 "qlen": int(f[4]), "slen": int(f[5]),
                 "qcov": qcov, "scov": scov,
             })
-            if qcov >= min_cov and scov >= min_cov:
+            if qcov >= min_cov and scov >= min_cov and q not in matched:
                 matched.add(q)
-    rate = len(matched) / len(qtotal) if qtotal else None
+                if subject_weights:
+                    wsum += subject_weights.get(s, 1.0) / 2.0
+    if not qtotal:
+        rate = None
+    elif subject_weights:
+        rate = wsum / len(qtotal)
+    else:
+        rate = len(matched) / len(qtotal)
     return rate, matched, hits
 
 
 def compute_hs(pred_faa: Path, referee_faa: Path, gold_faa: Path | None,
                out_dir: Path, threads: int, full_cov: float,
-               gold_weight: float = 0.5) -> dict:
+               gold_weight: float = 0.5,
+               subject_weights: dict | None = None) -> dict:
+    """H_s: full-length match rate vs referee set (relatedness-weighted when
+    subject_weights given: support from closer homolog sets counts more).
+    The gold-set component is never weighted (same-genome proteins)."""
     hs_dir = ensure_dir(out_dir)
     out = {}
     tsv = _diamond_blastp(pred_faa, referee_faa, hs_dir / "pred_vs_referee.tsv",
                           threads, hs_dir)
-    hs_hom, matched, hits = full_length_match_rate(tsv, full_cov)
+    hs_hom, matched, hits = full_length_match_rate(tsv, full_cov, subject_weights)
     out["Hs_homolog"] = hs_hom
     out["n_fullmatch_referee"] = len(matched)
 
@@ -301,7 +320,8 @@ def compute_bc(pred_faa: Path, busco_path: Path, out_dir: Path, threads: int) ->
 # ---------------------------------------------------------------- C_s
 
 def compute_cs(pred_faa: Path, blast_tsv: Path, referee_loci: dict[str, tuple],
-               min_seg_cov: float = 0.25, locus_gap: int = 1_000_000) -> dict:
+               min_seg_cov: float = 0.25, locus_gap: int = 1_000_000,
+               subject_weights: dict | None = None) -> dict:
     """C_s = 1 - r_anomaly.  Anomalies from homolog-hit patterns:
       chimeric: one predicted protein hits >=2 referee proteins whose genomic
                 loci are non-adjacent, each covering a distinct query segment
@@ -309,7 +329,11 @@ def compute_cs(pred_faa: Path, blast_tsv: Path, referee_loci: dict[str, tuple],
                 same referee protein
     blast_tsv: pred_vs_referee.tsv (outfmt with qstart/qend/sstart/send/qlen/slen).
     referee_loci: {referee_id: (seqid, start, end)} from homolog alignments.
+    subject_weights: relatedness weights of homolog sets; an anomaly supported
+    only by distant sets counts less (weight/2 normalization, in [0,1]).
     """
+    def sw(s: str) -> float:
+        return (subject_weights.get(s, 1.0) / 2.0) if subject_weights else 1.0
     by_query: dict[str, dict[str, dict]] = {}
     by_subject: dict[str, dict[str, dict]] = {}
     n_pred = 0
@@ -334,7 +358,8 @@ def compute_cs(pred_faa: Path, blast_tsv: Path, referee_loci: dict[str, tuple],
     def overlap(a0, a1, b0, b1):
         return max(0, min(a1, b1) - max(a0, b0))
 
-    chimeric, split_genes = set(), set()
+    chimeric: dict[str, float] = {}
+    split_genes: dict[str, float] = {}
     for q, subs in by_query.items():
         # distinct subjects covering distinct query segments
         good = [(s, r) for s, r in subs.items()
@@ -347,7 +372,9 @@ def compute_cs(pred_faa: Path, blast_tsv: Path, referee_loci: dict[str, tuple],
                     continue  # same segment -> alternative homolog, not chimera
                 l1, l2 = referee_loci[s1], referee_loci[s2]
                 if l1[0] != l2[0] or abs(l1[1] - l2[1]) > locus_gap:
-                    chimeric.add(q)
+                    w = min(sw(s1), sw(s2))
+                    if w > chimeric.get(q, 0.0):
+                        chimeric[q] = w
     for s, qs in by_subject.items():
         good = [(q, r) for q, r in qs.items()
                 if (r["se"] - r["ss"]) / r["slen"] >= min_seg_cov]
@@ -356,10 +383,18 @@ def compute_cs(pred_faa: Path, blast_tsv: Path, referee_loci: dict[str, tuple],
                 (q1, r1), (q2, r2) = good[i], good[j]
                 seg_ov = overlap(r1["ss"], r1["se"], r2["ss"], r2["se"])
                 if seg_ov < 0.1 * max(r1["se"] - r1["ss"], r2["se"] - r2["ss"]):
-                    split_genes.update((q1, q2))
+                    for q in (q1, q2):
+                        if sw(s) > split_genes.get(q, 0.0):
+                            split_genes[q] = sw(s)
 
-    anomalous = chimeric | split_genes
-    r_anom = len(anomalous) / n_pred if n_pred else None
+    anomalous = dict(chimeric)
+    for q, w in split_genes.items():
+        if w > anomalous.get(q, 0.0):
+            anomalous[q] = w
+    if subject_weights:
+        r_anom = min(1.0, sum(anomalous.values()) / n_pred) if n_pred else None
+    else:
+        r_anom = len(anomalous) / n_pred if n_pred else None
     return {
         "C_s": (1 - r_anom) if r_anom is not None else None,
         "r_anomaly": r_anom,
@@ -371,10 +406,15 @@ def compute_cs(pred_faa: Path, blast_tsv: Path, referee_loci: dict[str, tuple],
 def load_referee_loci(alignments_tsv: Path) -> dict[str, tuple]:
     loci = {}
     with open(alignments_tsv) as fh:
-        next(fh)
+        header = next(fh).rstrip("\n").split("\t")
+        # column lookup by name (robust to schema additions like 'set')
+        ci = {name: i for i, name in enumerate(header)}
+        i_t, i_s, i_e = ci.get("target", 7), ci.get("tstart", 8), ci.get("tend", 9)
         for line in fh:
             f = line.rstrip("\n").split("\t")
-            loci[f[0]] = (f[6], int(f[7]), int(f[8]))
+            if len(f) <= max(i_t, i_s, i_e):
+                continue
+            loci[f[0]] = (f[i_t], int(f[i_s]), int(f[i_e]))
     return loci
 
 
@@ -454,6 +494,17 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
     detail: dict = {"predictor": name, "gff": str(gff)}
     sub: dict[str, float | None] = {}
 
+    # relatedness weights of homolog sets: protein id -> weight (multi-set
+    # homolog input only; single set stays unweighted legacy behavior)
+    hom_ev = evidence.get("homolog") or {}
+    subject_weights = cfg.get("subject_weights")
+    if subject_weights is None and len(hom_ev.get("set_weights") or {}) > 1:
+        mem = hom_ev.get("membership") or {}
+        subject_weights = {p: hom_ev["set_weights"].get(lab, 1.0)
+                           for p, lab in mem.items()}
+    if subject_weights:
+        detail["H_s_weighted"] = True
+
     # ---- R_s
     if "rna" in ablate or not evidence.get("rna"):
         sub["R_s"] = None
@@ -474,7 +525,8 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
                                           out_root / "_shared" / "referee.faa")
         gold_faa = evidence.get("goldset", {}).get("goldset_faa") if evidence.get("goldset") else None
         h = compute_hs(pred_faa, referee_faa, gold_faa, pdir / "hs", threads,
-                       cfg["fulllength_cov"], cfg["hs_gold_weight"])
+                       cfg["fulllength_cov"], cfg["hs_gold_weight"],
+                       subject_weights=subject_weights)
         detail.update({k: v for k, v in h.items() if not k.startswith("_")})
         sub["H_s"] = h["Hs"]
         detail["_hits_cache"] = h["_hits_cache"]
@@ -494,7 +546,8 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
         detail["C_s_note"] = "ablated"
     elif detail.get("_hits_cache"):
         loci = load_referee_loci(evidence["homolog"]["alignments"])
-        c = compute_cs(pred_faa, detail["_hits_cache"], loci)
+        c = compute_cs(pred_faa, detail["_hits_cache"], loci,
+                       subject_weights=subject_weights)
         detail.update({k: v for k, v in c.items() if not isinstance(v, list)})
         detail["anomalous_ids"] = sorted(set(c["chimeric_ids"]) | set(c["split_ids"]))
         sub["C_s"] = c["C_s"]

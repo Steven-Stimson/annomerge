@@ -39,6 +39,7 @@ noncanonical_splice (intron not GT-AG/GC-AG), single_exon, neighbour_overlap
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from collections import Counter
 from pathlib import Path
@@ -65,7 +66,10 @@ def load_junctions(bed: Path) -> dict:
 
 
 def load_protein_blocks(gff: Path) -> dict[str, list]:
-    """miniprot EVM-style protein gff -> {seqid: [(s, e, strand)]} (match_part)."""
+    """miniprot EVM-style protein gff -> {seqid: [(s, e, strand, prot)]} (match_part).
+
+    The protein id (Name=/Target=) is kept so support can be weighted by the
+    protein's homolog-set relatedness."""
     blocks: dict[str, list] = {}
     for line in open(gff):
         if line.startswith("#"):
@@ -73,7 +77,9 @@ def load_protein_blocks(gff: Path) -> dict[str, list]:
         f = line.rstrip("\n").split("\t")
         if len(f) < 9 or f[2] not in ("match_part", "CDS"):
             continue
-        blocks.setdefault(f[0], []).append((int(f[3]), int(f[4]), f[6]))
+        m = re.search(r"Name=([^;]+)", f[8]) or re.search(r"Target=(\S+)", f[8])
+        prot = m.group(1) if m else ""
+        blocks.setdefault(f[0], []).append((int(f[3]), int(f[4]), f[6], prot))
     for v in blocks.values():
         v.sort()
     return blocks
@@ -249,8 +255,15 @@ def confidence_annotation(gff_in: Path, genome_fa: Path, junctions_bed: Path | N
                           min_depth: int = 5, min_cov_frac: float = 0.5,
                           cov_support_min: float = 0.8,
                           prot_support_min: float = 0.5,
-                          min_orf_aa: int = 50) -> dict:
-    """Annotate every coding transcript with evidence support and a tier."""
+                          min_orf_aa: int = 50,
+                          protein_weights: dict | None = None) -> dict:
+    """Annotate every coding transcript with evidence support and a tier.
+
+    protein_weights: {protein_id: relatedness weight} — when given, the
+    protein support fraction is weighted: each CDS segment hit contributes
+    weight(best covering protein)/2 (closest set = 1.0), so support from
+    closer homolog relatives counts more in the final assessment.
+    """
     if lazy([out_tsv], desc="confidence annotation"):
         return {}
     genome = _read_genome(genome_fa)
@@ -337,14 +350,27 @@ def confidence_annotation(gff_in: Path, genome_fa: Path, junctions_bed: Path | N
             rna_frac_out = "NA"
             intron_note = "coverage"
 
-        # ---- protein support
+        # ---- protein support (relatedness-weighted when protein_weights given)
         blocks = pblocks.get(m.seqid, [])
+        wsum = 0.0
         n_hit = 0
         for (s, e) in cds_segs:
-            if any(bs <= e and s <= be and (bst == m.strand or bst == ".")
-                   for bs, be, bst in blocks):
+            best_w = 0.0
+            for bs, be, bst, bprot in blocks:
+                if bs <= e and s <= be and (bst == m.strand or bst == "."):
+                    if protein_weights:
+                        w = protein_weights.get(bprot, 1.0) / 2.0
+                        best_w = max(best_w, w)
+                    else:
+                        best_w = 1.0
+                        break
+            if best_w > 0.0:
                 n_hit += 1
-        prot_frac = n_hit / len(cds_segs)
+                wsum += best_w
+        if protein_weights:
+            prot_frac = wsum / len(cds_segs)
+        else:
+            prot_frac = n_hit / len(cds_segs)
         prot_ok = prot_frac >= prot_support_min
         prot_reached = bool(blocks)
 
