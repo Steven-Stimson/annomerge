@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+result/
+annomerge_out/
+annomerge_eval_out/
+*.log
+viewer_web/

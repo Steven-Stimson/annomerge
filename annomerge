@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""AnnoMerge command-line entry point.
+
+Run directly from the repository root:
+
+    python3 annomerge merge -g genome.fa -P helixer=pred.gff -p homologs.faa ...
+    python3 annomerge --version
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
+from annomerge.cli import app
+
+if __name__ == "__main__":
+    app()

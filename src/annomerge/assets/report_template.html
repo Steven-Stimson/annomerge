@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>AnnoMerge Report</title>
+<style>
+  body { font-family: "Noto Sans CJK SC", "Helvetica Neue", Arial, sans-serif;
+         margin: 0 auto; max-width: 1080px; padding: 24px 32px; color: #222;
+         line-height: 1.55; }
+  h1 { border-bottom: 3px solid #4C72B0; padding-bottom: 8px; }
+  h2 { color: #34506e; margin-top: 36px; border-left: 5px solid #4C72B0;
+       padding-left: 10px; }
+  h3 { color: #456; margin-top: 22px; }
+  table { border-collapse: collapse; margin: 12px 0; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 6px 12px; text-align: left; }
+  th { background: #eef2f7; }
+  .kv td:first-child { font-weight: 600; width: 32%; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .tier-strong { color: #1a7f37; font-weight: 600; }
+  .tier-moderate { color: #8a6d1a; font-weight: 600; }
+  .tier-weak { color: #b02a2a; font-weight: 600; }
+  .tier-uncalibrated { color: #666; font-weight: 600; }
+  .muted { color: #777; font-size: 0.9em; }
+  .note { background: #f6f8fa; border: 1px solid #ddd; border-radius: 6px;
+          padding: 10px 14px; margin: 10px 0; }
+  .cmd { background: #0d1117; color: #e6edf3; border-radius: 8px;
+         padding: 14px 18px; overflow-x: auto; font-family: ui-monospace,
+         SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.92em;
+         line-height: 1.7; margin: 12px 0; }
+  .verdict { border-radius: 8px; padding: 14px 18px; margin: 14px 0;
+             font-size: 1.05em; }
+  .verdict-excellent { background: #e7f6ec; border: 1px solid #1a7f37; }
+  .verdict-good { background: #eef6e7; border: 1px solid #4a7c2e; }
+  .verdict-fair { background: #fdf6e3; border: 1px solid #b8860b; }
+  .verdict-poor { background: #fdecea; border: 1px solid #b02a2a; }
+  .bar { height: 10px; border-radius: 5px; background: #e3e8ee;
+         display: inline-block; width: 160px; vertical-align: middle;
+         margin-right: 8px; }
+  .bar > span { display: block; height: 100%; border-radius: 5px;
+                background: #4C72B0; }
+  code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>AnnoMerge Report</h1>
+
+<h2>1. Run Summary</h2>
+<table class="kv">
+  <tr><td>Output directory</td><td><code>{{ meta.outdir }}</code></td></tr>
+  <tr><td>Started at</td><td>{{ meta.timestamp }}</td></tr>
+  <tr><td>Finished at</td><td>{{ meta.finished_at }}</td></tr>
+  <tr><td>Total runtime</td><td>{{ meta.elapsed }}</td></tr>
+  <tr><td>AnnoMerge version</td><td>{{ meta.version }}</td></tr>
+</table>
+{% if meta.cmd_head %}
+<p>Full command (one parameter per line):</p>
+<pre class="cmd">{{ meta.cmd_head }}{% for a in meta.cmd_args %} \
+{{ a }}{% endfor %}</pre>
+{% endif %}
+
+<h2>2. Annotation Overview</h2>
+<table class="kv">
+  <tr><td>Genes</td><td class="num">{{ gene_set.n_genes }}</td></tr>
+  <tr><td>Transcripts</td><td class="num">{{ gene_set.n_transcripts }}</td></tr>
+  <tr><td>Coding transcripts</td><td class="num">{{ gene_set.n_coding_transcripts }}</td></tr>
+</table>
+{% if integ %}
+<h3>2.1 Evidence Integration</h3>
+<p>All evidence sources passed to EVidenceModeler, with the calibrated
+score (de&nbsp;novo predictors, <code>scoring/evm_weights.tsv</code>) and the
+EVM weight used during integration (<code>evm/weights.txt</code>):</p>
+<table>
+  <tr><th>Evidence type</th><th>Evidence source</th><th class="num">Score (W_raw)</th><th class="num">EVM weight</th></tr>
+  {% for e in integ.evidence_rows %}
+  <tr><td>{{ e.kind }}</td><td>{{ e.evidence }}</td><td class="num">{{ e.score }}</td><td class="num">{{ e.evm_weight }}</td></tr>
+  {% endfor %}
+</table>
+<p>After EVM integration: <strong>{{ integ.evm_genes }}</strong> genes /
+<strong>{{ integ.evm_transcripts }}</strong> transcripts.</p>
+
+<h3>2.2 Augment</h3>
+<p>Augment recovered <strong>{{ integ.added_genes }}</strong> additional genes and
+<strong>{{ integ.added_transcripts }}</strong> additional transcripts on top of the
+EVM consensus (ab initio/RNA/protein evidence missed by EVM).</p>
+{% endif %}
+
+<h2>3. Quality Assessment</h2>
+<div class="verdict verdict-{{ assessment.label|lower }}">
+  <strong>Overall: {{ assessment.label }}</strong>
+  {% if assessment.overall is not none %} (mean score {{ assessment.overall }} / 100){% endif %}
+  &mdash; averaged over the dimensions below (evidence support, BUSCO, OMArk).
+</div>
+<table>
+  <tr><th>Dimension</th><th>Score</th><th>Detail</th></tr>
+  {% for d in assessment.dims %}
+  <tr>
+    <td>{{ d.dimension }}</td>
+    <td>{% if d.score is not none %}<span class="bar"><span style="width: {{ d.score }}%"></span></span>{{ d.score }}%{% else %}n/a{% endif %}</td>
+    <td class="muted">{{ d.detail }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h3>3.1 Evidence Support (confidence tiers)</h3>
+{% if evidence %}
+<table>
+  <tr><th>Tier</th><th class="num">Transcripts</th><th class="num">Fraction</th></tr>
+  {% for t in ["strong", "moderate", "weak", "uncalibrated"] %}
+  {% if evidence.tiers.get(t) %}
+  <tr><td class="tier-{{ t }}">{{ t }}</td><td class="num">{{ evidence.tiers[t] }}</td>
+      <td class="num">{{ "%.1f"|format(100 * evidence.tiers[t] / gene_set.n_transcripts) }}%</td></tr>
+  {% endif %}
+  {% endfor %}
+  <tr><td>GoldSet origin</td><td class="num">{{ evidence.goldset_origin }}</td>
+      <td class="num">{{ "%.1f"|format(100 * evidence.goldset_origin / gene_set.n_transcripts) }}%</td></tr>
+</table>
+<p class="muted">Intrinsic warning flags:
+{% for k, v in evidence.intrinsic_flags.items() %}{{ k }}={{ v }} {% endfor %}</p>
+{% else %}
+<p class="note">confidence.tsv not found</p>
+{% endif %}
+
+<h3>3.2 BUSCO</h3>
+{% if busco.ok %}
+<p>Lineage: <code>{{ busco.lineage }}</code></p>
+<table>
+  <tr><th>Category</th><th class="num">Count</th><th class="num">Fraction</th></tr>
+  <tr><td>Complete</td><td class="num">{{ busco.complete }}</td><td class="num">{{ busco.complete_pct }}%</td></tr>
+  <tr><td>&nbsp;&nbsp;single-copy (S)</td><td class="num">{{ busco.single }}</td><td class="num">{{ busco.single_pct }}%</td></tr>
+  <tr><td>&nbsp;&nbsp;duplicated (D)</td><td class="num">{{ busco.duplicated }}</td><td class="num">{{ busco.duplicated_pct }}%</td></tr>
+  <tr><td>Fragmented</td><td class="num">{{ busco.fragmented }}</td><td class="num">{{ "%.1f"|format(100 * busco.fragmented / busco.total) }}%</td></tr>
+  <tr><td>Missing</td><td class="num">{{ busco.missing }}</td><td class="num">{{ "%.1f"|format(100 * busco.missing / busco.total) }}%</td></tr>
+  <tr><td>Total BUSCO groups</td><td class="num">{{ busco.total }}</td><td class="num">100.0%</td></tr>
+</table>
+{% else %}
+<p class="note">BUSCO not run: {{ busco.error }}</p>
+{% endif %}
+
+<h3>3.3 OMArk</h3>
+{% if omark %}
+{% if omark.ok %}
+<p>Database: <code>{{ omark.db }}</code> (OMArk {{ omark.omark_version }}).
+Consistent = gene structure matches the orthologous group; duplicated
+suggests possible contamination or over-annotation.</p>
+<table>
+  <tr><th>Category</th><th class="num">Count</th><th class="num">Fraction</th></tr>
+  <tr><td>Consistent with HOGs</td><td class="num">{{ omark.consistent }}</td><td class="num">{{ omark.consistent_pct }}%</td></tr>
+  <tr><td>Inconsistent</td><td class="num">{{ omark.inconsistent }}</td><td class="num">{{ omark.inconsistent_pct }}%</td></tr>
+  <tr><td>Unknown (no HOG)</td><td class="num">{{ omark.unknown }}</td><td class="num"></td></tr>
+  <tr><td>Duplicated (contamination)</td><td class="num">{{ omark.duplicated }}</td><td class="num">{{ omark.duplicated_pct }}%</td></tr>
+  <tr><td>Total proteins assessed</td><td class="num">{{ omark.total }}</td><td class="num"></td></tr>
+</table>
+{% else %}
+<p class="note">OMArk not run: {{ omark.error }}</p>
+{% endif %}
+{% else %}
+<p class="note">OMArk not run: no OMAmer database available.</p>
+{% endif %}
+
+<h2>4. Dependencies</h2>
+<table class="kv">
+  {% for name, ver in versions.rows %}
+  <tr><td>{{ name }}</td><td>{{ ver }}</td></tr>
+  {% endfor %}
+</table>
+
+<h2>5. Citation</h2>
+<p class="note">To be added.</p>
+
+<p class="muted">Report generated by AnnoMerge &middot; full stats in
+report/stats.json &middot; interactive evidence browser in viewer/</p>
+</body>
+</html>
