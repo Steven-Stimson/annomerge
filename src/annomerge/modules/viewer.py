@@ -331,10 +331,51 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
 
 
 # ------------------------------------------------------------ tracks.json
+def _split_protein_tracks(pgff: Path, data_dir: Path,
+                          set_weights: dict) -> list:
+    """Split protein evidence GFF3 into one file/track per homolog set.
+
+    Multi-set runs: 06.merge/protein.gff3 lines carry miniprot_<label>
+    sources -> one track per set, ordered by relatedness weight desc, the
+    closest set keeping the legacy cyan. Single-set runs: one legacy
+    "Protein (miniprot)" track. Returns [{set, weight, file, color}].
+    """
+    by_src: dict = {}
+    with open(pgff) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 9:
+                continue
+            by_src.setdefault(f[1], []).append(line)
+    tracks = []
+    multi = any(s.startswith("miniprot_") for s in by_src)
+    for src in by_src:
+        label = src[len("miniprot_"):] if src.startswith("miniprot_") else "all"
+        fname = f"protein_{label}.gff3"
+        with open(data_dir / fname, "w") as out:
+            out.write("##gff-version 3\n")
+            out.writelines(by_src[src])
+        w = set_weights.get(label)
+        tracks.append({"set": label, "weight": round(w, 4) if w else None,
+                       "file": fname})
+    tracks.sort(key=lambda t: -(t["weight"] or 1.0))
+    for rank, t in enumerate(tracks):
+        # closest set keeps the legacy cyan; others rotate the palette
+        t["color"] = "#17becf" if rank == 0 else _PALETTE[rank % len(_PALETTE)]
+    if not multi and tracks:
+        tracks[0]["color"] = "#17becf"
+    log.info("viewer protein tracks: %s",
+             ", ".join(f"{t['set']}(w={t['weight']})" for t in tracks))
+    return tracks
+
+
 def build_tracks_json(preds: dict, details: dict, data_dir: Path,
-                      out_json: Path) -> list:
+                      out_json: Path, protein_tracks: list | None = None) -> list:
     """denovo predictor tracks, colored by W_raw (desc). Copies each GFF3
-    into data_dir as denovo_<name>.gff3."""
+    into data_dir as denovo_<name>.gff3. Also records the per-set protein
+    tracks produced by _split_protein_tracks."""
     denovo = []
     for name, path in preds.items():
         w = 0.0
@@ -349,7 +390,8 @@ def build_tracks_json(preds: dict, details: dict, data_dir: Path,
     for rank, d in enumerate(denovo):
         d["color"] = _PALETTE[rank % len(_PALETTE)]
     with open(out_json, "w") as fh:
-        json.dump({"denovo": denovo}, fh, ensure_ascii=False, indent=1)
+        json.dump({"denovo": denovo, "protein": protein_tracks or []},
+                  fh, ensure_ascii=False, indent=1)
     return denovo
 
 
@@ -477,6 +519,11 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         p = data_dir / d["file"]
         if p.exists():
             files[d["file"]] = _datauri(p)
+    # per-set protein evidence tracks (multi-set homolog runs)
+    for t in tracks_cfg.get("protein", []):
+        p = data_dir / t["file"]
+        if p.exists():
+            files[t["file"]] = _datauri(p)
     genes_json = (data_dir / "genes.json").read_text().replace("</", "<\\/")
     fai_txt = (data_dir / "genome.fa.fai").read_text()
 
@@ -513,6 +560,24 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         html = html.replace("/*__COVERAGE_TRACK__*/", track)
     else:
         html = html.replace("/*__COVERAGE_TRACK__*/", "")
+
+    # 5b) protein evidence tracks: one per homolog set (relatedness-weighted
+    #     multi-set runs) or the single legacy track
+    protein_js = []
+    for t in tracks_cfg.get("protein", []):
+        if t["file"] not in files:
+            continue
+        if t["set"] == "all":
+            name = "Protein (miniprot)"
+        else:
+            wtxt = f", w={float(t['weight']):.2f}" if t.get("weight") else ""
+            name = f"Protein (miniprot: {t['set']}{wtxt})"
+        protein_js.append(
+            '  { name: ' + json.dumps(name) + ', type: "annotation", format: "gff3",\n'
+            '    url: DATA_URI[' + json.dumps(t["file"]) + '], color: '
+            + json.dumps(t["color"]) + ', height: 120,\n'
+            '    visibilityWindow: -1 }')
+    html = html.replace("/*__PROTEIN_TRACKS__*/", ",\n".join(protein_js))
 
     # 6) genes/tracks/fai fetches -> inlined constants
     html = html.replace('const resp = await fetch("data/genes.json");\n  genes = await resp.json();',
@@ -571,11 +636,17 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
         if cand.exists():
             _link_or_copy(cand, data / "goldset.gff3")
             break
+    pgff = None
     for cand in (integ_d / "protein.gff3",
                  Path((results.get("homolog") or {}).get("gff") or "")):
         if cand and cand.exists():
-            _link_or_copy(cand, data / "protein.gff3")
+            pgff = cand
             break
+    # protein evidence split into one track per homolog set (multi-set runs:
+    # 06.merge/protein.gff3 carries miniprot_<label> sources). Single-set
+    # runs keep one legacy "Protein (miniprot)" track.
+    set_weights = (results.get("homolog") or {}).get("set_weights") or {}
+    protein_tracks = _split_protein_tracks(pgff, data, set_weights) if pgff else []
     rna = results.get("rna") or {}
     st_gtf = rna.get("stringtie_gtf")
     if st_gtf and Path(st_gtf).exists():
@@ -586,7 +657,8 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
 
     # 3) tracks.json first: it copies denovo_<name>.gff3 into data/, which
     #    build_genes_json needs on disk to compute de novo evidence coverage
-    build_tracks_json(preds, details, data, data / "tracks.json")
+    build_tracks_json(preds, details, data, data / "tracks.json",
+                      protein_tracks=protein_tracks)
     build_genes_json(Path(out) / "08.assessment" / "confidence.tsv",
                      data / "genes.json",
                      final_gff3=data / "final.gff3",
