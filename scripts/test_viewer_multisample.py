@@ -111,6 +111,13 @@ def main():
     check(html.count("autoscale: true") >= 4, "all coverage tracks autoscale")
     check('min: 0' in html, "coverage y-axis starts at 0")
 
+    # 4b) tabix lazy-loading: merged + per-sample bedgraphs indexed & referenced
+    for f in ["coverage_all.bedgraph"] + [f"coverage_{n}.bedgraph" for n in names]:
+        check((data / (f + ".gz")).exists() and (data / (f + ".gz.tbi")).exists(),
+              f"bgzip+tabix index built: {f}.gz/.tbi")
+    check("indexURL: DATA_URI" in html and "coverage_all.bedgraph.gz" in html,
+          "HTML wires coverage tracks with indexURL (indexed lazy loading)")
+
     # 5) merged == sum of samples at the merged peak bin
     if (data / "coverage_all.bedgraph").exists() and len(names) == 3:
         mall = load_bg(data / "coverage_all.bedgraph")

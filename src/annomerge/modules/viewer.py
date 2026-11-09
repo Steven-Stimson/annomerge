@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 from ..utils import ensure_dir, run, which
@@ -398,6 +399,63 @@ def build_tracks_json(preds: dict, details: dict, data_dir: Path,
 
 
 # ---------------------------------------------------------------- coverage
+def _tabix_bundle(src: Path, data_dir: Path, preset: str) -> tuple | None:
+    """bgzip+tabix src into data_dir for interval lazy loading.
+
+    Returns (gz_name, tbi_name) embedded under those keys, or None when
+    bgzip/tabix are unavailable or indexing fails (caller then falls back
+    to embedding the whole plain file as before).
+    """
+    bgzip, tabix = shutil.which("bgzip"), shutil.which("tabix")
+    if not bgzip or not tabix:
+        # well-known pod location (env.sh normally provides these)
+        htsbin = Path("/public/tools/htslib/1.24/bin")
+        if not bgzip and (htsbin / "bgzip").exists():
+            bgzip = str(htsbin / "bgzip")
+        if not tabix and (htsbin / "tabix").exists():
+            tabix = str(htsbin / "tabix")
+    if not bgzip or not tabix:
+        return None
+    gz = data_dir / (src.name + ".gz")
+    tbi = data_dir / (src.name + ".gz.tbi")
+    if not (gz.exists() and tbi.exists()):
+        tmp = data_dir / (src.name + ".sorting.txt")
+        try:
+            header, body = [], []
+            with open(src) as fh:
+                for line in fh:
+                    (header if line.startswith("#") else body).append(line)
+            if preset == "gff" and not any(l.startswith("##gff-version")
+                                           for l in header):
+                header.insert(0, "##gff-version 3\n")
+            def key(ln):
+                f = ln.split("\t")
+                return (f[0], int(f[3]) - 1) if preset in ("gff", "gtf") \
+                    else (f[0], int(f[1]))
+            body.sort(key=key)
+            with open(tmp, "w") as out:
+                out.writelines(header)
+                out.writelines(body)
+            with open(gz, "wb") as out:
+                subprocess.run([bgzip, "-c", str(tmp)], check=True, stdout=out)
+            subprocess.run([tabix, "-f", "-p", preset, str(gz)], check=True)
+        except Exception as e:
+            log.warning("viewer: tabix index failed for %s (%s); "
+                        "falling back to whole-file embed", src.name, e)
+            for f in (gz, tbi):
+                if f.exists():
+                    f.unlink()
+            return None
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+    return gz.name, tbi.name
+
+
+_PRESET_BY_SUFFIX = {".gff3": "gff", ".gff": "gff", ".gtf": "gff",
+                     ".bed": "bed", ".bedgraph": "bed"}
+
+
 def coverage_bedgraph(bam: Path, out_bedgraph: Path, threads: int) -> Path | None:
     """Whole-genome 50-bp-bin coverage bedGraph.
 
@@ -536,8 +594,9 @@ _COV_SAMPLE_PALETTE = ["#31a354", "#756bb1", "#e6550d", "#636363",
 
 # ---------------------------------------------------------- offline bundle
 def _inline_script_vars(files: dict, genes_json: str, tracks_cfg: dict,
-                        fai_txt: str) -> str:
+                        fai_txt: str, idx: dict | None = None) -> str:
     return ("<script>\nconst DATA_URI = " + json.dumps(files) + ";\n"
+            "const IDX = " + json.dumps(idx or {}) + ";\n"
             "const GENES_JSON = " + json.dumps(genes_json) + ";\n"
             "const TRACKS_JSON = " +
             json.dumps(json.dumps(tracks_cfg, ensure_ascii=False)) + ";\n"
@@ -567,28 +626,40 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
     html = html.replace('<script src="js/igv.min.js"></script>',
                         '<script>\n' + igv_js + '\n</script>')
 
-    # 2) data files -> dataURI
+    # 2) data files -> dataURI. Annotation/wig tracks go through
+    #    bgzip+tabix (_tabix_bundle) so igv parses only the visible locus
+    #    (true per-chromosome lazy loading over embedded dataURIs); any
+    #    indexing failure falls back to the whole-file dataURI as before.
     tracks_cfg = json.load(open(data_dir / "tracks.json"))
     files: dict = {}
-    for name in ("final.gff3", "goldset.gff3", "protein.gff3", "stringtie.gtf",
-                 "junctions.bed"):
-        p = data_dir / name
-        if p.exists():
-            files[name] = _datauri(p)
-    if full:
-        # lite mode skips the genome sequence entirely
-        files["genome.fa"] = _datauri(data_dir / "genome.fa")
-    # merged + per-sample RNA coverage bedgraphs
+    indexed_map: dict = {}          # template file name -> (gz name, tbi name)
     covcfg = tracks_cfg.get("coverage") or {}
     cov_files = []
     if covcfg.get("merged"):
         cov_files.append(covcfg["merged"]["file"])
     for s in covcfg.get("samples", []):
         cov_files.append(s["file"])
-    for f in dict.fromkeys(cov_files):
-        p = data_dir / f
-        if p.exists():
-            files[f] = _datauri(p)
+    ann_names = ["final.gff3", "goldset.gff3", "stringtie.gtf", "junctions.bed"]
+    ann_names += [d["file"] for d in tracks_cfg.get("denovo", [])]
+    ann_names += [t["file"] for t in tracks_cfg.get("protein", [])]
+    ann_names += list(dict.fromkeys(cov_files))
+    for name in dict.fromkeys(ann_names):
+        src = data_dir / name
+        if not src.exists():
+            continue
+        preset = _PRESET_BY_SUFFIX.get(src.suffix.lower())
+        idx = _tabix_bundle(src, data_dir, preset) if preset else None
+        if idx:
+            indexed_map[name] = idx
+            files[idx[0]] = _datauri(data_dir / idx[0])
+            files[idx[1]] = _datauri(data_dir / idx[1])
+        else:
+            files[name] = _datauri(src)
+    def _embedded(fname: str) -> bool:
+        return fname in indexed_map or fname in files
+    if full:
+        # lite mode skips the genome sequence entirely
+        files["genome.fa"] = _datauri(data_dir / "genome.fa")
     # cytoband from fai (full mode only; chromsizes reference cannot take it)
     if full:
         cytoband = []
@@ -599,22 +670,20 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         files["cytoband.txt"] = ("data:text/plain;base64,"
                                  + base64.b64encode(("\n".join(cytoband) + "\n")
                                                     .encode()).decode())
-    for d in tracks_cfg.get("denovo", []):
-        p = data_dir / d["file"]
-        if p.exists():
-            files[d["file"]] = _datauri(p)
-    # per-set protein evidence tracks (multi-set homolog runs)
-    for t in tracks_cfg.get("protein", []):
-        p = data_dir / t["file"]
-        if p.exists():
-            files[t["file"]] = _datauri(p)
     genes_json = (data_dir / "genes.json").read_text().replace("</", "<\\/")
     fai_txt = (data_dir / "genome.fa.fai").read_text()
 
-    # 3) url references -> dataURI lookups
+    # 3) url references -> dataURI lookups; indexed tracks gain indexURL
+    for orig, (gz, tbi) in indexed_map.items():
+        html = html.replace(
+            f'url: "data/{orig}"',
+            f'url: DATA_URI["{gz}"],\n    indexURL: DATA_URI["{tbi}"]')
     for name in files:
         html = html.replace(f'url: "data/{name}"', f'url: DATA_URI["{name}"]')
-    html = html.replace('url: "data/" + d.file', 'url: DATA_URI[d.file]')
+    html = html.replace(
+        'url: "data/" + d.file',
+        'url: (IDX[d.file] ? DATA_URI[IDX[d.file][0]] : DATA_URI[d.file]), '
+        'indexURL: (IDX[d.file] ? DATA_URI[IDX[d.file][1]] : undefined)')
 
     # 4) reference block: drop the id (an id makes igv consult its built-in
     #    genome registry and fail with "Unknown genome id" offline)
@@ -640,16 +709,21 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
     #    fixed upper bound, each track adapts to its own depth range; the
     #    observed max depth is shown in the track label for comparability.
     def _wig(name: str, fname: str, color: str) -> str:
+        idx = indexed_map.get(fname)
+        if idx:
+            urlexpr = ('DATA_URI[' + json.dumps(idx[0]) + '], indexURL: '
+                       'DATA_URI[' + json.dumps(idx[1]) + ']')
+        else:
+            urlexpr = 'DATA_URI[' + json.dumps(fname) + ']'
         return ('  { name: ' + json.dumps(name) + ', type: "wig",\n'
                 '    format: "bedgraph",\n'
-                '    url: DATA_URI[' + json.dumps(fname) + '], color: '
-                + json.dumps(color) + ',\n'
+                '    url: ' + urlexpr + ', color: ' + json.dumps(color) + ',\n'
                 '    height: 90, min: 0, autoscale: true }')
 
     cov_tracks = []
     m = covcfg.get("merged") or {}
     multi = (m.get("n_samples") or 1) > 1
-    if m and m.get("file") in files:
+    if m and _embedded(m["file"]):
         if multi:
             label = f'RNA coverage (all {m["n_samples"]} samples, ~{m["max"]:,.0f}x max)'
         else:
@@ -657,7 +731,7 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         cov_tracks.append(_wig(label, m["file"], "#3182bd"))
     if multi:
         for rank, s in enumerate(covcfg.get("samples", [])):
-            if s["file"] not in files:
+            if not _embedded(s["file"]):
                 continue
             color = _COV_SAMPLE_PALETTE[rank % len(_COV_SAMPLE_PALETTE)]
             label = f'RNA coverage: {s["name"]} (~{s["max"]:,.0f}x max)'
@@ -669,16 +743,22 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
     #     multi-set runs) or the single legacy track
     protein_js = []
     for t in tracks_cfg.get("protein", []):
-        if t["file"] not in files:
+        if not _embedded(t["file"]):
             continue
         if t["set"] == "all":
             name = "Protein (miniprot)"
         else:
             wtxt = f", w={float(t['weight']):.2f}" if t.get("weight") else ""
             name = f"Protein (miniprot: {t['set']}{wtxt})"
+        pidx = indexed_map.get(t["file"])
+        if pidx:
+            purlexpr = ('DATA_URI[' + json.dumps(pidx[0]) + '], indexURL: '
+                        'DATA_URI[' + json.dumps(pidx[1]) + ']')
+        else:
+            purlexpr = 'DATA_URI[' + json.dumps(t["file"]) + ']'
         protein_js.append(
             '  { name: ' + json.dumps(name) + ', type: "annotation", format: "gff3",\n'
-            '    url: DATA_URI[' + json.dumps(t["file"]) + '], color: '
+            '    url: ' + purlexpr + ', color: '
             + json.dumps(t["color"]) + ', height: 120,\n'
             '    visibilityWindow: -1 }')
     html = html.replace("/*__PROTEIN_TRACKS__*/", ",\n".join(protein_js))
@@ -692,7 +772,8 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
                         'const text = FAI_TXT;')
 
     # 7) inject DATA_URI / GENES_JSON / TRACKS_JSON / FAI_TXT
-    inject = _inline_script_vars(files, genes_json, tracks_cfg, fai_txt)
+    inject = _inline_script_vars(files, genes_json, tracks_cfg, fai_txt,
+                                 indexed_map)
     html = html.replace('<div id="topbar">', inject + '<div id="topbar">')
 
     # 8) offline identity
