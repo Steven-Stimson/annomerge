@@ -17,7 +17,7 @@ Internal-invariant: a donor's introns within the CDS span must equal the CDS
 introns exactly — CDS internal structure is never rewritten by backfill.
 """
 from __future__ import annotations
-from .utils import inject_utr_features
+from ..utils import inject_utr_features
 
 import logging
 import re
