@@ -445,6 +445,8 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     # ---------------- write
     out_gff3 = d / "augment.gff3"
     if not lazy([out_gff3], desc="augment merge"):
+        _collapse_isoforms(genes, stats)
+        log.info("augment: %d isoform(s) collapsed (identical CDS, longest-UTR kept)", stats.get("isoforms_collapsed", 0))
         _write(out_gff3, genes, stats)
         n5, n3 = inject_utr_features(out_gff3, out_gff3)
         log.info("augment: UTR rows added: %d 5' + %d 3'", n5, n3)
@@ -695,6 +697,45 @@ def _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, c
             tx.mrna.end = new_exons[-1].end
             tx.mrna.attrs = f"utr_source={src.split(':')[0]}"
             stats[f"utr_from_{src.split(':')[0]}"] += 1
+
+
+def _collapse_isoforms(genes: list, stats: Counter) -> None:
+    """Collapse isoforms with identical CDS structure within a gene (same
+    strand + same CDS intervals => same intron chain).  The representative
+    is the isoform with the longest total UTR (UTR evidence reaches
+    furthest); ties break to the higher donor TPM.  Recorded in
+    stats['isoforms_collapsed']."""
+    for gene in genes:
+        if len(gene.isoforms) <= 1:
+            continue
+        groups: dict = {}
+        for tx in gene.isoforms:
+            key = (tx.mrna.strand,
+                   tuple(sorted((c.start, c.end) for c in tx.cds)))
+            groups.setdefault(key, []).append(tx)
+        if len(groups) == len(gene.isoforms):
+            continue
+        keep = []
+        for txs in groups.values():
+            if len(txs) == 1:
+                keep.append(txs[0])
+                continue
+
+            def _utr_total(t):
+                return sum(e - s + 1 for part in _utr_parts(t)
+                           for (s, e) in part)
+
+            def _tpm(t):
+                m = re.search(r"donor_tpm=([\d.eE+-]+)",
+                              getattr(t.mrna, "attrs", "") or "")
+                return float(m.group(1)) if m else 0.0
+
+            txs.sort(key=lambda t: (_utr_total(t), _tpm(t)), reverse=True)
+            keep.append(txs[0])
+            stats["isoforms_collapsed"] += len(txs) - 1
+        order = {id(t): i for i, t in enumerate(gene.isoforms)}
+        keep.sort(key=lambda t: order[id(t)])
+        gene.isoforms = keep
 
 
 def _write(out: Path, genes: list, stats: Counter) -> None:

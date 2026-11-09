@@ -7,8 +7,9 @@ Rewrites the IDs of a GFF3 in place to a compact, coordinate-based scheme:
 
 Exon / CDS / UTR features keep their ordinal suffix but inherit the new
 transcript prefix (``<new_tid>.exon3``, ``<new_tid>.cds``, ...).  The
-previous ID is preserved in ``Name=`` when the feature has no Name yet, so
-the provenance of every feature stays traceable.
+``Name=`` is stripped from gene/mRNA features on purpose: the normalized
+ID is the single display identifier (igv falls back to ID when Name is
+absent).
 
 Idempotent: a file whose gene IDs already follow the scheme is left
 untouched (no mtime bump), so cached downstream steps are not invalidated.
@@ -35,6 +36,12 @@ def _attr_get(attrs: str, key: str) -> str | None:
             if k.strip() == key:
                 return v.strip()
     return None
+
+
+def _attr_del(attrs: str, key: str) -> str:
+    """Drop a key from a GFF3 attribute string."""
+    return ";".join(kv for kv in attrs.split(";")
+                    if not ("=" in kv and kv.split("=", 1)[0].strip() == key))
 
 
 def _attr_set(attrs: str, key: str, value: str) -> str:
@@ -132,13 +139,11 @@ def normalize_ids(gff3: Path) -> dict:
         if ftype == "gene" and old_id in gid_map:
             new_id = gid_map[old_id]
             attrs = _attr_set(attrs, "ID", new_id)
-            if _attr_get(attrs, "Name") is None:
-                attrs = _attr_set(attrs, "Name", old_id)
+            attrs = _attr_del(attrs, "Name")
         elif ftype in ("mRNA", "transcript") and old_id in tid_map:
             new_id = tid_map[old_id]
             attrs = _attr_set(attrs, "ID", new_id)
-            if _attr_get(attrs, "Name") is None:
-                attrs = _attr_set(attrs, "Name", old_id)
+            attrs = _attr_del(attrs, "Name")
             attrs = _remap_parent(attrs)
         else:
             # exon / CDS / UTR / anything else carrying a Parent
