@@ -26,7 +26,7 @@ results = {
                 "set_weights": set_weights},
     "rna": {"stringtie_gtf": OUT / "02.rnaseq/stringtie/stringtie.gtf",
             "junctions_bed": OUT / "02.rnaseq/junctions.bed",
-            "bams": [OUT / "02.rnaseq/SRR31963760.sorted.bam"]},
+            "bams": [OUT / "02.rnaseq/bam/SRR31963760.sorted.bam"]},
 }
 preds = {"helixer": str(SC / "denovo/helixer.gff"),
          "annevo": str(SC / "denovo/annevo.norm.gff3")}

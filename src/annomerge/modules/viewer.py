@@ -372,10 +372,11 @@ def _split_protein_tracks(pgff: Path, data_dir: Path,
 
 
 def build_tracks_json(preds: dict, details: dict, data_dir: Path,
-                      out_json: Path, protein_tracks: list | None = None) -> list:
+                      out_json: Path, protein_tracks: list | None = None,
+                      coverage: dict | None = None) -> list:
     """denovo predictor tracks, colored by W_raw (desc). Copies each GFF3
     into data_dir as denovo_<name>.gff3. Also records the per-set protein
-    tracks produced by _split_protein_tracks."""
+    tracks and the per-sample/merged RNA coverage metadata."""
     denovo = []
     for name, path in preds.items():
         w = 0.0
@@ -390,7 +391,8 @@ def build_tracks_json(preds: dict, details: dict, data_dir: Path,
     for rank, d in enumerate(denovo):
         d["color"] = _PALETTE[rank % len(_PALETTE)]
     with open(out_json, "w") as fh:
-        json.dump({"denovo": denovo, "protein": protein_tracks or []},
+        json.dump({"denovo": denovo, "protein": protein_tracks or [],
+                   "coverage": coverage or {}},
                   fh, ensure_ascii=False, indent=1)
     return denovo
 
@@ -459,6 +461,79 @@ def coverage_bedgraph(bam: Path, out_bedgraph: Path, threads: int) -> Path | Non
     return out_bedgraph if out_bedgraph.exists() else None
 
 
+def sample_coverage(bams: list, data_dir: Path, threads: int) -> dict:
+    """Per-sample + merged 50-bp-bin coverage bedgraphs.
+
+    One bedgraph per BAM (coverage_<sample>.bedgraph) plus, for >=2 BAMs, a
+    per-bin summed coverage_all.bedgraph. Returns coverage metadata
+    {"merged": {file, max, mean, n_samples, name?}, "samples": [{name, file,
+    max, mean}]} or {} when no BAM produced a bedgraph. Track y-axes are left
+    to igv per-track autoscale; max/mean are recorded here for the track
+    labels so different sequencing depths stay comparable.
+    """
+    samples = []
+    merged: dict = {}          # (ref, start) -> [end, depth_sum]
+    used_names: set = set()
+    for bam in bams:
+        bam = Path(bam)
+        if not bam.exists():
+            continue
+        base = bam.name.split(".")[0].replace(".sorted", "")
+        name, i = base, 2
+        while name in used_names:
+            name = f"{base}_{i}"
+            i += 1
+        used_names.add(name)
+        bg = data_dir / f"coverage_{name}.bedgraph"
+        if not coverage_bedgraph(bam, bg, threads):
+            log.warning("viewer: coverage failed for %s; sample track skipped", bam)
+            continue
+        mx = tot = 0.0
+        n = 0
+        vals = []
+        with open(bg) as fh:
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                if len(f) < 4:
+                    continue
+                v = float(f[3])
+                vals.append((f[0], int(f[1]), int(f[2]), v))
+                mx = max(mx, v)
+                tot += v
+                n += 1
+        for ref, s, e, v in vals:
+            rec = merged.setdefault((ref, s), [e, 0.0])
+            rec[1] += v
+        samples.append({"name": name, "file": bg.name,
+                        "max": round(mx, 1),
+                        "mean": round(tot / n, 1) if n else 0.0})
+    if not samples:
+        return {}
+    if len(samples) > 1:
+        mbg = data_dir / "coverage_all.bedgraph"
+        mx = tot = 0.0
+        n = 0
+        with open(mbg, "w") as out:
+            for (ref, s), (e, dsum) in sorted(merged.items()):
+                out.write(f"{ref}\t{s}\t{e}\t{dsum:.1f}\n")
+                mx = max(mx, dsum)
+                tot += dsum
+                n += 1
+        merged_info = {"file": mbg.name, "max": round(mx, 1),
+                       "mean": round(tot / n, 1) if n else 0.0,
+                       "n_samples": len(samples)}
+    else:
+        merged_info = dict(samples[0])
+        merged_info["n_samples"] = 1
+    log.info("viewer coverage: %d sample(s), merged max %.0fx mean %.1fx",
+             len(samples), merged_info["max"], merged_info["mean"])
+    return {"merged": merged_info, "samples": samples}
+
+
+_COV_SAMPLE_PALETTE = ["#31a354", "#756bb1", "#e6550d", "#636363",
+                       "#dd1c77", "#2c7fb8"]
+
+
 # ---------------------------------------------------------- offline bundle
 def _inline_script_vars(files: dict, genes_json: str, tracks_cfg: dict,
                         fai_txt: str) -> str:
@@ -475,7 +550,7 @@ def _inline_script_vars(files: dict, genes_json: str, tracks_cfg: dict,
 
 def render_offline_html(data_dir: Path, out_html: Path, *,
                         ref_name: str, fallback_locus: str,
-                        coverage_name: str | None,
+                        coverage: dict | None,
                         full: bool = False) -> Path:
     """Pack the browser into a single offline HTML (data inlined as dataURIs).
 
@@ -483,6 +558,7 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
     reference is pure coordinates (chromsizes via blob URL) so the file
     stays small even for large genomes.  full=True additionally embeds the
     genome FASTA as a dataURI so base-level sequence is shown in igv.
+    coverage: sample_coverage() metadata (merged + per-sample bedgraphs).
     """
     html = (_ASSETS / "browser_template.html").read_text(encoding="utf-8")
     igv_js = (_ASSETS / "igv.min.js").read_text(encoding="utf-8")
@@ -492,6 +568,7 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
                         '<script>\n' + igv_js + '\n</script>')
 
     # 2) data files -> dataURI
+    tracks_cfg = json.load(open(data_dir / "tracks.json"))
     files: dict = {}
     for name in ("final.gff3", "goldset.gff3", "protein.gff3", "stringtie.gtf",
                  "junctions.bed"):
@@ -501,9 +578,17 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
     if full:
         # lite mode skips the genome sequence entirely
         files["genome.fa"] = _datauri(data_dir / "genome.fa")
-    cov = data_dir / "coverage.bedgraph"
-    if cov.exists():
-        files["coverage.bedgraph"] = _datauri(cov)
+    # merged + per-sample RNA coverage bedgraphs
+    covcfg = tracks_cfg.get("coverage") or {}
+    cov_files = []
+    if covcfg.get("merged"):
+        cov_files.append(covcfg["merged"]["file"])
+    for s in covcfg.get("samples", []):
+        cov_files.append(s["file"])
+    for f in dict.fromkeys(cov_files):
+        p = data_dir / f
+        if p.exists():
+            files[f] = _datauri(p)
     # cytoband from fai (full mode only; chromsizes reference cannot take it)
     if full:
         cytoband = []
@@ -514,7 +599,6 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         files["cytoband.txt"] = ("data:text/plain;base64,"
                                  + base64.b64encode(("\n".join(cytoband) + "\n")
                                                     .encode()).decode())
-    tracks_cfg = json.load(open(data_dir / "tracks.json"))
     for d in tracks_cfg.get("denovo", []):
         p = data_dir / d["file"]
         if p.exists():
@@ -551,15 +635,35 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
             'fastaURL: REF_URL,\n      format: "chromsizes"')
     html = html.replace("$FALLBACK_LOCUS$", fallback_locus)
 
-    # 5) coverage track (optional)
-    if coverage_name and "coverage.bedgraph" in files:
-        track = ('  { name: "RNA coverage (HISAT2)", type: "wig",\n'
-                 '    format: "bedgraph",\n'
-                 '    url: DATA_URI["coverage.bedgraph"], color: "#3182bd",\n'
-                 '    height: 90, min: 0, autoscale: true },')
-        html = html.replace("/*__COVERAGE_TRACK__*/", track)
-    else:
-        html = html.replace("/*__COVERAGE_TRACK__*/", "")
+    # 5) coverage tracks: merged depth over ALL RNA samples on top, then one
+    #    wig per sample (>=2 samples). Y-axes are per-track autoscale — no
+    #    fixed upper bound, each track adapts to its own depth range; the
+    #    observed max depth is shown in the track label for comparability.
+    def _wig(name: str, fname: str, color: str) -> str:
+        return ('  { name: ' + json.dumps(name) + ', type: "wig",\n'
+                '    format: "bedgraph",\n'
+                '    url: DATA_URI[' + json.dumps(fname) + '], color: '
+                + json.dumps(color) + ',\n'
+                '    height: 90, min: 0, autoscale: true }')
+
+    cov_tracks = []
+    m = covcfg.get("merged") or {}
+    multi = (m.get("n_samples") or 1) > 1
+    if m and m.get("file") in files:
+        if multi:
+            label = f'RNA coverage (all {m["n_samples"]} samples, ~{m["max"]:,.0f}x max)'
+        else:
+            label = f'RNA coverage: {m.get("name", "sample")} (~{m["max"]:,.0f}x max)'
+        cov_tracks.append(_wig(label, m["file"], "#3182bd"))
+    if multi:
+        for rank, s in enumerate(covcfg.get("samples", [])):
+            if s["file"] not in files:
+                continue
+            color = _COV_SAMPLE_PALETTE[rank % len(_COV_SAMPLE_PALETTE)]
+            label = f'RNA coverage: {s["name"]} (~{s["max"]:,.0f}x max)'
+            cov_tracks.append(_wig(label, s["file"], color))
+    html = html.replace("/*__COVERAGE_TRACK__*/",
+                        ",\n".join(cov_tracks) + ("," if cov_tracks else ""))
 
     # 5b) protein evidence tracks: one per homolog set (relatedness-weighted
     #     multi-set runs) or the single legacy track
@@ -655,23 +759,22 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
     if junc and Path(junc).exists():
         _link_or_copy(Path(junc), data / "junctions.bed")
 
+    # coverage bedgraphs: one per BAM + a merged track over ALL samples;
+    # must run BEFORE build_tracks_json so its metadata lands in tracks.json
+    cov = sample_coverage(rna.get("bams") or [], data, threads)
+
     # 3) tracks.json first: it copies denovo_<name>.gff3 into data/, which
     #    build_genes_json needs on disk to compute de novo evidence coverage
     build_tracks_json(preds, details, data, data / "tracks.json",
-                      protein_tracks=protein_tracks)
+                      protein_tracks=protein_tracks,
+                      coverage=cov)
     build_genes_json(Path(out) / "08.assessment" / "confidence.tsv",
                      data / "genes.json",
                      final_gff3=data / "final.gff3",
                      denovo_gff3={n: data / f"denovo_{n}.gff3"
                                   for n in (preds or {})})
 
-    # 4) coverage bedgraph (optional)
-    bams = rna.get("bams") or []
-    coverage_name = None
-    if bams and Path(bams[0]).exists():
-        coverage_name = Path(bams[0]).name.split(".")[0]
-        coverage_bedgraph(Path(bams[0]), data / "coverage.bedgraph", threads)
-
+    # 4) coverage bedgraphs (already computed above, before tracks.json)
     # 5) pack the single-file offline browser
     first_chrom = (data / "genome.fa.fai").read_text().split("\t")[0]
     chrom_len = (data / "genome.fa.fai").read_text().split("\t")[1]
@@ -679,5 +782,5 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
     html = render_offline_html(
         data, vdir / "AnnoMerge_evidence_browser.html",
         ref_name=genome.name, fallback_locus=fallback,
-        coverage_name=coverage_name, full=full)
+        coverage=cov, full=full)
     return {"dir": vdir, "data": data, "html": html, "full": full}
