@@ -22,7 +22,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from ..utils import ensure_dir, run, which
+from ..utils import ensure_dir, inject_utr_features, run, which
 
 log = logging.getLogger("annomerge")
 
@@ -391,7 +391,7 @@ def build_tracks_json(preds: dict, details: dict, data_dir: Path,
             w = round(float(d["W_raw"]), 3)
         dst = data_dir / f"denovo_{name}.gff3"
         if Path(path).exists() and not dst.exists():
-            _link_or_copy(Path(path), dst)
+            inject_utr_features(Path(path), dst)
         denovo.append({"pred": name, "w": w, "file": f"denovo_{name}.gff3"})
     denovo.sort(key=lambda d: -d["w"])
     for rank, d in enumerate(denovo):
@@ -821,10 +821,14 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
                 desc="viewer samtools faidx")
 
     # 2) annotation + evidence tracks
-    _link_or_copy(Path(final_gff3), data / "final.gff3")
+    # display copies carry derived five_prime_UTR/three_prime_UTR rows
+    # so igv renders UTR thin / CDS thick / exon box distinctly
+    n5, n3 = inject_utr_features(Path(final_gff3), data / "final.gff3")
+    log.info("viewer: final.gff3 UTR rows added: %d 5' + %d 3'", n5, n3)
     for cand in (final_d / "goldset.genome.gff3", integ_d / "goldset.genome.gff3"):
         if cand.exists():
-            _link_or_copy(cand, data / "goldset.gff3")
+            n5, n3 = inject_utr_features(cand, data / "goldset.gff3")
+            log.info("viewer: goldset UTR rows added: %d 5' + %d 3'", n5, n3)
             break
     # protein evidence: display miniprot's native mRNA/CDS gff3 (NOT the
     # EVM match/match_part adapter file, which stays pipeline-internal)

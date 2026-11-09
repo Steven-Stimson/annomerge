@@ -17,6 +17,7 @@ Internal-invariant: a donor's introns within the CDS span must equal the CDS
 introns exactly — CDS internal structure is never rewritten by backfill.
 """
 from __future__ import annotations
+from .utils import inject_utr_features
 
 import logging
 import re
@@ -445,6 +446,8 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     out_gff3 = d / "augment.gff3"
     if not lazy([out_gff3], desc="augment merge"):
         _write(out_gff3, genes, stats)
+        n5, n3 = inject_utr_features(out_gff3, out_gff3)
+        log.info("augment: UTR rows added: %d 5' + %d 3'", n5, n3)
     stsv = d / "augment_stats.tsv"
     with open(stsv, "w") as fh:
         fh.write("key\tvalue\n")
