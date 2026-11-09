@@ -26,16 +26,212 @@ log = logging.getLogger("annomerge")
 SPECIES_RE = re.compile(r"\|species=([^\s|]+)")
 
 
-def run_miniprot(genome: Path, proteins: Path, out_dir: Path, threads: int) -> tuple[Path, Path]:
+# ---- miniprot alignment quality filters (vocabulary from mnpFormatter.pl) --
+MNP_TOKENS = ("UnStop", "UnShift", "minIden", "minPos", "minSize",
+              "maxSize", "maxRank", "R2Q", "Q2R", "topRank")
+
+
+def parse_mnp_filter(spec: str) -> dict:
+    """'--mnp-filter "UnStop,UnShift,Q2R=0.5,topRank=1"' -> filter dict.
+
+    Token names mirror mnpFormatter.pl: UnStop/UnShift are switches (present
+    = drop in-frame-stop / frameshift alignments); numeric thresholds default
+    to 0 = disabled.  maxRank keeps only Rank<=N mappings (0 = off);
+    topRank keeps the best N mappings per protein (0 = off); R2Q/Q2R bound
+    the ratio reference-CDS-length / aligned-CDS-length from each side
+    (reference lengths come from the homolog FASTA itself).
+    """
+    f = {"UnStop": False, "UnShift": False, "minIden": 0.0, "minPos": 0.0,
+         "minSize": 0, "maxSize": 10**9, "maxRank": 0, "R2Q": 0.0,
+         "Q2R": 0.0, "topRank": 0}
+    for tok in (spec or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        key, _, val = tok.partition("=")
+        key = key.strip()
+        if key in ("UnStop", "UnShift"):
+            f[key] = True
+        elif key in f:
+            f[key] = (float(val) if key in ("minIden", "minPos", "R2Q", "Q2R")
+                      else int(float(val)))
+        else:
+            raise ValueError(
+                f"unknown --mnp-filter token '{key}' "
+                f"(allowed: {', '.join(MNP_TOKENS)})")
+    return f
+
+
+def _fasta_lens(path: Path | None) -> dict:
+    lens: dict = {}
+    if not path or not Path(path).exists():
+        return lens
+    name, n = None, 0
+    for line in open(path):
+        if line.startswith(">"):
+            if name:
+                lens[name] = n
+            name, n = line[1:].split()[0], 0
+        else:
+            n += len(line.strip())
+    if name:
+        lens[name] = n
+    return lens
+
+
+def filter_miniprot_alignments(raw_gff: Path, raw_paf: Path,
+                               out_gff: Path, out_paf: Path,
+                               ref_fa: Path | None, filt: dict) -> dict:
+    """Apply mnp quality filters to one miniprot output pair (GFF+PAF).
+
+    GFF records (mRNA + CDS/stop_codon children) are filtered on Rank /
+    Identity / Positive / span / StopCodon / Frameshift / CDS-coverage
+    ratios; topRank keeps the best N mappings per protein afterwards.
+    PAF lines are dropped in sync (keyed by query+target+tstart).  Returns
+    per-reason drop counts plus 'kept'."""
+    lens = _fasta_lens(ref_fa)
+    counts: dict = {r: 0 for r in
+                    ("stop", "shift", "minIden", "minPos", "minSize",
+                     "maxSize", "maxRank", "R2Q", "Q2R", "topRank", "kept")}
+    records: list = []
+    cur: dict | None = None
+    with open(raw_gff) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 9:
+                continue
+            if f[2] == "mRNA":
+                if cur:
+                    records.append(cur)
+                attrs = {}
+                for kv in f[8].split(";"):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        attrs[k.strip()] = v.strip()
+                cur = {"lines": [line], "attrs": attrs, "seqid": f[0],
+                       "start": int(f[3]), "end": int(f[4]), "cds": 0}
+            elif cur is not None and f[2] in ("CDS", "stop_codon"):
+                cur["lines"].append(line)
+                if f[2] == "CDS":
+                    cur["cds"] += int(f[4]) - int(f[3]) + 1
+    if cur:
+        records.append(cur)
+
+    def _metrics(rec):
+        a = rec["attrs"]
+        rank = int(a.get("Rank", 0) or 0)
+        ident = float(a.get("Identity", 0) or 0)
+        target = (a.get("Target", "") or "").split()[0]
+        return rank, ident, target
+
+    kept: list = []
+    for rec in records:
+        a = rec["attrs"]
+        rank, ident, _t = _metrics(rec)
+        pos = float(a.get("Positive", 0) or 0)
+        stop = a.get("StopCodon", "0") not in ("", "0")
+        shift = a.get("Frameshift", "0") not in ("", "0")
+        span = rec["end"] - rec["start"] + 1
+        target = (a.get("Target", "") or "").split()[0]
+        reason = None
+        if filt["UnStop"] and stop:
+            reason = "stop"
+        elif filt["UnShift"] and shift:
+            reason = "shift"
+        elif ident < filt["minIden"]:
+            reason = "minIden"
+        elif pos < filt["minPos"]:
+            reason = "minPos"
+        elif span < filt["minSize"]:
+            reason = "minSize"
+        elif span > filt["maxSize"]:
+            reason = "maxSize"
+        elif filt["maxRank"] and rank > filt["maxRank"]:
+            reason = "maxRank"
+        else:
+            rl = lens.get(target)
+            if rl and rec["cds"]:
+                q2r = rec["cds"] / (3 * rl)
+                r2q = (3 * rl) / rec["cds"]
+                if filt["Q2R"] and q2r < filt["Q2R"]:
+                    reason = "Q2R"
+                elif filt["R2Q"] and r2q < filt["R2Q"]:
+                    reason = "R2Q"
+        if reason:
+            counts[reason] += 1
+        else:
+            kept.append(rec)
+    if filt["topRank"]:
+        by_tgt: dict = {}
+        for rec in kept:
+            by_tgt.setdefault(_metrics(rec)[2], []).append(rec)
+        kept2: list = []
+        for tgt, rs in by_tgt.items():
+            rs.sort(key=lambda r: (_metrics(r)[0], -_metrics(r)[1]))
+            kept2.extend(rs[:filt["topRank"]])
+            counts["topRank"] += max(0, len(rs) - filt["topRank"])
+        kept = kept2
+    counts["kept"] = len(kept)
+    # PAF sync: miniprot PAF excludes the stop codon from its coords, so the
+    # GFF mRNA start can differ from the PAF tstart by up to 3 bp (stop sits
+    # at the transcription-start side).  Index kept starts per (query, chr)
+    # and accept a match within 3 bp.
+    from bisect import bisect_left
+    groups: dict = {}
+    for r in kept:
+        groups.setdefault((_metrics(r)[2], r["seqid"]), []).append(r["start"] - 1)
+    for g in groups.values():
+        g.sort()
+
+    def _paf_kept(c):
+        g = groups.get((c[0], c[5]))
+        if not g:
+            return False
+        t = int(c[7])
+        i = bisect_left(g, t)
+        for j in (i - 1, i):
+            if 0 <= j < len(g) and abs(g[j] - t) <= 3:
+                return True
+        return False
+
+    with open(out_gff, "w") as out:
+        out.write("##gff-version 3\n")
+        for rec in kept:
+            out.writelines(rec["lines"])
+    with open(raw_paf) as fh, open(out_paf, "w") as out:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            c = line.split("\t")
+            if len(c) >= 9 and _paf_kept(c):
+                out.write(line)
+    return counts
+
+
+def run_miniprot(genome: Path, proteins: Path, out_dir: Path, threads: int,
+                 filt: dict | None = None) -> tuple[Path, Path]:
     """Run miniprot once, producing PAF and GFF."""
     ensure_dir(out_dir)
     paf = out_dir / "miniprot.paf"
     gff = out_dir / "miniprot.gff"
-    if not lazy([paf, gff], desc="miniprot"):
-        run(f"{which('miniprot')} -t{threads} --paf {genome} {proteins} > {paf}",
+    raw_paf = out_dir / "miniprot.raw.paf"
+    raw_gff = out_dir / "miniprot.raw.gff"
+    if not (raw_paf.exists() and raw_gff.exists()):
+        run(f"{which('miniprot')} -t{threads} --paf {genome} {proteins} > {raw_paf}",
             shell=True, log_file=out_dir / "miniprot.paf.log", desc="miniprot (paf)")
-        run(f"{which('miniprot')} -t{threads} --gff {genome} {proteins} > {gff}",
+        run(f"{which('miniprot')} -t{threads} --gff {genome} {proteins} > {raw_gff}",
             shell=True, log_file=out_dir / "miniprot.gff.log", desc="miniprot (gff)")
+    if not lazy([paf, gff], desc="miniprot mnp-filter"):
+        counts = filter_miniprot_alignments(raw_gff, raw_paf, gff, paf,
+                                            proteins, filt or {})
+        drops = {k: v for k, v in counts.items() if k != "kept" and v}
+        log.info("miniprot mnp-filter (%s): kept %d, dropped %s",
+                 Path(proteins).name, counts["kept"], drops or 0)
+        (out_dir / "mnp_filter.tsv").write_text(
+            "reason\tcount\n" + "".join(f"{k}\t{v}\n"
+                                          for k, v in sorted(counts.items())))
     return paf, gff
 
 
@@ -102,14 +298,16 @@ def _median(xs: list[float]) -> float:
     return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
 
 
-def _run_sets_miniprot(vi: ValidatedInputs, hdir: Path, threads: int) -> tuple[Path, Path]:
+def _run_sets_miniprot(vi: ValidatedInputs, hdir: Path, threads: int,
+                       filt: dict | None = None) -> tuple[Path, Path]:
     """Per-set miniprot runs, merged transparently into hdir/miniprot.{paf,gff}."""
     sroot = ensure_dir(hdir / "sets")
     n_sets = len(vi.homolog_sets)
     t_each = max(1, threads // n_sets)
     set_outputs = []
     for label, path in vi.homolog_sets.items():
-        set_outputs.append(run_miniprot(vi.genome, path, ensure_dir(sroot / label), t_each))
+        set_outputs.append(run_miniprot(vi.genome, path, ensure_dir(sroot / label),
+                                        t_each, filt))
     paf = hdir / "miniprot.paf"
     gff = hdir / "miniprot.gff"
     if not lazy([paf, gff], desc="merge per-set miniprot"):
@@ -195,15 +393,22 @@ def _relatedness(vi: ValidatedInputs, hdir: Path) -> tuple[Path, dict[str, float
 
 
 def run_homolog_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
-                       referee_min_wi: float = 0.6) -> dict:
+                       referee_min_wi: float = 0.6,
+                       mnp_filter: str = "") -> dict:
     hdir = ensure_dir(out_dir / "03.homolog")
     log.info("module 2 [homolog]: %s (%d set(s))", vi.homologs, len(vi.homolog_sets))
     membership = _load_membership(vi)
+    filt = parse_mnp_filter(mnp_filter)
+    active = [k for k in ("UnStop", "UnShift", "minIden", "minPos", "minSize",
+                          "maxRank", "R2Q", "Q2R", "topRank")
+              if filt.get(k)] or filt.get("maxSize", 10**9) != 10**9
+    if active:
+        log.info("homolog mnp-filter active (%s): %s", mnp_filter, active)
 
     if len(vi.homolog_sets) > 1:
-        paf, gff = _run_sets_miniprot(vi, hdir, threads)
+        paf, gff = _run_sets_miniprot(vi, hdir, threads, filt)
     else:
-        paf, gff = run_miniprot(vi.genome, vi.homologs, hdir, threads)
+        paf, gff = run_miniprot(vi.genome, vi.homologs, hdir, threads, filt)
 
     sets_tsv, rel, weight = _relatedness(vi, hdir)
 

@@ -78,7 +78,8 @@ def _run_evidence_pipeline(
         logging.getLogger("annomerge").warning("no RNA evidence; RNA branch skipped (auto-degraded)")
 
     # module 2: homology branch
-    results["homolog"] = run_homolog_branch(vi, out, threads, referee_min_wi=referee_min_wi)
+    results["homolog"] = run_homolog_branch(vi, out, threads, referee_min_wi=referee_min_wi,
+                       mnp_filter=mnp_filter)
 
     # module 2b: gold set
     if goldset and vi.has_rna:
@@ -95,7 +96,7 @@ def _run_evidence_pipeline(
 def merge(
     genome: Optional[str] = typer.Option(None, "-g", help="MANDATORY (unless -c): reference genome FASTA"),
     predictors: Optional[str] = typer.Option(None, "-P", help="MANDATORY (unless -c): de novo predictions, name=path comma list"),
-    homologs: Optional[str] = typer.Option(None, "-p", help="MANDATORY (unless -c): homolog protein FASTA, 'label=path' comma list OK (e.g. -p near=near.pep,far=far.fa; unlabeled -> filename stem). headers: >id|species=Genus_species. Multiple sets get per-set miniprot runs + relatedness-weighted evidence"),
+    homologs: Optional[str] = typer.Option(None, "-p", help="MANDATORY (unless -c): homolog protein FASTA, 'label=path' comma list OK (e.g. -p near=near.pep,far=far.fa; unlabeled -> filename stem). headers: >id|species=Genus_species. Multiple UNLABELED files merge into one protein pool (mnp-filtered, unweighted); explicit id=path labels keep the relatedness-weighted multi-set mode"),
     rna_list: Optional[str] = typer.Option(None, "-r", help="RNA list file (fastq/bam/gtf tags)"),
     bam: Optional[str] = typer.Option(None, "--bam", help="sorted+indexed RNA-seq BAM(s), comma list"),
     transcripts: Optional[str] = typer.Option(None, "--transcripts", help="StringTie transcripts GTF/GFF"),

@@ -267,10 +267,24 @@ def validate(
     log.info("genome: %d sequences", len(gids))
 
     h_sets = parse_homolog_sets(homologs)
+    # option B: multiple UNLABELED files are one protein pool (mnp filtering
+    # at stage 03 handles divergence; no per-set scoring).  Explicit
+    # id=path labels keep the dormant relatedness-weighted multi-set mode.
+    labeled = any("=" in it for it in homologs.split(","))
     membership = None
     if len(h_sets) == 1:
         label, hp = next(iter(h_sets.items()))
         check_homolog_headers(hp)
+    elif not labeled:
+        if not workdir:
+            raise InputError(
+                "multiple homolog FASTAs require workdir to cache the merged file"
+            )
+        hp = Path(workdir) / "input" / "homologs.merged.faa"
+        merge_homolog_fastas(h_sets, hp)
+        h_sets = {"all": hp}
+        log.info("homologs: %d unlabeled file(s) merged into one pool (%s)",
+                 len(homologs.split(",")), hp.name)
     else:
         if not workdir:
             raise InputError(
