@@ -166,7 +166,10 @@ def lift_goldset(goldset_dir: Path, stringtie_gtf: Path, d: Path,
             # against the reference annotation
             ts, te = exons[0][0], exons[-1][1]
             gid = f"GOLD.{oid}"
-            nm_attr = f';Name="{name}"' if name else ""
+            # short display name: the ORF/transcript id. TransDecoder's
+            # Name carries the full ORF/hit description (long); keep the
+            # browser label and popup readable.
+            nm_attr = f';Name="{oid}"'
             out.write(f"{seqid}\tgoldset\tgene\t{ts}\t{te}\t.\t{g_strand}\t.\t"
                       f"ID={gid}{nm_attr}\n")
             out.write(f"{seqid}\tgoldset\tmRNA\t{ts}\t{te}\t.\t{g_strand}\t.\t"

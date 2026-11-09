@@ -334,12 +334,14 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
 # ------------------------------------------------------------ tracks.json
 def _split_protein_tracks(pgff: Path, data_dir: Path,
                           set_weights: dict) -> list:
-    """Split protein evidence GFF3 into one file/track per homolog set.
+    """Split miniprot-native protein evidence GFF3 into one track per set.
 
-    Multi-set runs: 06.merge/protein.gff3 lines carry miniprot_<label>
-    sources -> one track per set, ordered by relatedness weight desc, the
-    closest set keeping the legacy cyan. Single-set runs: one legacy
-    "Protein (miniprot)" track. Returns [{set, weight, file, color}].
+    The browser shows miniprot's own mRNA/CDS GFF3 (03.homolog/miniprot.gff)
+    rather than the EVM match/match_part adapter format. Multi-set merged
+    runs prefix feature IDs with '<label>__' -> one track per homolog set,
+    ordered by relatedness weight desc, the closest set keeping the legacy
+    cyan. Single-set runs: one legacy "Protein (miniprot)" track. Returns
+    [{set, weight, file, color}].
     """
     by_src: dict = {}
     with open(pgff) as fh:
@@ -349,11 +351,14 @@ def _split_protein_tracks(pgff: Path, data_dir: Path,
             f = line.rstrip("\n").split("\t")
             if len(f) < 9:
                 continue
-            by_src.setdefault(f[1], []).append(line)
+            m = re.search(r"(?:ID|Parent)=([^\s;]+)", f[8])
+            tok = m.group(1) if m else ""
+            label = tok.split("__", 1)[0] if "__" in tok else "all"
+            by_src.setdefault(label, []).append(line)
     tracks = []
-    multi = any(s.startswith("miniprot_") for s in by_src)
+    multi = len(by_src) > 1 and "all" not in by_src
     for src in by_src:
-        label = src[len("miniprot_"):] if src.startswith("miniprot_") else "all"
+        label = src
         fname = f"protein_{label}.gff3"
         with open(data_dir / fname, "w") as out:
             out.write("##gff-version 3\n")
@@ -821,12 +826,10 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
         if cand.exists():
             _link_or_copy(cand, data / "goldset.gff3")
             break
-    pgff = None
-    for cand in (integ_d / "protein.gff3",
-                 Path((results.get("homolog") or {}).get("gff") or "")):
-        if cand and cand.exists():
-            pgff = cand
-            break
+    # protein evidence: display miniprot's native mRNA/CDS gff3 (NOT the
+    # EVM match/match_part adapter file, which stays pipeline-internal)
+    mp_gff = Path((results.get("homolog") or {}).get("gff") or "")
+    pgff = mp_gff if mp_gff.exists() else None
     # protein evidence split into one track per homolog set (multi-set runs:
     # 06.merge/protein.gff3 carries miniprot_<label> sources). Single-set
     # runs keep one legacy "Protein (miniprot)" track.
