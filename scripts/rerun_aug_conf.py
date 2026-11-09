@@ -3,6 +3,7 @@
 01-06 layout (fullrun_dualsets), then regenerate the viewer. Used to apply
 the isoform-collapse + Name-strip changes without re-running 01-06."""
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -16,7 +17,7 @@ from annomerge.modules.renamer import normalize_ids        # noqa: E402
 from annomerge.modules.sanity import sanity_filter         # noqa: E402
 from annomerge.modules.viewer import run_viewer            # noqa: E402
 
-OUT = REPO / "result/fullrun_dualsets"
+OUT = Path(os.environ.get("ANNO_OUT", str(REPO / "result/fullrun_dualsets")))
 TD = Path("/work/shidishen/AnnoMerge/test_data")
 SC = TD / "Saccharomyces_cerevisiae"
 vi = SimpleNamespace(genome=SC / "genome/GCF_000146045.2_R64_genomic.fna")

@@ -138,6 +138,10 @@ def merge(
                                       help="evidence dedup: absolute TPM floor for keeping a donor"),
     aug_junc_reads: int = typer.Option(3, "--aug-junc-reads",
                                        help="evidence dedup: junction-read corroboration min reads"),
+    aug_collapse_tol: int = typer.Option(5, "--aug-collapse-tol-bp",
+        help="isoform collapse tolerance: CDS outer boundaries within this "
+             "many bp (same intron chain, same strand) count as one "
+             "structure; representative = longest total UTR (0 = exact)"),
     aug_pwm_gate: float = typer.Option(-3.0, "--aug-pwm-gate",
                                        help="evidence dedup: splice-PWM gate threshold (log2 lift, calibrated)"),
     check_dependencies: bool = typer.Option(False, "--check-dependencies", "-c",
@@ -285,7 +289,8 @@ def merge(
             tpm_ratio=aug_tpm_ratio,
             min_tpm=aug_min_tpm,
             junc_min_reads=aug_junc_reads,
-            pwm_gate=aug_pwm_gate)
+            pwm_gate=aug_pwm_gate,
+            collapse_tol_bp=aug_collapse_tol)
         typer.secho(f"augment output: {aug['augment_gff3']}", fg="green")
         aug_sanity = sanity_filter(
             aug["augment_gff3"], vi.genome,

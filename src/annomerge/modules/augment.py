@@ -169,7 +169,8 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
                 tpm_ratio: float = 0.1,
                 min_tpm: float = 0.1,
                 junc_min_reads: int = 3,
-                pwm_gate: float | None = None) -> dict:
+                pwm_gate: float | None = None,
+                collapse_tol_bp: int = 5) -> dict:
     """dedup_mode: geometric = legacy ±jitter_merge_bp span clustering;
     evidence = EviAnn-style voting — splice-PWM gate on non-anchor introns,
     junction-read corroboration of unique UTR introns, and TPM-ratio test
@@ -445,7 +446,8 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     # ---------------- write
     out_gff3 = d / "augment.gff3"
     if not lazy([out_gff3], desc="augment merge"):
-        _collapse_isoforms(genes, stats)
+        stats["collapse_tol_bp"] = collapse_tol_bp
+        _collapse_isoforms(genes, stats, tol_bp=collapse_tol_bp)
         log.info("augment: %d isoform(s) collapsed (identical CDS, longest-UTR kept)", stats.get("isoforms_collapsed", 0))
         _write(out_gff3, genes, stats)
         n5, n3 = inject_utr_features(out_gff3, out_gff3)
@@ -699,40 +701,80 @@ def _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, c
             stats[f"utr_from_{src.split(':')[0]}"] += 1
 
 
-def _collapse_isoforms(genes: list, stats: Counter) -> None:
-    """Collapse isoforms with identical CDS structure within a gene (same
-    strand + same CDS intervals => same intron chain).  The representative
-    is the isoform with the longest total UTR (UTR evidence reaches
-    furthest); ties break to the higher donor TPM.  Recorded in
-    stats['isoforms_collapsed']."""
+def _cds_intron_chain(tx) -> tuple:
+    """Intron chain implied by a transcript's CDS segments (exact)."""
+    cds = sorted(tx.cds, key=lambda c: (c.start, c.end))
+    return tuple((cds[i].end + 1, cds[i + 1].start - 1)
+                 for i in range(len(cds) - 1)
+                 if cds[i].end + 1 <= cds[i + 1].start - 1)
+
+
+def _collapse_isoforms(genes: list, stats: Counter,
+                       tol_bp: int = 0) -> None:
+    """Collapse isoforms with the same CDS structure within a gene.
+
+    Same structure = same strand + same intron chain + CDS outer boundaries
+    (first CDS start, last CDS end) within ``tol_bp`` bp — terminal trim
+    differences <= tol_bp (e.g. stop-codon boundary calls differing by a
+    few bp) are treated as one structure.  tol_bp=0 restores exact-interval
+    matching.  The representative is the isoform with the longest total UTR
+    (UTR evidence reaches furthest); ties break to the higher donor TPM.
+    Recorded in stats['isoforms_collapsed']."""
     for gene in genes:
         if len(gene.isoforms) <= 1:
             continue
+        # group by exact intron chain (internal CDS segments are then fixed;
+        # only the two outer CDS ends may float within tol_bp)
         groups: dict = {}
         for tx in gene.isoforms:
-            key = (tx.mrna.strand,
-                   tuple(sorted((c.start, c.end) for c in tx.cds)))
+            key = (tx.mrna.strand, _cds_intron_chain(tx))
             groups.setdefault(key, []).append(tx)
         if len(groups) == len(gene.isoforms):
             continue
+
+        def _utr_total(t):
+            return sum(e - s + 1 for part in _utr_parts(t)
+                       for (s, e) in part)
+
+        def _tpm(t):
+            m = re.search(r"donor_tpm=([\d.eE+-]+)",
+                          getattr(t.mrna, "attrs", "") or "")
+            return float(m.group(1)) if m else 0.0
+
+        def _outer(t):
+            cds = sorted(t.cds, key=lambda c: (c.start, c.end))
+            return (cds[0].start, cds[-1].end)
+
         keep = []
         for txs in groups.values():
             if len(txs) == 1:
                 keep.append(txs[0])
                 continue
+            # union-find: cluster isoforms whose outer CDS ends are pairwise
+            # within tol_bp of each other
+            n = len(txs)
+            parent = list(range(n))
 
-            def _utr_total(t):
-                return sum(e - s + 1 for part in _utr_parts(t)
-                           for (s, e) in part)
+            def find(i):
+                while parent[i] != i:
+                    parent[i] = parent[parent[i]]
+                    i = parent[i]
+                return i
 
-            def _tpm(t):
-                m = re.search(r"donor_tpm=([\d.eE+-]+)",
-                              getattr(t.mrna, "attrs", "") or "")
-                return float(m.group(1)) if m else 0.0
-
-            txs.sort(key=lambda t: (_utr_total(t), _tpm(t)), reverse=True)
-            keep.append(txs[0])
-            stats["isoforms_collapsed"] += len(txs) - 1
+            outs = [_outer(t) for t in txs]
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if (abs(outs[i][0] - outs[j][0]) <= tol_bp
+                            and abs(outs[i][1] - outs[j][1]) <= tol_bp):
+                        parent[find(i)] = find(j)
+            clusters: dict = {}
+            for i in range(n):
+                clusters.setdefault(find(i), []).append(txs[i])
+            for cl in clusters.values():
+                cl.sort(key=lambda t: (_utr_total(t), _tpm(t)),
+                        reverse=True)
+                keep.append(cl[0])
+                stats["isoforms_collapsed"] += len(cl) - 1
         order = {id(t): i for i, t in enumerate(gene.isoforms)}
         keep.sort(key=lambda t: order[id(t)])
         gene.isoforms = keep

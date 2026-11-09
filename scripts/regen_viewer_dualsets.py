@@ -9,7 +9,9 @@ from types import SimpleNamespace
 sys.path.insert(0, "/work/shidishen/AnnoMerge/annomerge/src")
 from annomerge.modules.viewer import run_viewer
 
-OUT = Path("/work/shidishen/AnnoMerge/annomerge/result/fullrun_dualsets")
+import os
+OUT = Path(os.environ.get("ANNO_OUT",
+    "/work/shidishen/AnnoMerge/annomerge/result/fullrun_dualsets"))
 TD = Path("/work/shidishen/AnnoMerge/test_data")
 SC = TD / "Saccharomyces_cerevisiae"
 
