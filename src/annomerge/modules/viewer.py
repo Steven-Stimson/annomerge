@@ -2,9 +2,13 @@
 
 Produces, under <out>/viewer/:
   data/                              genome.fa(.fai), final.gff3, goldset.gff3,
-                                     protein.gff3, stringtie.gtf, junctions.bed,
-                                     denovo_<name>.gff3, coverage bedgraph
-                                     (optional), genes.json, tracks.json
+                                     protein.gff3 (per homolog set),
+                                     stringtie.gtf, denovo_<name>.gff3,
+                                     coverage bedgraph (optional),
+                                     genes.json, tracks.json
+                                     (junctions.bed is NOT shipped: the
+                                     HISAT2 junction track was removed from
+                                     the browser by design)
   AnnoMerge_evidence_browser.html    single-file offline browser (all data
                                      inlined as dataURIs, double-click to open)
 
@@ -650,7 +654,7 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         cov_files.append(covcfg["merged"]["file"])
     for s in covcfg.get("samples", []):
         cov_files.append(s["file"])
-    ann_names = ["final.gff3", "goldset.gff3", "stringtie.gtf", "junctions.bed"]
+    ann_names = ["final.gff3", "goldset.gff3", "stringtie.gtf"]
     ann_names += [d["file"] for d in tracks_cfg.get("denovo", [])]
     ann_names += [t["file"] for t in tracks_cfg.get("protein", [])]
     ann_names += list(dict.fromkeys(cov_files))
@@ -858,9 +862,9 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
     st_gtf = rna.get("stringtie_gtf")
     if st_gtf and Path(st_gtf).exists():
         _link_or_copy(Path(st_gtf), data / "stringtie.gtf")
-    junc = rna.get("junctions_bed")
-    if junc and Path(junc).exists():
-        _link_or_copy(Path(junc), data / "junctions.bed")
+    # NOTE: the HISAT2 junctions.bed track was removed from the browser by
+    # design (user request): junctions remain in 02.rnaseq for the pipeline,
+    # but are no longer copied into the viewer data/ or embedded.
 
     # coverage bedgraphs: one per BAM + a merged track over ALL samples;
     # must run BEFORE build_tracks_json so its metadata lands in tracks.json

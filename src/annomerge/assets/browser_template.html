@@ -39,6 +39,9 @@
   #gene-table table { width: 100%; border-collapse: collapse; }
   #gene-table th { position: sticky; top: 0; background: #f5f5f5; padding: 6px 8px; text-align: left;
                    border-bottom: 1px solid #ddd; font-weight: 600; }
+  #gene-table th select.col-flt { font-size: 11px; font-weight: 400; padding: 1px 2px;
+                                  margin-left: 2px; border: 1px solid #ccc; border-radius: 3px;
+                                  background: #fff; max-width: 76px; }
   #gene-table td { padding: 4px 8px; border-bottom: 1px solid #f0f0f0; cursor: pointer; white-space: nowrap; }
   #gene-table tr:hover td { background: #eaf2fa; }
   #gene-table tr.current td { background: #d6e6f5; }
@@ -103,10 +106,12 @@
       <div id="list-head">
         <div class="list-title">Gene list</div>
         <div class="flt-row">
-          <span class="chip active" data-tier="all">All</span>
-          <span class="chip" data-tier="strong">strong</span>
-          <span class="chip" data-tier="moderate">moderate</span>
-          <span class="chip" data-tier="weak">weak</span>
+          <select id="flt-tier" title="Filter by tier">
+            <option value="all">Tier: All</option>
+            <option value="strong">Tier: strong</option>
+            <option value="moderate">Tier: moderate</option>
+            <option value="weak">Tier: weak</option>
+          </select>
           <select id="flt-chr" title="Filter by chromosome"><option value="">All chromosomes</option></select>
           <select id="flt-sort" title="Sort gene list">
             <option value="gff">Sort: GFF order</option>
@@ -122,7 +127,24 @@
       </div>
       <div id="gene-table">
         <table>
-          <thead><tr><th>Gene</th><th>Transcript</th><th>Tier</th><th>RNA</th><th>Protein</th><th title="GoldSet origin">GoldSet</th></tr></thead>
+          <thead><tr><th>Gene</th><th>Transcript</th><th>Tier</th>
+            <th>RNA <select id="flt-rna" class="col-flt" title="Filter by RNA support range">
+              <option value="">all</option>
+              <option value="hi">≥0.8</option>
+              <option value="mid">0.5–0.8</option>
+              <option value="lo">&lt;0.5</option>
+            </select></th>
+            <th>Protein <select id="flt-prot" class="col-flt" title="Filter by protein support range">
+              <option value="">all</option>
+              <option value="hi">≥0.8</option>
+              <option value="mid">0.5–0.8</option>
+              <option value="lo">&lt;0.5</option>
+            </select></th>
+            <th title="GoldSet origin">GoldSet <select id="flt-gold" class="col-flt" title="Filter by GoldSet origin">
+              <option value="">all</option>
+              <option value="yes">✓</option>
+              <option value="no">no</option>
+            </select></th></tr></thead>
           <tbody id="gene-tbody"></tbody>
         </table>
       </div>
@@ -143,6 +165,9 @@ let genes = [];
 let browser = null;
 let currentTier = "all";
 let fltChr = "";
+let fltRna = "";     // "" | hi (>=0.8) | mid (0.5-0.8) | lo (<0.5)
+let fltProt = "";
+let fltGold = "";    // "" | yes | no
 let sortMode = "gff";
 let sortDir = "asc";
 let chromOrder = new Map();   // chrom name -> index in fai
@@ -174,16 +199,15 @@ const TRACKS_BEFORE = [
     url: "data/final.gff3", color: tierColorFn, height: 220,
     displayMode: "EXPANDED", visibilityWindow: -1 }
 ];
-// evidence tracks ordered by evidential weight: GoldSet > RNA > junction >
-// transcript assembly > protein; de novo predictors appended last (by W)
+// evidence tracks ordered by evidential weight: GoldSet > RNA coverage >
+// transcript assembly > protein; de novo predictors appended last (by W).
+// (the HISAT2 junction track was removed by design: it overlaps the RNA
+// coverage/StringTie evidence and clutters the browser)
 const TRACKS_EVIDENCE = [
   { name: "GoldSet (TransDecoder)", type: "annotation", format: "gff3",
     url: "data/goldset.gff3", color: "#2ca02c", height: 120,
     visibilityWindow: -1 },
 /*__COVERAGE_TRACK__*/
-  { name: "Junction (HISAT2)", type: "annotation", format: "bed",
-    url: "data/junctions.bed", color: "#6a3d9a", height: 80,
-    visibilityWindow: -1 },
   { name: "Transcript Assembly (StringTie)", type: "annotation", format: "gtf",
     url: "data/stringtie.gtf", color: "#9467bd", height: 160,
     displayMode: "EXPANDED", visibilityWindow: -1 },
@@ -272,6 +296,16 @@ function renderTable(keyword) {
     if (fltChr && g.seqid !== fltChr) continue;
     for (const t of (g.isoforms || [])) {
       if (currentTier !== "all" && t.tier !== currentTier) continue;
+      const rv = parseFloat(t.rna) || 0;
+      if (fltRna === "hi" && rv < 0.8) continue;
+      if (fltRna === "mid" && (rv < 0.5 || rv >= 0.8)) continue;
+      if (fltRna === "lo" && rv >= 0.5) continue;
+      const pv = parseFloat(t.prot) || 0;
+      if (fltProt === "hi" && pv < 0.8) continue;
+      if (fltProt === "mid" && (pv < 0.5 || pv >= 0.8)) continue;
+      if (fltProt === "lo" && pv >= 0.5) continue;
+      if (fltGold === "yes" && t.gold !== "yes") continue;
+      if (fltGold === "no" && t.gold === "yes") continue;
       pool.push({ g, t });
     }
   }
@@ -458,14 +492,16 @@ document.getElementById("gene-search").addEventListener("keydown", (e) => {
 document.getElementById("gene-search").addEventListener("input", (e) => {
   renderTable(e.target.value);
 });
-document.querySelectorAll(".chip[data-tier]").forEach(chip => {
-  chip.addEventListener("click", () => {
-    document.querySelectorAll(".chip[data-tier]").forEach(c => c.classList.remove("active"));
-    chip.classList.add("active");
-    currentTier = chip.dataset.tier;
+function bindFilter(id, setter) {
+  document.getElementById(id).addEventListener("change", (e) => {
+    setter(e.target.value);
     renderTable(document.getElementById("gene-search").value);
   });
-});
+}
+bindFilter("flt-tier", v => currentTier = v);
+bindFilter("flt-rna", v => fltRna = v);
+bindFilter("flt-prot", v => fltProt = v);
+bindFilter("flt-gold", v => fltGold = v);
 document.getElementById("side-toggle").addEventListener("click", () => {
   document.body.classList.toggle("side-collapsed");
   const collapsed = document.body.classList.contains("side-collapsed");
