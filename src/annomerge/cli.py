@@ -235,6 +235,15 @@ def merge(
         typer.secho(f"unknown --merge-mode {merge_mode!r} (isoform|evm)",
                     fg="red", err=True)
         raise typer.Exit(2)
+    # isoform resolution needs RNA evidence (StringTie + gold set); with
+    # homolog proteins only the pipeline degrades to EVM-only integration
+    # and the viewer shows the EVM result (final = evm.sanity.gff3).
+    if not vi.has_rna and mode == "isoform":
+        mode = "evm"
+        typer.secho(
+            "no RNA evidence: --merge-mode isoform unavailable "
+            "(isoform resolution / UTR backfill need RNA); "
+            "falling back to EVM-only integration", fg="yellow", err=True)
     gold_dir = out / "04.goldset"
     goldset_dir = gold_dir if (gold_dir / "transcripts.fa.transdecoder.gff3").exists() else None
     stringtie_gtf = (results.get("rna", {}) or {}).get("stringtie_gtf")
@@ -337,7 +346,7 @@ def merge(
                   "threads": threads, "homologs": homologs,
                   "rna": rna_list or bam or transcripts or "none",
                   "busco": busco or "none",
-                  "merge_mode": merge_mode,
+                  "merge_mode": mode,
                   "w_rna": w_rna, "w_homolog": w_homolog,
                   "w_conserve": w_conserve, "w_structure": w_structure,
                   "min_predictor_score": min_predictor_score,
