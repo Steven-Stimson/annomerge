@@ -696,6 +696,15 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         'url: (IDX[d.file] ? DATA_URI[IDX[d.file][0]] : DATA_URI[d.file]), '
         'indexURL: (IDX[d.file] ? DATA_URI[IDX[d.file][1]] : undefined)')
 
+    # 3b) drop evidence tracks whose data file is absent (e.g. homolog-only
+    #     runs have no goldset / junctions / stringtie): the offline
+    #     single-file page cannot resolve leftover data/... relative URLs.
+    for name in dict.fromkeys(ann_names):
+        if name in files or name in indexed_map:
+            continue
+        html = re.sub(r'\{[^{}]*?url: "data/' + re.escape(name)
+                      + r'"[^{}]*?\},?[ \t]*\n', '', html)
+
     # 4) reference block: drop the id (an id makes igv consult its built-in
     #    genome registry and fail with "Unknown genome id" offline)
     html = html.replace('name: "$REF_NAME$"', f'name: "{ref_name}"')
