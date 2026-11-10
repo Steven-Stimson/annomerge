@@ -194,6 +194,10 @@ let sortMode = "gff";
 let sortDir = "asc";
 let chromOrder = new Map();   // chrom name -> index in fai
 let denovoMeta = [];          // [{pred, w, color}]
+function wTag(d) {
+  // " (W=0.86)" suffix, hidden when the run carries no predictor scores
+  return (d.w === null || d.w === undefined) ? "" : " (W=" + Number(d.w).toFixed(2) + ")";
+}
 function setStatus(msg) { document.getElementById("status").textContent = msg; }
 function gidNum(g) {
   const m = g.match(/(\d+)(?!.*\d)/);
@@ -243,7 +247,7 @@ async function loadDenovoTracks() {
   const cfg = await resp.json();
   denovoMeta = cfg.denovo || [];
   denovoTracks = denovoMeta.map(d => ({
-    name: `de novo predictions: ${d.pred} (W=${Number(d.w).toFixed(2)})`,
+    name: `de novo predictions: ${d.pred}${wTag(d)}`,
     type: "annotation", format: "gff3",
     url: "data/" + d.file, color: d.color, height: 50,
     visibilityWindow: -1
@@ -490,7 +494,7 @@ function renderDetail(g) {
     return `<div class="ev-row" title="fraction of transcript CDS covered by ${esc(d.pred)} predictions (UTRs excluded)">` +
            `<span class="ev-bar" style="width:${Math.round(frac * 80)}px;background:${d.color}"></span>` +
            `<span class="ev-name">${esc(d.pred)}</span>` +
-           `<span class="ev-w">W=${Number(d.w).toFixed(2)}</span>` +
+           `<span class="ev-w">${wTag(d).trim()}</span>` +
            `<span class="ev-val">${frac.toFixed(2)}</span></div>`;
   }).join("");
   // per-transcript cards: each transcript's own metrics
@@ -503,7 +507,7 @@ function renderDetail(g) {
     const tdn = (t.denovo && denovoMeta.length) ? denovoMeta.map(d => {
       const frac = t.denovo[d.pred] !== undefined ? t.denovo[d.pred] : 0;
       return `<span class="ev-bar" style="width:${Math.round(frac * 40)}px;background:${d.color}"></span>` +
-             `${esc(d.pred)} <span class="dim">W=${Number(d.w).toFixed(2)}</span> <b>${frac.toFixed(2)}</b>`;
+             `${esc(d.pred)} <span class="dim">${wTag(d).trim()}</span> <b>${frac.toFixed(2)}</b>`;
     }).join("<br>") : "";
     return `<div class="tx-card">
       <div class="tx-head"><span class="tx-id">${esc(t.tid)}</span>` +

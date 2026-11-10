@@ -127,8 +127,8 @@ def busco_proteins(faa: Path, lineage: Path, out_dir: Path,
     # BUSCO -o <name> writes <name>/short_summary.*.txt under the run dir
     summaries = list(bdir.glob("busco_run/short_summary*.txt"))
     if not summaries:
-        run(f"cd {bdir} && PYTHONPATH= {which('busco')} -i {faa} -m proteins "
-            f"-l {lineage} -o busco_run --offline -c {threads} -f",
+        run(f"cd {bdir} && PYTHONPATH= {which('busco')} -i {Path(faa).resolve()} -m proteins "
+            f"-l {Path(lineage).resolve()} -o busco_run --offline -c {threads} -f",
             shell=True, log_file=bdir / "busco.log", desc="busco (report)")
         summaries = list(bdir.glob("busco_run/short_summary*.txt"))
     if not summaries:

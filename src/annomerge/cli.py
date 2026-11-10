@@ -375,31 +375,143 @@ def merge(
     typer.secho(f"deliverables: {out}/01.validate ... 09.result", fg="green")
 
 
-@app.command(help="Evidence auditing / QC of an existing annotation (no EVM).")
+def _annotation_to_gff3(anno: Path, dst: Path) -> Path:
+    """Normalize an evaluated annotation to GFF3.
+
+    GFF3 input passes through unchanged: its gene/mRNA structure must be
+    preserved (gffread -o silently DROPS gene features, which would empty
+    the sanity/confidence model). GTF input (gene_id/transcript_id attrs,
+    no ID=/Parent=) is converted by a small pure-Python writer: one gene
+    per gene_id (span = union of its features), one mRNA per transcript_id,
+    exon/CDS rows re-pointed with Parent=<transcript>.
+    """
+    if dst.exists():
+        return dst
+    import logging
+    log = logging.getLogger("annomerge")
+    is_gtf = False
+    with open(anno) as fh:
+        for ln in fh:
+            if ln.startswith("#"):
+                continue
+            f = ln.rstrip("\n").split("\t")
+            if len(f) < 9:
+                continue
+            a = f[8]
+            is_gtf = ("gene_id" in a and "ID=" not in a
+                      and "Parent=" not in a)
+            break
+    if not is_gtf:
+        dst.write_bytes(anno.read_bytes())
+        log.info("evaluate: annotation already GFF3 -> copied (%s)", dst.name)
+        return dst
+
+    def _attrs(s: str) -> dict:
+        av = {}
+        for kv in s.rstrip(";").split(";"):
+            kv = kv.strip()
+            if not kv:
+                continue
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+            elif " " in kv:
+                k, v = kv.split(None, 1)
+            else:
+                k, v = kv, ""
+            av[k.strip()] = v.strip().strip('"')
+        return av
+
+    genes: dict = {}
+    with open(anno) as fh:
+        for ln in fh:
+            if ln.startswith("#"):
+                continue
+            f = ln.rstrip("\n").split("\t")
+            if len(f) < 9:
+                continue
+            seqid, src, ftype = f[0], f[1], f[2]
+            start, end = int(f[3]), int(f[4])
+            strand, phase, av = f[6], f[7], _attrs(f[8])
+            gid = av.get("gene_id")
+            if not gid:
+                continue
+            g = genes.setdefault(gid, {"seqid": seqid, "src": src,
+                                       "strand": strand, "start": start,
+                                       "end": end, "txs": {}})
+            g["start"] = min(g["start"], start)
+            g["end"] = max(g["end"], end)
+            tid = av.get("transcript_id")
+            if not tid:
+                continue
+            t = g["txs"].setdefault(tid, {"start": start, "end": end,
+                                          "strand": strand, "feats": []})
+            t["start"] = min(t["start"], start)
+            t["end"] = max(t["end"], end)
+            t["feats"].append((ftype, start, end, strand, phase))
+    n_g = n_t = n_f = 0
+    with open(dst, "w") as out:
+        out.write("##gff-version 3\n")
+        for gid, g in genes.items():
+            n_g += 1
+            out.write(f'{g["seqid"]}\t{g["src"]}\tgene\t{g["start"]}\t'
+                      f'{g["end"]}\t.\t{g["strand"]}\t.\tID={gid}\n')
+            for tid, t in g["txs"].items():
+                n_t += 1
+                out.write(f'{g["seqid"]}\t{g["src"]}\tmRNA\t{t["start"]}\t'
+                          f'{t["end"]}\t.\t{t["strand"]}\t.\t'
+                          f'ID={tid};Parent={gid}\n')
+                for ftype, s, e, strand, phase in t["feats"]:
+                    ftype = "exon" if ftype.lower() in ("exon", "cds") \
+                        else ftype
+                    n_f += 1
+                    out.write(f'{g["seqid"]}\t{g["src"]}\t{ftype}\t{s}\t{e}'
+                              f'\t.\t{strand}\t{phase}\tParent={tid}\n')
+    log.info("evaluate: GTF -> GFF3: %d genes, %d mRNAs, %d sub-features",
+             n_g, n_t, n_f)
+    return dst
+
+
+@app.command(help="Evidence auditing / QC of an existing annotation (no EVM integration).")
 def evaluate(
     genome: Optional[str] = typer.Option(None, "-g", help="MANDATORY (unless -c): reference genome FASTA"),
     annotation: Optional[str] = typer.Option(None, "-a", help="MANDATORY (unless -c): annotation GFF3/GTF to evaluate"),
-    homologs: Optional[str] = typer.Option(None, "-p", help="MANDATORY (unless -c): homolog protein FASTA"),
+    homologs: Optional[str] = typer.Option(None, "-p", help="MANDATORY (unless -c): homolog protein FASTA, 'label=path' comma list OK (same rules as merge)"),
+    predictors: Optional[str] = typer.Option(None, "-P", help="optional de novo predictions 'name=path' comma list (evidence tracks + denovo_support attributes only; no scoring in evaluate)"),
+    rna_list: Optional[str] = typer.Option(None, "-r", help="RNA list file (fastq/bam/gtf tags)"),
+    bam: Optional[str] = typer.Option(None, "--bam", help="sorted+indexed RNA-seq BAM(s), comma list"),
+    transcripts: Optional[str] = typer.Option(None, "--transcripts", help="StringTie transcripts GTF/GFF"),
+    busco: Optional[str] = typer.Option(None, "--busco", help="local BUSCO odb lineage path (offline)"),
+    core: Optional[str] = typer.Option(None, "--core", help="custom core conserved protein FASTA"),
+    omark_db: Optional[str] = typer.Option(None, "--omark-db", help="OMAmer database (.h5) for OMArk orthology QC (after BUSCO)"),
+    paf: Optional[str] = typer.Option(None, "--paf", help="precomputed miniprot PAF"),
+    mnp_filter: Optional[str] = typer.Option(None, "--mnp-filter",
+        help="miniprot homolog quality filter, comma tokens: UnStop,UnShift,Q2R=0.5,topRank=1 ... "
+             "(empty = no filter; same semantics as merge)"),
+    species_map: Optional[str] = typer.Option(None, "--species-map", help="queryID -> species TSV"),
+    referee_min_wi: float = typer.Option(0.6, "--referee-min-wi", help="referee filter wi=cov*ident"),
+    goldset: bool = typer.Option(True, "--goldset/--no-goldset",
+                                 help="build the Gold set from RNA evidence (enables goldset-origin support; needs RNA input)"),
+    goldset_min_orf: int = typer.Option(50, "--goldset-min-orf", help="min ORF length (aa) in Gold set"),
+    threads: int = typer.Option(8, "-t", help="threads"),
+    outdir: str = typer.Option("./annomerge_eval_out", "-o", help="output directory"),
+    viewer_off: bool = typer.Option(False, "--no-viewer", help="skip the evidence browser build"),
+    viewer_full: bool = typer.Option(False, "--viewer-full",
+                                     help="evidence browser: embed genome sequence (base-level track). "
+                                          "Default is the lite build (coordinates only, much smaller)"),
     check_dependencies: bool = typer.Option(False, "--check-dependencies", "-c",
                                             help="verify all external dependencies and exit"),
-    rna_list: Optional[str] = typer.Option(None, "-r", help="RNA list file"),
-    bam: Optional[str] = typer.Option(None, "--bam"),
-    transcripts: Optional[str] = typer.Option(None, "--transcripts"),
-    busco: Optional[str] = typer.Option(None, "--busco"),
-    core: Optional[str] = typer.Option(None, "--core"),
-    predictors: Optional[str] = typer.Option(None, "-P", help="optional de novo GFF3s (support rating only)"),
-    paf: Optional[str] = typer.Option(None, "--paf"),
-    species_map: Optional[str] = typer.Option(None, "--species-map"),
-    skip_omark: bool = typer.Option(False, "--skip-omark"),
-    threads: int = typer.Option(8, "-t"),
-    outdir: str = typer.Option("./annomerge_eval_out", "-o"),
-    referee_min_wi: float = typer.Option(0.6, "--referee-min-wi"),
-    goldset: bool = typer.Option(True, "--goldset/--no-goldset"),
-    goldset_min_orf: int = typer.Option(50, "--goldset-min-orf"),
-    config: Optional[str] = typer.Option(None, "--config"),
+    config: Optional[str] = typer.Option(None, "--config", help="resolved_params.yaml from a previous run"),
     verbose: bool = typer.Option(False, "--verbose"),
     version: Optional[bool] = typer.Option(None, "--version", callback=_version_callback, is_eager=True),
 ):
+    """Evaluate an existing annotation with the SAME assessment chain as the
+    integration flow: evidence collection (RNA / homolog proteins / Gold
+    set) -> sanity filter -> coverage-aware confidence tiers -> support
+    tags on every gene and mRNA -> HTML report (BUSCO + OMArk + stats)
+    -> single-file offline evidence browser. Original IDs are preserved
+    (no renamer). RNA inputs, -P predictors, --busco/--core and --omark-db
+    are all optional; only -g/-a/-p are mandatory.
+    """
     if check_dependencies:
         from .deps import check_all, format_table
         table = format_table(check_all())
@@ -417,16 +529,85 @@ def evaluate(
     params = {k: v for k, v in locals().items() if k not in ("out",)}
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
-        _run_evidence_pipeline(
+        results, vi = _run_evidence_pipeline(
             out, genome, homologs, rna_list, bam, transcripts, busco, core,
             species_map, threads, referee_min_wi, goldset, goldset_min_orf,
-            annotation=annotation,
+            predictors=predictors, annotation=annotation,
+            mnp_filter=mnp_filter or "",
         )
     except InputError as e:
         typer.secho(f"input error: {e}", fg="red", err=True)
         raise typer.Exit(2)
-    for stage in ("confidence annotation", "report"):
-        _stub(stage)
+
+    # ---- module 6 (evaluate): normalise the annotation to GFF3 (GTF
+    # converted in-Python; GFF3 passed through — gffread would drop the
+    # gene features), sanity-filter exactly like the integration flow, then
+    # run the identical assessment chain. Original IDs are preserved.
+    from .modules.sanity import sanity_filter
+    eval_d = ensure_dir(out / "06.evaluate")
+    raw_gff3 = _annotation_to_gff3(Path(annotation), eval_d / "annotation.gff3")
+    sanity_stats = sanity_filter(
+        raw_gff3, vi.genome,
+        eval_d / "eval.sanity.gff3", eval_d / "sanity_filter.tsv")
+    typer.secho(f"sanity filter: {sanity_stats or 'skipped (exists)'}", fg="green")
+    final_gff3 = eval_d / "eval.sanity.gff3"
+    # Gold set lift to genome coordinates: merge does this inside EVM;
+    # evaluate has no EVM, so lift directly whenever the Gold set exists.
+    rna = results.get("rna") or {}
+    gold_dir = out / "04.goldset"
+    if (gold_dir / "transcripts.fa.transdecoder.gff3").exists() and rna.get("stringtie_gtf"):
+        from .modules.evm import lift_goldset
+        lift_goldset(gold_dir, rna["stringtie_gtf"], eval_d,
+                     eval_d / "goldset.genome.gff3", genome_fa=vi.genome)
+    # module 6: coverage-aware evidence tiering (identical to merge)
+    from .modules.confidence import confidence_annotation, annotate_support
+    assess_d = ensure_dir(out / "08.assessment")
+    hom_res = results.get("homolog") or {}
+    set_w = hom_res.get("set_weights") or {}
+    membership = hom_res.get("membership") or {}
+    protein_weights = ({p: set_w.get(lab, 1.0) for p, lab in membership.items()}
+                       if len(set_w) > 1 else None)
+    conf_stats = confidence_annotation(
+        final_gff3, vi.genome,
+        rna.get("junctions_bed"),
+        hom_res.get("gff"),
+        rna.get("bams", []),
+        eval_d / "goldset.genome.gff3",
+        eval_d / "sanity_filter.tsv",
+        assess_d / "confidence.tsv",
+        protein_weights=protein_weights)
+    typer.secho(f"confidence tiers: {conf_stats or 'skipped (exists)'}", fg="green")
+    # module 6b: Tier / RNA_support / Protein_support / denovo_support /
+    # Flags on every gene and mRNA + CDS numbering (same as merge)
+    tag_stats = annotate_support(final_gff3, assess_d / "confidence.tsv",
+                                 vi.predictors or {})
+    typer.secho(f"support tags: {tag_stats}", fg="green")
+    # module 7/8: report (gene set stats + completeness + charts)
+    import shlex, sys
+    from .modules.report import run_report
+    rep = run_report(
+        out, final_gff3, vi.genome, eval_d,
+        busco_lineage=vi.busco, threads=threads,
+        omark_db=Path(omark_db) if omark_db else None,
+        run_meta={"mode": "evaluate", "annotation": Path(annotation).name,
+                  "predictors": ",".join(vi.predictors or {}),
+                  "genome": Path(genome).name, "outdir": str(out),
+                  "command": shlex.join(sys.argv),
+                  "timestamp": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+                  "threads": threads, "homologs": homologs,
+                  "rna": rna_list or bam or transcripts or "none",
+                  "busco": busco or "none", "omark": omark_db or "none",
+                  "merge_mode": "evaluate", "goldset": goldset,
+                  "referee_min_wi": referee_min_wi})
+    typer.secho(f"report: {rep['html']}", fg="green")
+    # evidence browser (igv.js, single-file offline) — same as merge
+    if not viewer_off:
+        from .modules.viewer import run_viewer
+        vw = run_viewer(out, vi, results, vi.predictors or {}, {},
+                        final_gff3, eval_d, eval_d, threads,
+                        full=viewer_full)
+        typer.secho(f"evidence browser: {vw['html']}", fg="green")
+    typer.secho(f"deliverables: {out}/01.validate ... 09.result", fg="green")
 
 
 if __name__ == "__main__":

@@ -395,7 +395,10 @@ def build_tracks_json(preds: dict, details: dict, data_dir: Path,
     tracks and the per-sample/merged RNA coverage metadata."""
     denovo = []
     for name, path in preds.items():
-        w = 0.0
+        # W_raw comes from predictor scoring (merge mode); evaluate mode
+        # has no scoring -> w stays None and the browser hides the "W="
+        # suffix from de novo track names/cards.
+        w = None
         d = (details or {}).get(name) or {}
         if isinstance(d.get("W_raw"), (int, float)):
             w = round(float(d["W_raw"]), 3)
@@ -403,7 +406,8 @@ def build_tracks_json(preds: dict, details: dict, data_dir: Path,
         if Path(path).exists() and not dst.exists():
             inject_utr_features(Path(path), dst)
         denovo.append({"pred": name, "w": w, "file": f"denovo_{name}.gff3"})
-    denovo.sort(key=lambda d: -d["w"])
+    # None w (evaluate mode: no predictor scoring) sorts last, stably
+    denovo.sort(key=lambda d: -(d["w"] if d["w"] is not None else -1.0))
     for rank, d in enumerate(denovo):
         d["color"] = _PALETTE[rank % len(_PALETTE)]
     with open(out_json, "w") as fh:

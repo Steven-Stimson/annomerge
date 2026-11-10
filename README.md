@@ -2,11 +2,12 @@
 
 AnnoMerge: automated EVM weight calibration and evidence auditing for gene annotation in non-model organisms.
 
-> Current status: **early development**. This repository currently implements and tests the
-> evidence-preparation layer (Module 1 input validation, Module 2 evidence sub-pipelines:
-> RNA-seq alignment/assembly, miniprot homology alignment with referee-set filtering,
-> and the Gold set construction via StringTie + TransDecoder + homology validation).
-> Predictor scoring, EVM integration, augment and confidence annotation modules are under development.
+> Current status: both entry points run end to end. `merge` scores de novo
+> predictors, calibrates EVM weights and integrates evidence (EVM + isoform
+> resolution + augment) into a final annotation; `evaluate` audits an
+> existing annotation through the identical assessment chain (evidence ->
+> sanity -> confidence tiers -> support tags -> HTML report + offline
+> evidence browser).
 
 ## Design documents
 
@@ -21,12 +22,16 @@ bash scripts/setup_env.sh
 source env.sh
 ```
 
-## Usage (current scope)
-
+## Usage
 ```bash
-# evidence preparation on the S. cerevisiae test dataset
-annomerge evaluate -g genome.fa -a annotation.gff \
-    -r rnaseq.list -p homologs.faa --skip-omark -t 16 -o result/
+# merge (integration): scoring -> EVM -> augment -> confidence tiers -> report + browser
+annomerge merge -g genome.fa -P helixer=helixer.gff,annevo=annevo.gff \
+    -p homologs.faa -r rnaseq.list --busco odb10_lineage/ -t 16 -o result/
+
+# evaluate (audit an existing annotation with the SAME assessment chain;
+# only -g/-a/-p are mandatory, RNA / predictors / BUSCO / OMArk are optional)
+annomerge evaluate -g genome.fa -a annotation.gff3 -p homologs.faa \
+    -r rnaseq.list --busco odb10_lineage/ -t 16 -o result_eval/
 ```
 
 ## Repository layout
