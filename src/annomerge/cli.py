@@ -59,6 +59,7 @@ def _run_evidence_pipeline(
     core: Optional[str],    species_map: Optional[str], threads: int,
     referee_min_wi: float, goldset: bool, goldset_min_orf: int,
     predictors: Optional[str] = None, annotation: Optional[str] = None,
+    mnp_filter: str = "",
 ):
     vi = validate(
         genome=genome, homologs=homologs, predictors=predictors,
@@ -103,6 +104,9 @@ def merge(
     busco: Optional[str] = typer.Option(None, "--busco", help="local BUSCO odb lineage path (offline)"),
     core: Optional[str] = typer.Option(None, "--core", help="custom core conserved protein FASTA"),
     paf: Optional[str] = typer.Option(None, "--paf", help="precomputed miniprot PAF"),
+    mnp_filter: Optional[str] = typer.Option(None, "--mnp-filter",
+        help="miniprot homolog quality filter, comma tokens: UnStop,UnShift,Q2R=0.5,topRank=1 ... "
+             "(empty = no filter)"),
     species_map: Optional[str] = typer.Option(None, "--species-map", help="queryID -> species TSV"),
     weight_only: bool = typer.Option(False, "--weight-only", help="stop after weight table"),
     threads: int = typer.Option(8, "-t", help="threads"),
@@ -178,7 +182,7 @@ def merge(
         results, vi = _run_evidence_pipeline(
             out, genome, homologs, rna_list, bam, transcripts, busco, core,
             species_map, threads, referee_min_wi, goldset, goldset_min_orf,
-            predictors=predictors,
+            predictors=predictors, mnp_filter=mnp_filter or "",
         )
     except InputError as e:
         typer.secho(f"input error: {e}", fg="red", err=True)
