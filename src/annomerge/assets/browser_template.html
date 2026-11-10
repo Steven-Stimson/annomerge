@@ -41,7 +41,7 @@
                    border-bottom: 1px solid #ddd; font-weight: 600; }
   #gene-table th select.col-flt { font-size: 11px; font-weight: 400; padding: 1px 2px;
                                   margin-left: 2px; border: 1px solid #ccc; border-radius: 3px;
-                                  background: #fff; max-width: 76px; }
+                                  background: #fff; max-width: 92px; }
   #gene-table td { padding: 4px 8px; border-bottom: 1px solid #f0f0f0; cursor: pointer; white-space: nowrap; }
   #gene-table tr:hover td { background: #eaf2fa; }
   #gene-table tr.current td { background: #d6e6f5; }
@@ -89,6 +89,14 @@
   #igv-div { flex: 1 1 auto; min-width: 0; overflow-y: auto; }
   /* igv root (.igv-container) is height:auto and grows with total track height; scroll at this container */
   #igv-div .igv-container { height: auto; min-height: 100%; }
+  /* igv collapses the navbar buttons (cursor guide / center guide / track
+     labels / save SVG) below ~990px panel width — keep them always visible */
+  #igv-div .igv-navbar-right-container [class^="igv-navbar-toggle-button-container"] {
+    display: flex !important;
+    flex-flow: row nowrap;
+    align-items: center;
+    height: 100%;
+  }
   #status { flex: 0 0 auto; padding: 4px 12px; font-size: 12px; color: #888; border-top: 1px solid #eee; }
 </style>
 </head>
@@ -106,12 +114,6 @@
       <div id="list-head">
         <div class="list-title">Gene list</div>
         <div class="flt-row">
-          <select id="flt-tier" title="Filter by tier">
-            <option value="all">Tier: All</option>
-            <option value="strong">Tier: strong</option>
-            <option value="moderate">Tier: moderate</option>
-            <option value="weak">Tier: weak</option>
-          </select>
           <select id="flt-chr" title="Filter by chromosome"><option value="">All chromosomes</option></select>
           <select id="flt-sort" title="Sort gene list">
             <option value="gff">Sort: GFF order</option>
@@ -127,7 +129,13 @@
       </div>
       <div id="gene-table">
         <table>
-          <thead><tr><th>Gene</th><th>Transcript</th><th>Tier</th>
+          <thead><tr><th>Gene</th><th>Transcript</th>
+            <th>Tier <select id="flt-tier" class="col-flt" title="Filter by tier">
+              <option value="all">All</option>
+              <option value="strong">strong</option>
+              <option value="moderate">moderate</option>
+              <option value="weak">weak</option>
+            </select></th>
             <th>RNA <select id="flt-rna" class="col-flt" title="Filter by RNA support range">
               <option value="">all</option>
               <option value="hi">≥0.8</option>
@@ -158,7 +166,7 @@
 </div>
 <div id="status">Loading igv.js and annotation data&hellip;</div>
 <script>
-const TIER_COLORS = { strong: "#1a7f37", moderate: "#b8860b", weak: "#c0392b" };
+const TIER_COLORS = __TIER_COLORS__;
 const DEFAULT_COLOR = "#1f4e79";
 let geneMap = new Map();   // gid -> gene record
 let genes = [];
@@ -205,11 +213,11 @@ const TRACKS_BEFORE = [
 // coverage/StringTie evidence and clutters the browser)
 const TRACKS_EVIDENCE = [
   { name: "GoldSet (TransDecoder)", type: "annotation", format: "gff3",
-    url: "data/goldset.gff3", color: "#2ca02c", height: 120,
+    url: "data/goldset.gff3", color: "__GOLDSET_COLOR__", height: 120,
     visibilityWindow: -1 },
 /*__COVERAGE_TRACK__*/
   { name: "Transcript Assembly (StringTie)", type: "annotation", format: "gtf",
-    url: "data/stringtie.gtf", color: "#9467bd", height: 160,
+    url: "data/stringtie.gtf", color: "__STRINGTIE_COLOR__", height: 160,
     displayMode: "EXPANDED", visibilityWindow: -1 },
 /*__PROTEIN_TRACKS__*/
 ];

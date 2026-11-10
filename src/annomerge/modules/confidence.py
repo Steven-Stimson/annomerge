@@ -421,3 +421,236 @@ def confidence_annotation(gff_in: Path, genome_fa: Path, junctions_bed: Path | N
         fh.write("\n".join(rows) + "\n")
     log.info("confidence: %s", dict(tier_count))
     return dict(tier_count)
+
+
+# --------------------------------------------------- final GFF3 support tags
+# Viewer-matching wording for the intrinsic flags / sanity notes so the GFF3
+# attributes read exactly like the evidence-browser cards.
+_TAG_FLAG_MAP = {
+    "single_exon": "single-exon",
+    "noncanonical_splice": "noncanonical-splice",
+    "neighbour_overlap": "neighbour-overlap",
+    "short_orf": "short-ORF",
+}
+_TAG_NOTE_MAP = {
+    "no_stop": "no-stop",
+    "non_atg_start": "non-ATG-start",
+    "extended_stop": "extended-stop",
+}
+_TAG_KEYS = ("Tier", "RNA_support", "Protein_support", "denovo_support",
+             "Flags")
+
+
+def annotate_support(gff3: Path, conf_tsv: Path,
+                     denovo_gff3: dict) -> dict:
+    """Tag the final annotation GFF3 in place (idempotent).
+
+    Two jobs, both requested as deliverable-quality annotation output:
+      1) number every CDS per transcript in genomic order:
+         ID=<tid>.cds  ->  ID=<tid>.cds1 .. <tid>.cdsN
+         (the exon features already carry .exon1/.exon2 numbering; a
+         transcript with several CDS segments used to repeat the bare
+         .cds ID on every segment, which is neither unique nor sortable)
+      2) put the evidence verdict on every gene AND every mRNA, using the
+         same numbers and the same words as the evidence browser:
+           Tier=strong|moderate|weak|uncalibrated
+           RNA_support=<frac 0..1 or NA>        (per mRNA; gene = best)
+           Protein_support=<frac 0..1>          (per mRNA; gene = best)
+           denovo_support=<pred:frac,...>       (CDS covered by each de
+                                                 novo predictor; per mRNA,
+                                                 gene = union of isoforms)
+           Flags=<single-exon,noncanonical-splice,...>  (mapped like the
+                                                 viewer cards; "none" when
+                                                 the transcript is clean)
+    Gene-level aggregation mirrors build_genes_json() in the viewer module
+    (tier of the first transcript row, max RNA/protein, flag union) so the
+    GFF3 and the browser never disagree.
+    """
+    # ---- pass 1: parse the GFF3 (rows, gene/mRNA/CDS structure)
+    lines = Path(gff3).read_text().splitlines()
+    tx_cds: dict = {}            # tid -> [(start, end)]
+    tx_row: dict = {}            # tid -> row index of the mRNA
+    gene_rows: dict = {}         # gid -> row index of the gene
+    gene_tids: dict = {}         # gid -> [tid, ...] in file order
+    cds_rows: dict = {}          # tid -> [row index, ...]
+    for i, ln in enumerate(lines):
+        if ln.startswith("#"):
+            continue
+        p = ln.split("\t")
+        if len(p) < 9:
+            continue
+        ftype, attrs = p[2], p[8]
+        av = {}
+        for kv in attrs.split(";"):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                av[k] = v
+        if ftype == "gene" and av.get("ID"):
+            gene_rows[av["ID"]] = i
+        elif ftype == "mRNA" and av.get("ID"):
+            tid = av["ID"]
+            tx_row[tid] = i
+            gid = (av.get("Parent") or "").split(",")[0]
+            gene_tids.setdefault(gid, []).append(tid)
+        elif ftype == "CDS":
+            for parent in (av.get("Parent") or "").split(","):
+                if parent:
+                    tx_cds.setdefault(parent, []).append(
+                        (int(p[3]), int(p[4])))
+                    cds_rows.setdefault(parent, []).append(i)
+    for iv in tx_cds.values():
+        iv.sort()
+
+    # ---- pass 2: confidence.tsv -> per-transcript + per-gene aggregation
+    tx_info: dict = {}
+    gene_tier: dict = {}
+    gene_rna: dict = {}
+    gene_prot: dict = {}
+    gene_flags: dict = {}
+    with open(conf_tsv) as fh:
+        for ln in fh:
+            if ln.startswith("#") or ln.startswith("gene_id"):
+                continue
+            p = ln.rstrip("\n").split("\t")
+            if len(p) < 18:
+                continue
+            (gid, tid, _seq, _strand, _s, _e, tier, _gold,
+             rna, _rb, _cf, _dp, _rr, prot, _pb, _pr, notes, flags) = p[:18]
+            tx_info[tid] = {"tier": tier, "rna": rna, "prot": prot}
+            if gid not in gene_tier:
+                gene_tier[gid] = tier      # first row = representative
+            def _maxfrac(old, new):
+                try:
+                    nf = float(new)
+                except (TypeError, ValueError):
+                    return old
+                if old == "NA" or old is None:
+                    return new
+                try:
+                    return new if nf > float(old) else old
+                except (TypeError, ValueError):
+                    return new
+            gene_rna[gid] = _maxfrac(gene_rna.get(gid), rna)
+            gene_prot[gid] = _maxfrac(gene_prot.get(gid), prot)
+            fl = set()
+            if flags != ".":
+                fl |= {_TAG_FLAG_MAP[f] for f in flags.split(",")
+                       if f in _TAG_FLAG_MAP}
+            if notes != ".":
+                fl |= {_TAG_NOTE_MAP[n] for n in notes.split(",")
+                       if n in _TAG_NOTE_MAP}
+            gene_flags.setdefault(gid, set()).update(fl)
+            fl |= set()  # per-transcript flags captured below
+
+    def _tx_flags(tid: str) -> str:
+        # intrinsic flags + sanity notes of this transcript, viewer wording
+        # (re-read from the per-row record stored during pass 2)
+        info = tx_info.get(tid) or {}
+        fl = info.get("flags") or set()
+        return ",".join(sorted(fl)) if fl else "none"
+
+    # per-transcript flag sets (stored on the tx_info records)
+    with open(conf_tsv) as fh:
+        for ln in fh:
+            if ln.startswith("#") or ln.startswith("gene_id"):
+                continue
+            p = ln.rstrip("\n").split("\t")
+            if len(p) < 18:
+                continue
+            tid, notes, flags = p[1], p[16], p[17]
+            fl = set()
+            if flags != ".":
+                fl |= {_TAG_FLAG_MAP[f] for f in flags.split(",")
+                       if f in _TAG_FLAG_MAP}
+            if notes != ".":
+                fl |= {_TAG_NOTE_MAP[n] for n in notes.split(",")
+                       if n in _TAG_NOTE_MAP}
+            if tid in tx_info:
+                tx_info[tid]["flags"] = fl
+
+    # ---- pass 3: de novo predictor support (same union math as the viewer)
+    denovo_paths = {n: Path(p) for n, p in (denovo_gff3 or {}).items()
+                    if p and Path(p).exists()}
+    tx_dn: dict = {}             # tid -> "pred:frac,pred:frac"
+    gene_dn: dict = {}           # gid -> "pred:frac,pred:frac"
+    if denovo_paths:
+        from .viewer import _denovo_gene_coverage   # same truth as the cards
+        genes_struct = []
+        gid_seq = {}
+        for gid, tids in gene_tids.items():
+            iso = [{"tid": t, "cds": tx_cds.get(t, []),
+                    "start": 0, "end": 0} for t in tids]
+            genes_struct.append({"gene": gid, "seqid": gid_seq.get(gid, ""),
+                                 "isoforms": iso})
+        # seqid per gene from the mRNA rows
+        for gid, i in gene_rows.items():
+            p = lines[i].split("\t")
+            gid_seq[gid] = p[0]
+        for g in genes_struct:
+            g["seqid"] = gid_seq.get(g["gene"], "")
+        for name, path in denovo_paths.items():
+            tx_map, gene_map = _denovo_gene_coverage(path, genes_struct,
+                                                     tx_cds)
+            for t, f in tx_map.items():
+                tx_dn.setdefault(t, {})[name] = f
+            for g, f in gene_map.items():
+                gene_dn.setdefault(g, {})[name] = f
+
+    def _dn_str(d: dict) -> str:
+        return ",".join(f"{k}:{d[k]:.3f}" for k in sorted(d))
+
+    # ---- pass 4: rewrite rows
+    def _retag(attrs: str, extra: dict) -> str:
+        av = {}
+        for kv in attrs.split(";"):
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                if k not in _TAG_KEYS:
+                    av[k] = v
+        av.update({k: v for k, v in extra.items() if v is not None})
+        return ";".join(f"{k}={v}" for k, v in av.items())
+
+    n_cds = n_tx = n_gene = 0
+    # CDS numbering: genomic order per transcript (start, then end)
+    for tid, rows in cds_rows.items():
+        order = sorted(range(len(rows)),
+                       key=lambda k: (tx_cds[tid][k][0], tx_cds[tid][k][1]))
+        for rank, k in enumerate(order, 1):
+            i = rows[k]
+            p = lines[i].split("\t")
+            p[8] = re.sub(r"ID=[^;]+",
+                          f"ID={tid}.cds{rank}", p[8], count=1)
+            lines[i] = "\t".join(p)
+            n_cds += 1
+    for tid, i in tx_row.items():
+        info = tx_info.get(tid)
+        if not info:
+            continue
+        p = lines[i].split("\t")
+        p[8] = _retag(p[8], {
+            "Tier": info["tier"],
+            "RNA_support": info["rna"],
+            "Protein_support": info["prot"],
+            "denovo_support": _dn_str(tx_dn[tid]) if tid in tx_dn else None,
+            "Flags": _tx_flags(tid),
+        })
+        lines[i] = "\t".join(p)
+        n_tx += 1
+    for gid, i in gene_rows.items():
+        p = lines[i].split("\t")
+        p[8] = _retag(p[8], {
+            "Tier": gene_tier.get(gid),
+            "RNA_support": gene_rna.get(gid),
+            "Protein_support": gene_prot.get(gid),
+            "denovo_support": _dn_str(gene_dn[gid]) if gid in gene_dn
+                              else None,
+            "Flags": (",".join(sorted(gene_flags[gid]))
+                      if gene_flags.get(gid) else "none"),
+        })
+        lines[i] = "\t".join(p)
+        n_gene += 1
+
+    Path(gff3).write_text("\n".join(lines) + "\n")
+    log.info("annotate_support: %d genes, %d mRNAs, %d CDS renumbered",
+             n_gene, n_tx, n_cds)
+    return {"genes": n_gene, "mrnas": n_tx, "cds": n_cds}

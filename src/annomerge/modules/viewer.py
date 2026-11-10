@@ -606,6 +606,64 @@ def sample_coverage(bams: list, data_dir: Path, threads: int) -> dict:
 _COV_SAMPLE_PALETTE = ["#31a354", "#756bb1", "#e6550d", "#636363",
                        "#dd1c77", "#2c7fb8"]
 
+# ---------------------------------------------------------------- themes
+# Color themes for the evidence browser (journal-grade palettes, ggsci-style).
+# Each theme overrides: goldset / stringtie / coverage(wig) / protein /
+# de-novo predictor palette / tier colors (annotation + badges).
+THEMES: dict = {
+    "classic": {
+        "goldset": "#2ca02c", "stringtie": "#9467bd", "coverage": "#3182bd",
+        "protein": "#17becf",
+        "palette": _PALETTE,
+        "sample_palette": _COV_SAMPLE_PALETTE,
+        "tiers": {"strong": "#1a7f37", "moderate": "#b8860b", "weak": "#c0392b"},
+    },
+    # Nature (NPG) — 明亮期刊风
+    "npg": {
+        "goldset": "#00A087", "stringtie": "#F39B7F", "coverage": "#4DBBD5",
+        "protein": "#E64B35",
+        "palette": ["#3C5488", "#8491B4", "#91D1C2", "#DC0000",
+                    "#E64B35", "#4DBBD5", "#00A087", "#F39B7F"],
+        "sample_palette": ["#00A087", "#3C5488", "#F39B7F", "#8491B4",
+                           "#91D1C2", "#DC0000"],
+        "tiers": {"strong": "#00A087", "moderate": "#E69F00", "weak": "#E64B35"},
+    },
+    # Science (AAAS) — 高饱和对比
+    "aaas": {
+        "goldset": "#008B45", "stringtie": "#008280", "coverage": "#3B4992",
+        "protein": "#EE0000",
+        "palette": ["#631879", "#BB0021", "#5F559B", "#A20056",
+                    "#3B4992", "#008280", "#008B45", "#EE0000"],
+        "sample_palette": ["#008B45", "#3B4992", "#EE0000", "#631879",
+                           "#008280", "#BB0021"],
+        "tiers": {"strong": "#008B45", "moderate": "#E69F00", "weak": "#EE0000"},
+    },
+    # Lancet — 医学沉稳
+    "lancet": {
+        "goldset": "#42B540", "stringtie": "#0099B4", "coverage": "#00468B",
+        "protein": "#ED0000",
+        "palette": ["#925E9F", "#FDAF91", "#AD002A", "#ADB6B6",
+                    "#0099B4", "#00468B", "#42B540", "#ED0000"],
+        "sample_palette": ["#42B540", "#00468B", "#ED0000", "#925E9F",
+                           "#0099B4", "#FDAF91"],
+        "tiers": {"strong": "#42B540", "moderate": "#E8A33D", "weak": "#ED0000"},
+    },
+    # JAMA — 低饱和大地色
+    "jama": {
+        "goldset": "#79AE97", "stringtie": "#DF8F44", "coverage": "#00A1D5",
+        "protein": "#B24745",
+        "palette": ["#6A6599", "#80796B", "#374E55", "#79AE97",
+                    "#DF8F44", "#00A1D5", "#B24745", "#6A6599"],
+        "sample_palette": ["#79AE97", "#00A1D5", "#B24745", "#6A6599",
+                           "#DF8F44", "#374E55"],
+        "tiers": {"strong": "#4C9A78", "moderate": "#DF8F44", "weak": "#B24745"},
+    },
+}
+
+
+def theme_colors(theme: str) -> dict:
+    return THEMES.get(theme) or THEMES["classic"]
+
 
 # ---------------------------------------------------------- offline bundle
 def _inline_script_vars(files: dict, genes_json: str, tracks_cfg: dict,
@@ -625,7 +683,8 @@ def _inline_script_vars(files: dict, genes_json: str, tracks_cfg: dict,
 def render_offline_html(data_dir: Path, out_html: Path, *,
                         ref_name: str, fallback_locus: str,
                         coverage: dict | None,
-                        full: bool = False) -> Path:
+                        full: bool = False,
+                        theme: str = "npg") -> Path:
     """Pack the browser into a single offline HTML (data inlined as dataURIs).
 
     full=False (default, lite): the genome sequence is NOT embedded; the
@@ -633,7 +692,9 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
     stays small even for large genomes.  full=True additionally embeds the
     genome FASTA as a dataURI so base-level sequence is shown in igv.
     coverage: sample_coverage() metadata (merged + per-sample bedgraphs).
+    theme: key into THEMES (track/tier color scheme).
     """
+    th = theme_colors(theme)
     html = (_ASSETS / "browser_template.html").read_text(encoding="utf-8")
     igv_js = (_ASSETS / "igv.min.js").read_text(encoding="utf-8")
 
@@ -641,11 +702,24 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
     html = html.replace('<script src="js/igv.min.js"></script>',
                         '<script>\n' + igv_js + '\n</script>')
 
+    # 1b) theme: substitute color tokens in the template (tier colors of the
+    #     final-annotation track + GoldSet / StringTie track colors)
+    html = html.replace("__TIER_COLORS__", json.dumps(th["tiers"]))
+    html = html.replace("__GOLDSET_COLOR__", th["goldset"])
+    html = html.replace("__STRINGTIE_COLOR__", th["stringtie"])
+
     # 2) data files -> dataURI. Annotation/wig tracks go through
     #    bgzip+tabix (_tabix_bundle) so igv parses only the visible locus
     #    (true per-chromosome lazy loading over embedded dataURIs); any
     #    indexing failure falls back to the whole-file dataURI as before.
     tracks_cfg = json.load(open(data_dir / "tracks.json"))
+    # theme: recolor tracks.json-driven tracks (de novo predictors rotate
+    # through the theme palette; protein evidence uses the protein color)
+    for i, d in enumerate(tracks_cfg.get("denovo", [])):
+        d["color"] = th["palette"][i % len(th["palette"])]
+    for i, t in enumerate(tracks_cfg.get("protein", [])):
+        t["color"] = (th["protein"] if i == 0
+                      else th["palette"][i % len(th["palette"])])
     files: dict = {}
     indexed_map: dict = {}          # template file name -> (gz name, tbi name)
     covcfg = tracks_cfg.get("coverage") or {}
@@ -752,12 +826,13 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
             label = f'RNA coverage (all {m["n_samples"]} samples, ~{m["max"]:,.0f}x max)'
         else:
             label = f'RNA coverage: {m.get("name", "sample")} (~{m["max"]:,.0f}x max)'
-        cov_tracks.append(_wig(label, m["file"], "#3182bd"))
+        cov_tracks.append(_wig(label, m["file"], th["coverage"]))
     if multi:
         for rank, s in enumerate(covcfg.get("samples", [])):
             if not _embedded(s["file"]):
                 continue
-            color = _COV_SAMPLE_PALETTE[rank % len(_COV_SAMPLE_PALETTE)]
+            sp = th["sample_palette"]
+            color = sp[rank % len(sp)]
             label = f'RNA coverage: {s["name"]} (~{s["max"]:,.0f}x max)'
             cov_tracks.append(_wig(label, s["file"], color))
     html = html.replace("/*__COVERAGE_TRACK__*/",

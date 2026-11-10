@@ -332,6 +332,15 @@ def merge(
         assess_d / "confidence.tsv",
         protein_weights=protein_weights)
     typer.secho(f"confidence tiers: {conf_stats or 'skipped (exists)'}", fg="green")
+    # module 6b: tag the final GFF3 with the evidence verdict (Tier /
+    # RNA_support / Protein_support / denovo_support / Flags on every gene
+    # and mRNA, viewer wording) + per-transcript CDS numbering (.cds1..N).
+    # Always runs (cheap, idempotent) so downstream deliverables stay tagged
+    # even when confidence.tsv itself is lazy-skipped.
+    from .modules.confidence import annotate_support
+    tag_stats = annotate_support(final_gff3, assess_d / "confidence.tsv",
+                                 preds or {})
+    typer.secho(f"support tags: {tag_stats}", fg="green")
     # module 7/8: report (run summary + stats + completeness + accuracy + charts)
     import shlex, sys
     from .modules.report import run_report
