@@ -97,6 +97,17 @@
     align-items: center;
     height: 100%;
   }
+  #track-colors { flex: 0 0 auto; max-height: 180px; overflow-y: auto;
+                  border-bottom: 1px solid #eee; padding: 2px 12px 6px; display: none; }
+  #track-colors.open { display: block; }
+  .tc-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 12px; }
+  .tc-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #333; }
+  .tc-row input[type=color] { width: 36px; height: 22px; padding: 0; border: 1px solid #ccc;
+                              background: none; cursor: pointer; flex: 0 0 auto; }
+  .tc-hex { width: 62px; height: 22px; padding: 0 4px; border: 1px solid #ccc; border-radius: 3px;
+            font-size: 11px; font-family: monospace; flex: 0 0 auto; }
+  .tc-row button { flex: 0 0 auto; border: 1px solid #ccc; background: #f4f4f4; border-radius: 3px;
+                   cursor: pointer; font-size: 11px; padding: 0 5px; line-height: 20px; }
   #status { flex: 0 0 auto; padding: 4px 12px; font-size: 12px; color: #888; border-top: 1px solid #eee; }
 </style>
 </head>
@@ -126,7 +137,9 @@
           </select>
         </div>
         <div id="list-info"></div>
+        <div class="flt-row"><span id="tc-toggle" class="chip" title="Show/hide per-track color panel">&#127912; Track colors</span></div>
       </div>
+      <div id="track-colors"></div>
       <div id="gene-table">
         <table>
           <thead><tr><th>Gene</th><th>Transcript</th>
@@ -167,6 +180,7 @@
 <div id="status">Loading igv.js and annotation data&hellip;</div>
 <script>
 const TIER_COLORS = __TIER_COLORS__;
+const LITE_REF = __LITE_REF__;   // true: chromsizes-only reference (no bases embedded)
 const DEFAULT_COLOR = "#1f4e79";
 let geneMap = new Map();   // gid -> gene record
 let genes = [];
@@ -203,8 +217,8 @@ function tierColorFn(feature) {
   return DEFAULT_COLOR;
 }
 const TRACKS_BEFORE = [
-  { name: "AnnoMerge final annotation (colored by tier)", type: "annotation", format: "gff3",
-    url: "data/final.gff3", color: tierColorFn, height: 220,
+  { name: "AnnoMerge", type: "annotation", format: "gff3",
+    url: "data/final.gff3", color: tierColorFn, height: 100,
     displayMode: "EXPANDED", visibilityWindow: -1 }
 ];
 // evidence tracks ordered by evidential weight: GoldSet > RNA coverage >
@@ -213,11 +227,11 @@ const TRACKS_BEFORE = [
 // coverage/StringTie evidence and clutters the browser)
 const TRACKS_EVIDENCE = [
   { name: "GoldSet (TransDecoder)", type: "annotation", format: "gff3",
-    url: "data/goldset.gff3", color: "__GOLDSET_COLOR__", height: 120,
+    url: "data/goldset.gff3", color: "__GOLDSET_COLOR__", height: 80,
     visibilityWindow: -1 },
 /*__COVERAGE_TRACK__*/
   { name: "Transcript Assembly (StringTie)", type: "annotation", format: "gtf",
-    url: "data/stringtie.gtf", color: "__STRINGTIE_COLOR__", height: 160,
+    url: "data/stringtie.gtf", color: "__STRINGTIE_COLOR__", height: 50,
     displayMode: "EXPANDED", visibilityWindow: -1 },
 /*__PROTEIN_TRACKS__*/
 ];
@@ -231,7 +245,7 @@ async function loadDenovoTracks() {
   denovoTracks = denovoMeta.map(d => ({
     name: `de novo predictions: ${d.pred} (W=${Number(d.w).toFixed(2)})`,
     type: "annotation", format: "gff3",
-    url: "data/" + d.file, color: d.color, height: 120,
+    url: "data/" + d.file, color: d.color, height: 50,
     visibilityWindow: -1
   }));
   TRACKS = TRACKS_BEFORE.concat(TRACKS_EVIDENCE, denovoTracks);
@@ -249,6 +263,97 @@ function makeOptions(locus) {
     tracks: TRACKS
   };
 }
+// ---- per-track color panel: one native color picker (spectrum + hex
+// input) per igv track; changes apply immediately and persist in
+// localStorage (best effort; ignored on file:// where storage is blocked)
+const tcDefaults = new Map();
+function tcHex(c) {
+  if (!c || typeof c === "function") return null;
+  c = String(c).trim();
+  if (c[0] === "#") {
+    if (c.length === 4)
+      return "#" + c.slice(1).split("").map(x => x + x).join("");
+    return c.slice(0, 7).toLowerCase();
+  }
+  const m = c.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+  if (m)
+    return "#" + [m[1], m[2], m[3]].map(v =>
+      Math.max(0, Math.min(255, +v)).toString(16).padStart(2, "0")).join("");
+  return null;
+}
+function buildColorPanel() {
+  try {
+    const panel = document.getElementById("track-colors");
+    if (!panel || !browser || !browser.trackViews) return;
+    panel.innerHTML = "";
+    for (const v of browser.trackViews) {
+      const tr = v.track;
+      if (!tr || !tr.name) continue;
+      if (!tcDefaults.has(tr.name)) tcDefaults.set(tr.name, tr.color);
+      let cur = tr.color;
+      try {
+        const saved = localStorage.getItem("annomerge_tc_" + tr.name);
+        if (saved) { tr.color = saved; cur = saved; }
+      } catch (e) { /* storage unavailable (file://) */ }
+      const row = document.createElement("div");
+      row.className = "tc-row";
+      const nm = document.createElement("span");
+      nm.className = "tc-name";
+      nm.textContent = tr.name;
+      nm.title = tr.name;
+      const inp = document.createElement("input");
+      inp.type = "color";
+      inp.value = tcHex(cur) || "#1f4e79";
+      inp.title = "Pick a color (spectrum); applies immediately";
+      const hex = document.createElement("input");
+      hex.type = "text";
+      hex.className = "tc-hex";
+      hex.maxLength = 7;
+      hex.value = inp.value;
+      hex.title = "Hex color, e.g. #E64B35 — Enter to apply";
+      const applyColor = (val) => {
+        tr.color = val;
+        try { localStorage.setItem("annomerge_tc_" + tr.name, val); } catch (e) {}
+        if (browser.repaint) browser.repaint();
+      };
+      const applyHex = () => {
+        let v = hex.value.trim();
+        if (v && v[0] !== "#") v = "#" + v;
+        if (!/^[0-9a-fA-F]{6}$/.test(v || "") && !/^[0-9a-fA-F]{3}$/.test(v || "")) {
+          hex.value = inp.value;   // invalid: revert
+          return;
+        }
+        const norm = tcHex(v);
+        inp.value = norm;
+        hex.value = norm;
+        applyColor(norm);
+      };
+      inp.addEventListener("change", () => {
+        hex.value = inp.value;
+        applyColor(inp.value);
+      });
+      hex.addEventListener("change", applyHex);
+      hex.addEventListener("keydown", (e) => { if (e.key === "Enter") applyHex(); });
+      const rb = document.createElement("button");
+      rb.textContent = "↺";
+      rb.title = "Restore default color";
+      rb.addEventListener("click", () => {
+        const d = tcDefaults.get(tr.name);
+        tr.color = d;
+        inp.value = tcHex(d) || "#1f4e79";
+        hex.value = inp.value;
+        try { localStorage.removeItem("annomerge_tc_" + tr.name); } catch (e) {}
+        if (browser.repaint) browser.repaint();
+      });
+      row.appendChild(nm);
+      row.appendChild(inp);
+      row.appendChild(hex);
+      row.appendChild(rb);
+      panel.appendChild(row);
+    }
+    if (browser.repaint) browser.repaint();
+  } catch (e) { console.warn("track color panel failed:", e); }
+}
 async function initBrowser() {
   // try whole-genome view first, fall back to the first chromosome
   try {
@@ -258,7 +363,21 @@ async function initBrowser() {
     browser = await igv.createBrowser(document.getElementById("igv-div"),
       makeOptions("$FALLBACK_LOCUS$"));
   }
-  setStatus("Ready: click a gene on the left or use search; scroll to zoom, drag to pan.");
+  buildColorPanel();
+  maybeRemoveSeqTrack();
+  setStatus("Ready: click a gene on the left or use search; scroll to zoom, drag to pan. [build __BUILD_ID__]");
+}
+// igv auto-appends a reference sequence (bases) track right below the ruler;
+// with a chromsizes-only reference (lite build) there are no bases to show,
+// so drop the empty strip. full builds (embedded FASTA) keep it.
+function maybeRemoveSeqTrack() {
+  if (!LITE_REF || !browser) return;
+  try {
+    for (const v of (browser.trackViews || []).slice()) {
+      const t = v.track;
+      if (t && t.type === "sequence" && browser.removeTrack) browser.removeTrack(t);
+    }
+  } catch (e) { console.warn("sequence-track removal failed:", e); }
 }
 async function loadGenes() {
   const resp = await fetch("data/genes.json");
@@ -518,6 +637,9 @@ document.getElementById("side-toggle").addEventListener("click", () => {
   btn.classList.toggle("active", !collapsed);
   // notify igv to recompute viewport after panel width change
   setTimeout(() => window.dispatchEvent(new Event("resize")), 50);
+});
+document.getElementById("tc-toggle").addEventListener("click", () => {
+  document.getElementById("track-colors").classList.toggle("open");
 });
 (async () => {
   try {

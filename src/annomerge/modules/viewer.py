@@ -620,7 +620,7 @@ THEMES: dict = {
     },
     # Nature (NPG) — 明亮期刊风
     "npg": {
-        "goldset": "#00A087", "stringtie": "#F39B7F", "coverage": "#4DBBD5",
+        "goldset": "#00A087", "stringtie": "#F39B7F", "coverage": "#FFCE6E",
         "protein": "#E64B35",
         "palette": ["#3C5488", "#8491B4", "#91D1C2", "#DC0000",
                     "#E64B35", "#4DBBD5", "#00A087", "#F39B7F"],
@@ -791,6 +791,7 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
             'fastaURL: "data/genome.fa",\n      indexURL: "data/genome.fa.fai",\n      cytobandURL: "data/cytoband.txt"',
             'fastaURL: DATA_URI["genome.fa"],\n      '
             'cytobandURL: DATA_URI["cytoband.txt"]')
+        html = html.replace("__LITE_REF__", "false")
     else:
         # lite: pure-coordinate reference (chromsizes via blob URL).
         # igv only picks its chromsizes loader when format is set explicitly;
@@ -800,6 +801,7 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         html = html.replace(
             'fastaURL: "data/genome.fa",\n      indexURL: "data/genome.fa.fai",\n      cytobandURL: "data/cytoband.txt"',
             'fastaURL: REF_URL,\n      format: "chromsizes"')
+        html = html.replace("__LITE_REF__", "true")
     html = html.replace("$FALLBACK_LOCUS$", fallback_locus)
 
     # 5) coverage tracks: merged depth over ALL RNA samples on top, then one
@@ -816,7 +818,7 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         return ('  { name: ' + json.dumps(name) + ', type: "wig",\n'
                 '    format: "bedgraph",\n'
                 '    url: ' + urlexpr + ', color: ' + json.dumps(color) + ',\n'
-                '    height: 90, min: 0, autoscale: true }')
+                '    height: 100, min: 0, autoscale: true }')
 
     cov_tracks = []
     m = covcfg.get("merged") or {}
@@ -858,7 +860,7 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         protein_js.append(
             '  { name: ' + json.dumps(name) + ', type: "annotation", format: "gff3",\n'
             '    url: ' + purlexpr + ', color: '
-            + json.dumps(t["color"]) + ', height: 120,\n'
+            + json.dumps(t["color"]) + ', height: 80,\n'
             '    visibilityWindow: -1 }')
     html = html.replace("/*__PROTEIN_TRACKS__*/", ",\n".join(protein_js))
 
@@ -878,6 +880,8 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
     # 8) offline identity
     html = html.replace("<title>AnnoMerge Evidence Browser (igv.js)</title>",
                         "<title>AnnoMerge Evidence Browser (offline single-file)</title>")
+    html = html.replace("__BUILD_ID__",
+                        __import__("datetime").datetime.now().strftime("%Y%m%d-%H%M%S"))
 
     out_html.parent.mkdir(parents=True, exist_ok=True)
     out_html.write_text(html, encoding="utf-8")
