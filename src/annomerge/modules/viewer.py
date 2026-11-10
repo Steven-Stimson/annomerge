@@ -198,6 +198,12 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
                      denovo_gff3: dict | None = None) -> int:
     """Aggregate confidence.tsv -> one viewer record per gene."""
     genes: dict = {}
+    def _num(x: str) -> float:
+        # confidence.tsv uses 'NA' for unavailable evidence (e.g. no RNA run)
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return 0.0
     with open(confidence_tsv) as fh:
         for ln in fh:
             if ln.startswith("#") or ln.startswith("gene_id"):
@@ -219,19 +225,19 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
             g["iso"] += 1
             g["start"] = min(g["start"], int(start))
             g["end"] = max(g["end"], int(end))
-            g["rna"] = max(g["rna"], float(rna_frac))
-            g["prot"] = max(g["prot"], float(prot_frac))
-            g["cov"] = max(g["cov"], float(cov_frac))
-            g["depth"] = max(g["depth"], float(depth))
+            g["rna"] = max(g["rna"], _num(rna_frac))
+            g["prot"] = max(g["prot"], _num(prot_frac))
+            g["cov"] = max(g["cov"], _num(cov_frac))
+            g["depth"] = max(g["depth"], _num(depth))
             if gold == "yes":
                 g["goldset"] = "yes"
             if rna_reached == "yes":
                 g["rna_reached"] = "yes"
             if prot_reached == "yes":
                 g["prot_reached"] = "yes"
-            if float(rna_frac) >= g["rna"]:
+            if _num(rna_frac) >= g["rna"]:
                 g["rna_basis"] = rna_basis
-            if float(prot_frac) >= g["prot"]:
+            if _num(prot_frac) >= g["prot"]:
                 g["prot_basis"] = prot_basis
             if flags != ".":
                 for fl in flags.split(","):
@@ -250,11 +256,11 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
             g["isoforms"].append({
                 "tid": _tid, "start": int(start), "end": int(end),
                 "tier": tier,
-                "rna": f"{float(rna_frac):.3f}", "rna_basis": rna_basis,
+                "rna": f"{_num(rna_frac):.3f}", "rna_basis": rna_basis,
                 "rna_reached": rna_reached,
-                "prot": f"{float(prot_frac):.3f}", "prot_basis": prot_basis,
+                "prot": f"{_num(prot_frac):.3f}", "prot_basis": prot_basis,
                 "prot_reached": prot_reached,
-                "cov": f"{float(cov_frac):.3f}", "depth": float(depth),
+                "cov": f"{_num(cov_frac):.3f}", "depth": _num(depth),
                 "gold": gold, "marks": ",".join(tx_marks),
                 "cds": 0, "exon": 0,
             })
