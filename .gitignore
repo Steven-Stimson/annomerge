@@ -9,3 +9,5 @@ annomerge_out/
 annomerge_eval_out/
 *.log
 viewer_web/
+.gh_*
+scripts/*_summary.md
