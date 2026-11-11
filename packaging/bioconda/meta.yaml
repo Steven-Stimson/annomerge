@@ -35,10 +35,11 @@ requirements:
     - busco
     - miniprot
     # gold set / EVM integration (+ their perl module deps)
+    # perl-uri: hard dep — TransDecoder.LongOrfs/Predict and
+    # util/gtf_to_alignment_gff3.pl all `use Gene_obj`, which uses URI::Escape
     - transdecoder
     - perl-uri
     - evidencemodeler
-    - perl-dbi
 
 test:
   commands:

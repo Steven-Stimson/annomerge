@@ -208,6 +208,19 @@ def _home_version(key: str, p: Path) -> str:
     m = re.search(r"rans\w*ecoder[-_](\d+(?:\.\d+)+)", text, re.I)
     if m:
         return m.group(1)
+    if key == "transdecoder":
+        # version embedded in the scripts, e.g.  my $VERSION = "5.7.1";
+        for script in ("TransDecoder.LongOrfs", "TransDecoder.Predict", "TransDecoder"):
+            f = p / script
+            if not f.is_file():
+                continue
+            try:
+                head = "\n".join(f.read_text(errors="replace").splitlines()[:80])
+            except OSError:
+                continue
+            m = re.search(r"\$VERSION\s*=\s*[\"']([\d.]+)", head)
+            if m:
+                return m.group(1)
     m = re.search(r"[-_](\d+\.\d+(?:\.\d+)?)\s*$", p.name)
     return m.group(1) if m else "?"
 
@@ -281,18 +294,31 @@ def check_all() -> list[dict]:
     return rows
 
 
+_GREEN = "\033[32m"
+_RED = "\033[31m"
+_YELLOW = "\033[33m"
+_RESET = "\033[0m"
+
+
 def format_table(rows: list[dict]) -> str:
     out = ["dependency       env var(s)              status  version   resolved from"]
     out.append("-" * 78)
     for r in rows:
-        status = "OK" if r["ok"] else "MISSING"
-        miss = f" ({','.join(r['missing'])})" if r["missing"] else ""
-        out.append(f"{r['dep']:<16} {r['env']:<23} {status}{miss:<10} "
+        if r["ok"]:
+            status = f"{_GREEN}OK{_RESET}"
+        else:
+            miss = f" ({','.join(r['missing'])})" if r["missing"] else ""
+            status = f"{_RED}MISSING{miss}{_RESET}"
+        out.append(f"{r['dep']:<16} {r['env']:<23} {status:<28} "
                    f"{r['version'][:42]:<42} {r['src']}: {r['path']}")
         if not r["ok"]:
-            out.append(f"    -> {r['hint']}")
+            out.append(f"    {_YELLOW}->{_RESET} {r['hint']}")
     n_bad = sum(1 for r in rows if not r["ok"])
     out.append("-" * 78)
-    out.append(f"{len(rows) - n_bad}/{len(rows)} dependencies OK"
-               + (f"; {n_bad} MISSING" if n_bad else " — ready to run."))
+    if n_bad:
+        out.append(f"{len(rows) - n_bad}/{len(rows)} dependencies OK; "
+                   f"{_RED}{n_bad} MISSING{_RESET}")
+    else:
+        out.append(f"{_GREEN}{len(rows)}/{len(rows)} dependencies OK"
+                   f" — ready to run.{_RESET}")
     return "\n".join(out)
