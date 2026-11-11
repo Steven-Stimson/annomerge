@@ -398,7 +398,6 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
             stringtie_gtf: Path, miniprot_gff: Path, goldset_dir: Path,
             threads: int, min_intron: int = 20,
             w_gold: int = 10, w_transcript: int = 8, w_protein: int = 6,
-            evm_parts: int = 1,
             protein_set_weights: dict | None = None,
             protein_membership: dict | None = None) -> dict:
     """preds: {name: (gff3_path, evm_weight)} — already filtered by scoring.
@@ -470,8 +469,10 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
                         continue
                     out.write(line)
 
-    # ---- EVM execution: whole-genome (evm_parts<=1) or size-balanced parts
-    parts = split_genome_balanced(vi.genome, evm_parts) if evm_parts > 1 else [None]
+    # ---- EVM execution: whole-genome (single thread) or size-balanced
+    # parts, one part per thread (genome split granularity matches the
+    # parallelism the user asked for with --threads)
+    parts = split_genome_balanced(vi.genome, threads) if threads > 1 else [None]
     acc_gffs: dict[str, Path] = {}
     if len(parts) <= 1:
         acc_gffs = _evm_run_one(vi.genome, combined, evidence, wfile, d, min_intron)

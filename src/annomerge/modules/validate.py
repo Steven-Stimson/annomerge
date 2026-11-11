@@ -70,12 +70,17 @@ def parse_predictors(spec: str | None) -> dict[str, Path]:
 @dataclass
 class RnaSample:
     files: list[Path]
-    tag: str  # fastq | bam | bam_isoseq | gtf
+    tag: str  # fastq | bam | gtf
+    name_override: str | None = None
+    isoseq: bool = False   # long-read (CCS) sample: stringtie -L downstream
 
     @property
     def name(self) -> str:
+        if self.name_override:
+            return self.name_override
         n = self.files[0].name
-        for suf in (".fastq.gz", ".fq.gz", ".fastq", ".fq", ".bam", ".gtf", ".gff"):
+        for suf in (".fastq.gz", ".fq.gz", ".fastq", ".fq", ".bam",
+                    ".gtf", ".gff3", ".gff"):
             if n.endswith(suf):
                 n = n[: -len(suf)]
         for tail in ("_1", "_2", "_R1", "_R2"):
@@ -84,24 +89,89 @@ class RnaSample:
         return n
 
 
-def parse_rna_list(list_file: Path) -> list[RnaSample]:
+_FQ_SUF = (".fastq.gz", ".fq.gz", ".fastq", ".fq")
+_GTF_SUF = (".gtf", ".gff3", ".gff")
+_LIST_SUF = (".txt", ".list")
+
+
+def _sniff_rna(path: Path) -> str:
+    n = path.name.lower()
+    if n.endswith(_FQ_SUF):
+        return "fastq"
+    if n.endswith(".bam"):
+        return "bam"
+    if n.endswith(_GTF_SUF):
+        return "gtf"
+    raise InputError(
+        f"cannot tell RNA input type from extension: {path} "
+        "(expected .fastq/.fq[.gz], .bam, .gtf/.gff[3], or a .txt/.list file)")
+
+
+def _sample_from_files(raw_files: list[str], name: str | None, ln_tag: str) -> RnaSample:
+    files = [_require(f.strip(), f"RNA file ({ln_tag})") for f in raw_files if f.strip()]
+    if not files:
+        raise InputError(f"{ln_tag}: no input files given")
+    tags = {_sniff_rna(f) for f in files}
+    if len(tags) != 1:
+        raise InputError(
+            f"{ln_tag}: mixed input types in one sample ({', '.join(sorted(tags))}); "
+            "give each RNA sample its own -r (one type per sample)")
+    tag = tags.pop()
+    isoseq = False
+    if tag == "fastq":
+        if len(files) == 1:
+            isoseq = True   # lone FASTQ defaults to long-read (isoseq/CCS)
+        elif len(files) != 2:
+            raise InputError(f"{ln_tag}: fastq sample needs 1 (isoseq/SE) or 2 (PE) files")
+    elif tag == "bam" and len(files) != 1:
+        raise InputError(f"{ln_tag}: bam sample needs exactly 1 file")
+    return RnaSample(files=files, tag=tag, name_override=name, isoseq=isoseq)
+
+
+def parse_rna_entries(entries: list[str] | None) -> list[RnaSample]:
+    """Parse -r/--rna entries.
+
+    Each entry is either an inline sample or a list file:
+      -r sample_r1.fq,sample_r2.fq     PE short-read sample
+      -r ccs.fq                        single FASTQ -> isoseq (long-read) sample
+      -r aligned.bam                   pre-aligned BAM
+      -r a.gtf,b.gtf                   assembled transcripts (>=1 GTF per sample)
+      -r samples.txt                  list file, one sample per line:
+                                         ID1=1.fq,2.fq
+                                         ID2=xxx.fq
+                                         ID3=xxx.gtf,yyy.gtf,zzz.gtf
+                                       (same per-line rules; ID = sample name)
+    """
     samples: list[RnaSample] = []
-    with open(list_file) as fh:
-        for ln, line in enumerate(fh, 1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            tag = parts[-1] if parts[-1] in ("fastq", "bam", "bam_isoseq", "gtf") else "fastq"
-            files = parts[:-1] if parts[-1] in ("fastq", "bam", "bam_isoseq", "gtf") else parts
-            files = [str(_require(f, f"RNA file (line {ln})")) for f in files]
-            if tag == "fastq" and len(files) not in (1, 2):
-                raise InputError(f"{list_file}:{ln}: fastq sample needs 1 (SE) or 2 (PE) files")
-            if tag in ("bam", "bam_isoseq", "gtf") and len(files) != 1:
-                raise InputError(f"{list_file}:{ln}: {tag} sample needs exactly 1 file")
-            samples.append(RnaSample(files=[Path(f) for f in files], tag=tag))
-    if not samples:
-        raise InputError(f"RNA list file is empty: {list_file}")
+    for entry in entries or []:
+        entry = entry.strip()
+        if not entry:
+            continue
+        if entry.lower().endswith(_LIST_SUF) and Path(entry).is_file():
+            with open(entry) as fh:
+                for ln, line in enumerate(fh, 1):
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        raise InputError(
+                            f"{entry}:{ln}: expected 'ID=files' (key=value), got: {line!r}")
+                    sid, _, filespec = line.partition("=")
+                    sid = sid.strip()
+                    if not sid:
+                        raise InputError(f"{entry}:{ln}: empty sample ID")
+                    samples.append(
+                        _sample_from_files(filespec.split(","), sid,
+                                           f"{entry}:{ln} ({sid})"))
+        else:
+            samples.append(_sample_from_files(entry.split(","), None,
+                                              f"-r {entry}"))
+    seen: set[str] = set()
+    for s in samples:
+        if s.name in seen:
+            raise InputError(f"duplicate RNA sample name: {s.name!r} "
+                             "(use a list file with explicit IDs)")
+        seen.add(s.name)
     return samples
 
 
@@ -243,9 +313,7 @@ def validate(
     homologs: str,
     predictors: str | None = None,
     annotation: str | None = None,
-    rna_list: str | None = None,
-    bam: str | None = None,
-    transcripts: str | None = None,
+    rna: list[str] | None = None,
     busco: str | None = None,
     species_map: str | None = None,
     workdir: str | None = None,
@@ -296,16 +364,23 @@ def validate(
     else:
         busco_p = None
 
-    if rna_list and (bam or transcripts):
-        raise InputError("-r is mutually exclusive with --bam/--transcripts")
-
-    samples: list[RnaSample] = []
-    if rna_list:
-        samples = parse_rna_list(_require(rna_list, "RNA list file (-r)"))
-    if bam:
-        for b in bam.split(","):
-            samples.append(RnaSample(files=[_require(b.strip(), "BAM (--bam)")], tag="bam"))
-    tr = _require(transcripts, "transcripts GTF (--transcripts)") if transcripts else None
+    samples: list[RnaSample] = parse_rna_entries(rna)
+    # a gtf sample may carry several transcript files (ID=a.gtf,b.gtf): merge
+    # them into one cached GTF per sample so downstream sees a single file
+    for s in samples:
+        if s.tag == "gtf" and len(s.files) > 1:
+            if not workdir:
+                raise InputError("multi-GTF RNA samples require workdir")
+            merged = Path(workdir) / "input" / f"{s.name}.gtf"
+            merged.parent.mkdir(parents=True, exist_ok=True)
+            if not merged.exists():
+                with open(merged, "w") as out:
+                    for f in s.files:
+                        out.write(f.read_text())
+            log.info("rna sample %s: %d GTF(s) merged -> %s",
+                     s.name, len(s.files), merged.name)
+            s.files = [merged]
+    tr = None
 
     preds = parse_predictors(predictors)
     for name, p in preds.items():

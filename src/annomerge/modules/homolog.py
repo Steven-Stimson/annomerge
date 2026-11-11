@@ -18,13 +18,15 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-from ..utils import ensure_dir, lazy, run, which
+from ..utils import ToolError, ensure_dir, lazy, run, which
 from .validate import ValidatedInputs
 
 log = logging.getLogger("annomerge")
 
 SPECIES_RE = re.compile(r"\|species=([^\s|]+)")
 
+
+REFEREE_MIN_WI = 0.6  # referee set threshold: wi = coverage x identity
 
 # ---- miniprot alignment quality filters (vocabulary from mnpFormatter.pl) --
 MNP_TOKENS = ("UnStop", "UnShift", "minIden", "minPos", "minSize",
@@ -211,18 +213,27 @@ def filter_miniprot_alignments(raw_gff: Path, raw_paf: Path,
 
 
 def run_miniprot(genome: Path, proteins: Path, out_dir: Path, threads: int,
-                 filt: dict | None = None) -> tuple[Path, Path]:
-    """Run miniprot once, producing PAF and GFF."""
+                 filt: dict | None = None,
+                 extra_opts: list[str] | None = None) -> tuple[Path, Path]:
+    """Run miniprot once, producing PAF and GFF.
+
+    extra_opts are inserted into both invocations (protected: -t, --paf, --gff).
+    """
     ensure_dir(out_dir)
     paf = out_dir / "miniprot.paf"
     gff = out_dir / "miniprot.gff"
     raw_paf = out_dir / "miniprot.raw.paf"
     raw_gff = out_dir / "miniprot.raw.gff"
     if not (raw_paf.exists() and raw_gff.exists()):
-        run(f"{which('miniprot')} -t{threads} --paf {genome} {proteins} > {raw_paf}",
-            shell=True, log_file=out_dir / "miniprot.paf.log", desc="miniprot (paf)")
-        run(f"{which('miniprot')} -t{threads} --gff {genome} {proteins} > {raw_gff}",
-            shell=True, log_file=out_dir / "miniprot.gff.log", desc="miniprot (gff)")
+        for mode, raw in (("--paf", raw_paf), ("--gff", raw_gff)):
+            cmd = [which("miniprot"), f"-t{threads}", mode,
+                   *(extra_opts or []), str(genome), str(proteins)]
+            with open(raw, "w") as fh:
+                import subprocess
+                log.info("RUN  miniprot (%s) %s", mode, Path(proteins).name)
+                rc = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT).returncode
+            if rc != 0:
+                raise ToolError(f"miniprot failed (rc={rc}): see {raw}")
     if not lazy([paf, gff], desc="miniprot mnp-filter"):
         counts = filter_miniprot_alignments(raw_gff, raw_paf, gff, paf,
                                             proteins, filt or {})
@@ -299,7 +310,8 @@ def _median(xs: list[float]) -> float:
 
 
 def _run_sets_miniprot(vi: ValidatedInputs, hdir: Path, threads: int,
-                       filt: dict | None = None) -> tuple[Path, Path]:
+                       filt: dict | None = None,
+                       extra_opts: list[str] | None = None) -> tuple[Path, Path]:
     """Per-set miniprot runs, merged transparently into hdir/miniprot.{paf,gff}."""
     sroot = ensure_dir(hdir / "sets")
     n_sets = len(vi.homolog_sets)
@@ -307,7 +319,7 @@ def _run_sets_miniprot(vi: ValidatedInputs, hdir: Path, threads: int,
     set_outputs = []
     for label, path in vi.homolog_sets.items():
         set_outputs.append(run_miniprot(vi.genome, path, ensure_dir(sroot / label),
-                                        t_each, filt))
+                                        t_each, filt, extra_opts))
     paf = hdir / "miniprot.paf"
     gff = hdir / "miniprot.gff"
     if not lazy([paf, gff], desc="merge per-set miniprot"):
@@ -393,8 +405,9 @@ def _relatedness(vi: ValidatedInputs, hdir: Path) -> tuple[Path, dict[str, float
 
 
 def run_homolog_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
-                       referee_min_wi: float = 0.6,
-                       mnp_filter: str = "") -> dict:
+                       mnp_filter: str = "",
+                       miniprot_opts: list[str] | None = None) -> dict:
+    referee_min_wi = REFEREE_MIN_WI
     hdir = ensure_dir(out_dir / "03.homolog")
     log.info("module 2 [homolog]: %s (%d set(s))", vi.homologs, len(vi.homolog_sets))
     membership = _load_membership(vi)
@@ -406,9 +419,10 @@ def run_homolog_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
         log.info("homolog mnp-filter active (%s): %s", mnp_filter, active)
 
     if len(vi.homolog_sets) > 1:
-        paf, gff = _run_sets_miniprot(vi, hdir, threads, filt)
+        paf, gff = _run_sets_miniprot(vi, hdir, threads, filt, miniprot_opts)
     else:
-        paf, gff = run_miniprot(vi.genome, vi.homologs, hdir, threads, filt)
+        paf, gff = run_miniprot(vi.genome, vi.homologs, hdir, threads, filt,
+                                miniprot_opts)
 
     sets_tsv, rel, weight = _relatedness(vi, hdir)
 

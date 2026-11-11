@@ -37,9 +37,30 @@ def _read_fasta_ids(path: Path) -> dict[str, str]:
     return ids
 
 
+# TransDecoder.Predict-only flags: passed to Predict but not LongOrfs
+TD_PREDICT_ONLY = ("--single_best_only", "--single_best_ORF",
+                   "--retain_long_orfs_length", "--retain_long_orfs_mode",
+                   "--no_refine_starts")
+
+
+def split_td_opts(opts: list[str] | None) -> tuple[list[str], list[str]]:
+    """Split user TransDecoder options into (longorfs_extra, predict_extra).
+
+    Flags in TD_PREDICT_ONLY go to Predict only; everything else goes to
+    both stages (e.g. -S strand-specific, -G genetic code).
+    """
+    both, predict_only = [], []
+    for t in opts or []:
+        base = t.split("=", 1)[0]
+        (predict_only if base in TD_PREDICT_ONLY else both).append(t)
+    return both, predict_only
+
+
 def run_goldset(vi: ValidatedInputs, out_dir: Path, threads: int,
                 stringtie_gtf: Path | None, referee_faa: Path | None,
-                min_orf_aa: int = 50) -> dict | None:
+                min_orf_aa: int = 50,
+                td_opts: list[str] | None = None) -> dict | None:
+    lo_opts, pr_opts = split_td_opts(td_opts)
     """Build the gold set. Requires RNA transcripts AND homolog evidence."""
     if stringtie_gtf is None:
         log.warning("goldset: no RNA transcripts available -> skipped (auto-degraded)")
@@ -57,7 +78,8 @@ def run_goldset(vi: ValidatedInputs, out_dir: Path, threads: int,
     td_dir = gdir / "transdecoder"
     orfs = gdir / "transcripts.fa.transdecoder_dir" / "longest_orfs.pep"
     if not lazy([orfs], desc="TransDecoder.LongOrfs"):
-        run(f"cd {gdir} && {which('TransDecoder.LongOrfs')} -t {tfa} -m {min_orf_aa}",
+        run(f"cd {gdir} && {which('TransDecoder.LongOrfs')} -t {tfa} -m {min_orf_aa} "
+            + " ".join(lo_opts),
             shell=True, log_file=gdir / "longorfs.log", desc="TransDecoder.LongOrfs")
 
     # 3. DIAMOND blastp: candidate ORFs vs homolog referee (fall back to full homologs)
@@ -77,7 +99,8 @@ def run_goldset(vi: ValidatedInputs, out_dir: Path, threads: int,
     final_pep = gdir / "transcripts.fa.transdecoder.pep"
     if not lazy([final_pep], desc="TransDecoder.Predict"):
         run(f"cd {gdir} && {which('TransDecoder.Predict')} -t {tfa} "
-            f"--retain_blastp_hits {blast_out}",
+            f"--retain_blastp_hits {blast_out} "
+            + " ".join(lo_opts + pr_opts),
             shell=True, log_file=gdir / "predict.log", desc="TransDecoder.Predict")
 
     # 5. goldset.faa = TransDecoder final pep; details table

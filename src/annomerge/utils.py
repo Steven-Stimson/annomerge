@@ -24,6 +24,28 @@ class ToolError(RuntimeError):
     """Raised when an external tool fails or is missing."""
 
 
+def parse_extra_opts(spec: str | None, protected: tuple[str, ...], tool: str) -> list[str]:
+    """shlex-split a user-supplied extra-options string and reject flags that
+    the pipeline manages itself (e.g. 'hisat2 -x/-p/-S/-1/-2/-U/--dta').
+
+    protected flags may not appear at all: not as a bare token, with '=',
+    or glued to a value ('-p8' / '--threads=8' forms are rejected too).
+    Returns [] for empty/None specs.
+    """
+    import shlex
+    if not spec or not spec.strip():
+        return []
+    toks = shlex.split(spec)
+    for tok in toks:
+        for f in protected:
+            base = tok.split("=", 1)[0]
+            if base == f or (len(f) == 2 and tok.startswith(f) and len(tok) > 2):
+                raise ToolError(
+                    f"{tool}: '{tok}' overlaps a pipeline-managed option ({f}); "
+                    f"remove it from the extra options. Protected: {', '.join(protected)}")
+    return toks
+
+
 def which(tool: str) -> str:
     """Resolve an external tool: dependency registry (env vars) first,
     PATH as fallback.  Import is local to avoid a module-level cycle."""

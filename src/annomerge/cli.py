@@ -1,14 +1,15 @@
 """annomerge CLI (typer). Two subcommands: merge / evaluate.
 
-Current implementation scope: Module 1 (validation) + Module 2 evidence
-sub-pipelines (RNA branch, miniprot homology branch, Gold set construction).
-Predictor scoring / EVM / augment / confidence annotation are stubs that
-log a clear "not implemented" notice.
+merge:   evidence collection (RNA / homolog proteins / Gold set) -> predictor
+         scoring -> EVM weight calibration -> EVM integration -> (isoform
+         mode) isoform resolution / UTR backfill -> sanity repair ->
+         confidence tiers -> HTML report + single-file offline browser.
+evaluate: the same assessment chain on an existing annotation (read-only).
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 
@@ -18,39 +19,52 @@ from .modules.validate import InputError, validate
 from .modules.rna import run_rna_branch
 from .modules.homolog import run_homolog_branch
 from .modules.goldset import run_goldset
-from .utils import ensure_dir, setup_logging
+from .utils import ensure_dir, parse_extra_opts, setup_logging
 
 app = typer.Typer(
     name="annomerge",
     help="""AnnoMerge: EVM weight calibration + evidence auditing for gene annotation.
 
-Subcommands:
-  merge     Integration pipeline — score de novo predictors and calibrate
-            EVM weights -> EVM integration -> isoform resolution / UTR
-            backfill -> sanity repair -> confidence tiers -> HTML report
-            + single-file offline evidence browser.
-            Inputs: -g genome -P de novo predictions -p homolog proteins
-            [-r/--bam/--transcripts RNA] [--busco lineage] [--omark-db db]
-  evaluate  Assessment pipeline — run the SAME assessment chain as merge on
-            an existing annotation (evidence collection -> confidence tiers
-            -> per-gene support tags -> report + evidence browser).
-            The annotation is read-only: never filtered, renamed or
-            coordinate-lifted.
-            Inputs: -g genome -a annotation GFF3/GTF -p homolog proteins
-            [-r/--bam/--transcripts RNA] [-P de novo evidence tracks]
-            [--busco lineage] [--omark-db db]
+[blue]Subcommands[/blue]
+  merge      Integration pipeline — score de novo predictors, calibrate EVM
+             weights, run EVM integration, (optionally) isoform resolution /
+             UTR backfill, sanity repair, confidence tiers, HTML report and a
+             single-file offline evidence browser.
+  evaluate   Read-only assessment of an existing annotation with the same
+             evidence chain (never filtered, renamed or coordinate-lifted).
 
-Global options:
-  -c, --check-dependencies  check all external dependencies and versions
-                            (exit 0 = all present, 3 = missing)
-  -v, --version             print version and exit
-  -h, --help                show this help (use <subcommand> --help for
-                            subcommand options)
+[blue]Global options[/blue]
+  -c, --check-dependencies   check all external dependencies and versions
+  -v, --version              print version and exit
+  -h, --help                 show this help (see <subcommand> --help for options)
 """,
     context_settings={"help_option_names": ["-h", "--help"]},
     add_completion=False,
     no_args_is_help=True,
+    rich_markup_mode="rich",
 )
+
+_ADV_CAUTION = ("[yellow]Caution:[/yellow] only touch these if you fully understand "
+                "the consequences; the defaults are calibrated for the AnnoMerge "
+                "evidence chain. Pipeline-managed flags are rejected.")
+
+_MNP_HELP = (
+    "miniprot alignment quality filter (comma-separated tokens). "
+    "[cyan]Default: 'UnStop,UnShift'[/cyan]; pass [blue]0[/blue] to disable filtering. "
+    "Switches: [blue]UnStop[/blue] (drop in-frame-stop alignments), "
+    "[blue]UnShift[/blue] (drop frameshift alignments). "
+    "Numeric thresholds ([blue]key=value[/blue], 0 = off): "
+    "[blue]minIden[/blue] min identity, [blue]minPos[/blue] min positive-rate, "
+    "[blue]minSize[/blue]/[blue]maxSize[/blue] aligned-CDS length range, "
+    "[blue]maxRank[/blue] keep Rank<=N mappings, [blue]topRank[/blue] keep best "
+    "N mappings per protein, [blue]R2Q[/blue]/[blue]Q2R[/blue] lower bounds of the "
+    "reference-vs-query CDS length ratio from each side.")
+
+_TD_HELP = (
+    "extra flags for TransDecoder.LongOrfs/Predict, e.g. \"-S --single_best_only\". "
+    "Predict-only flags (e.g. --single_best_only, --no_refine_starts) are routed "
+    "to Predict automatically; all other flags go to both stages. "
+    "Protected: -t, -m (use --goldset-min-orf), --retain_blastp_hits. " + _ADV_CAUTION)
 
 
 def _version_callback(value: bool):
@@ -85,24 +99,44 @@ def _prepare(outdir: str, verbose: bool) -> Path:
     out = ensure_dir(Path(outdir))
     return out
 
-def _stub(stage: str):
-    import logging
-    logging.getLogger("annomerge").warning(
-        "stage %r is not implemented in this development build; skipped.", stage)
+
+def _parse_evm_options(spec: str | None) -> dict:
+    """'--evm-options "min_intron=20"' -> {min_intron: 20} (whitelisted keys)."""
+    out: dict = {}
+    for tok in (spec or "").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        key, _, val = tok.partition("=")
+        key = key.strip()
+        if key == "min_intron":
+            out["min_intron"] = int(float(val))
+        else:
+            typer.secho(f"unknown --evm-options key {key!r} "
+                        f"(allowed: min_intron)", fg="red", err=True)
+            raise typer.Exit(2)
+    return out
+
+
+def _norm_mnp(spec: str) -> str:
+    """'0' (or none/off) disables the mnp filter entirely."""
+    return "" if spec.strip().lower() in ("0", "none", "off") else spec
 
 
 def _run_evidence_pipeline(
-    out: Path, genome: str, homologs: str, rna_list: Optional[str],
-    bam: Optional[str], transcripts: Optional[str], busco: Optional[str],
-    species_map: Optional[str], threads: int,
-    referee_min_wi: float, goldset: bool, goldset_min_orf: int,
+    out: Path, genome: str, homologs: str, rna: Optional[List[str]],
+    busco: Optional[str], species_map: Optional[str], threads: int,
+    goldset_min_orf: int,
     predictors: Optional[str] = None, annotation: Optional[str] = None,
     mnp_filter: str = "",
+    miniprot_opts: Optional[List[str]] = None,
+    hisat2_opts: Optional[List[str]] = None,
+    stringtie_opts: Optional[List[str]] = None,
+    td_opts: Optional[List[str]] = None,
 ):
     vi = validate(
         genome=genome, homologs=homologs, predictors=predictors,
-        annotation=annotation, rna_list=rna_list, bam=bam,
-        transcripts=transcripts, busco=busco, species_map=species_map,
+        annotation=annotation, rna=rna, busco=busco, species_map=species_map,
         workdir=str(out),
     )
     results: dict = {}
@@ -110,113 +144,311 @@ def _run_evidence_pipeline(
     # module 2: RNA branch
     rna_res = None
     if vi.has_rna:
-        rna_res = run_rna_branch(vi, out, threads)
+        rna_res = run_rna_branch(vi, out, threads,
+                                 hisat2_opts=hisat2_opts,
+                                 stringtie_opts=stringtie_opts)
         results["rna"] = rna_res
     else:
         import logging
-        logging.getLogger("annomerge").warning("no RNA evidence; RNA branch skipped (auto-degraded)")
+        logging.getLogger("annomerge").warning(
+            "no RNA evidence; RNA branch skipped (auto-degraded)")
 
     # module 2: homology branch
-    results["homolog"] = run_homolog_branch(vi, out, threads, referee_min_wi=referee_min_wi,
-                       mnp_filter=mnp_filter)
+    results["homolog"] = run_homolog_branch(
+        vi, out, threads, mnp_filter=mnp_filter, miniprot_opts=miniprot_opts)
 
-    # module 2b: gold set
-    if goldset and vi.has_rna:
+    # module 2b: gold set (built whenever RNA evidence exists)
+    if vi.has_rna:
         gtf = rna_res["stringtie_gtf"] if rna_res else (vi.rna_gtfs[0] if vi.rna_gtfs else None)
         results["goldset"] = run_goldset(
             vi, out, threads, stringtie_gtf=gtf,
             referee_faa=None,  # referee protein FASTA extraction: TODO, use full homologs for now
             min_orf_aa=goldset_min_orf,
+            td_opts=td_opts,
         )
     return results, vi
 
 
-@app.command(help="Predictor scoring + EVM weight calibration (full pipeline by default).")
+_SCORING_FORMULA = """
+[bold]Scoring model[/bold] (module 3 — every de novo predictor gets one W_raw):
+
+    W_raw = w_r·R_s + w_h·H_s + w_b·B_c + w_c·C_s   (default 0.45/0.25/0.15/0.15)
+
+  R_s  RNA support: junction/exon coverage + expression (internals α/β/γ, see --rna-weights)
+  H_s  homolog support: full-length miniprot hits vs referee proteins and the
+       RNA-assembled Gold set (gold-set share = --hs-gold-weight)
+  B_c  conservation: BUSCO complete recall in proteins mode (needs --busco)
+  C_s  structure: 1 − anomaly rate (chimeric / split heuristics from homolog hit patterns)
+
+Sub-blocks without evidence are skipped and the remaining weights are
+renormalized. A predictor is hard-rejected (EXCLUDE, never enters EVM) when
+its anomaly rate exceeds --max-anomaly-rate or fewer than 2 sub-blocks are
+usable. W_raw is then mapped to integer EVM weights (--weight-mapping).
+"""
+
+_MERGE_HELP = """[bold]merge[/bold]: score de novo predictors, calibrate EVM
+weights and integrate all evidence into a final annotation.
+
+Minimal example:
+
+    annomerge merge -g genome.fa -P helixer=h.gff3,annevo=a.gff3 \\
+        -p proteins.pep -r rnaseq_r1.fq,rnaseq_r2.fq --busco bacteria_odb10
+""" + _SCORING_FORMULA
+
+
+@app.command(help=_MERGE_HELP)
 def merge(
-    genome: Optional[str] = typer.Option(None, "-g", help="MANDATORY (unless -c): reference genome FASTA"),
-    predictors: Optional[str] = typer.Option(None, "-P", help="MANDATORY (unless -c): de novo predictions, name=path comma list"),
-    homologs: Optional[str] = typer.Option(None, "-p", help="MANDATORY (unless -c): homolog protein FASTA, 'label=path' comma list OK (e.g. -p near=near.pep,far=far.fa; unlabeled -> filename stem). headers: >id|species=Genus_species. Multiple UNLABELED files merge into one protein pool (mnp-filtered, unweighted); explicit id=path labels keep the relatedness-weighted multi-set mode"),
-    rna_list: Optional[str] = typer.Option(None, "-r", help="RNA list file (fastq/bam/gtf tags)"),
-    bam: Optional[str] = typer.Option(None, "--bam", help="sorted+indexed RNA-seq BAM(s), comma list"),
-    transcripts: Optional[str] = typer.Option(None, "--transcripts", help="StringTie transcripts GTF/GFF"),
-    busco: Optional[str] = typer.Option(None, "--busco", help="local BUSCO odb lineage path (offline)"),
-    paf: Optional[str] = typer.Option(None, "--paf", help="precomputed miniprot PAF"),
-    mnp_filter: Optional[str] = typer.Option(None, "--mnp-filter",
-        help="miniprot homolog quality filter, comma tokens: UnStop,UnShift,Q2R=0.5,topRank=1 ... "
-             "(empty = no filter)"),
-    species_map: Optional[str] = typer.Option(None, "--species-map", help="queryID -> species TSV"),
-    weight_only: bool = typer.Option(False, "--weight-only", help="stop after weight table"),
-    threads: int = typer.Option(8, "-t", help="threads"),
-    outdir: str = typer.Option("./annomerge_out", "-o", help="output directory"),
-    referee_min_wi: float = typer.Option(0.6, "--referee-min-wi", help="referee filter wi=cov*ident"),
-    goldset: bool = typer.Option(True, "--goldset/--no-goldset", help="build Gold set (module 2b)"),
-    goldset_min_orf: int = typer.Option(50, "--goldset-min-orf", help="min ORF length (aa) in Gold set"),
-    w_rna: float = typer.Option(0.45, "--w-rna", help="RNA sub-block weight"),
-    w_homolog: float = typer.Option(0.25, "--w-homolog", help="homolog sub-block weight"),
-    w_conserve: float = typer.Option(0.15, "--w-conserve", help="conservation sub-block weight"),
-    w_structure: float = typer.Option(0.15, "--w-structure", help="structure sub-block weight"),
-    rna_weights: str = typer.Option("0.5,0.35,0.15", "--rna-weights", help="R_s internals alpha,beta,gamma"),
-    fulllength_cov: float = typer.Option(0.9, "--fulllength-cov", help="bidirectional coverage for full-length match"),
-    hs_gold_weight: float = typer.Option(0.5, "--hs-gold-weight", help="Gold set share inside H_s (0-1)"),
-    max_anomaly_rate: float = typer.Option(0.08, "--max-anomaly-rate", help="hard-reject anomaly threshold"),
-    min_predictor_score: float = typer.Option(0.35, "--min-predictor-score", help="min W_raw to enter EVM"),
-    weight_mapping: str = typer.Option("linear", "--weight-mapping", help="linear|rank"),
-    ablate: Optional[str] = typer.Option(None, "--ablate", help="comma list: rna,homolog,conserve,structure,me"),
-    w_gold_evm: int = typer.Option(10, "--w-gold-evm", help="EVM weight: TransDecoder gold set"),
-    w_transcript_evm: int = typer.Option(8, "--w-transcript-evm", help="EVM weight: StringTie transcripts"),
-    w_protein_evm: int = typer.Option(6, "--w-protein-evm", help="EVM weight: miniprot homolog proteins"),
-    min_intron_evm: int = typer.Option(20, "--min-intron-evm", help="EVM min intron length"),
-    evm_parts: int = typer.Option(0, "--evm-parts",
-                                  help="EVM genome split: 0=auto (=threads), 1=off (single run), "
-                                       "N=split whole chromosomes into N size-balanced parts run in parallel"),
-    aug_jitter_bp: int = typer.Option(50, "--aug-jitter-bp",
-                                      help="augment: merge UTR donors closer than this on both ends (0=off)"),
-    aug_dedup: str = typer.Option("geometric", "--aug-dedup",
-                                  help="augment donor dedup: geometric|evidence "
-                                       "(evidence = EviAnn-style PWM gate + junction vote + TPM-ratio, no bp threshold)"),
-    aug_tpm_ratio: float = typer.Option(0.1, "--aug-tpm-ratio",
-                                        help="evidence dedup: keep donor if TPM >= ratio * representative TPM"),
-    aug_min_tpm: float = typer.Option(0.1, "--aug-min-tpm",
-                                      help="evidence dedup: absolute TPM floor for keeping a donor"),
-    aug_junc_reads: int = typer.Option(3, "--aug-junc-reads",
-                                       help="evidence dedup: junction-read corroboration min reads"),
-    aug_collapse_tol: int = typer.Option(5, "--aug-collapse-tol-bp",
-        help="isoform collapse tolerance: CDS outer boundaries within this "
-             "many bp (same intron chain, same strand) count as one "
-             "structure; representative = longest total UTR (0 = exact)"),
-    aug_pwm_gate: float = typer.Option(-3.0, "--aug-pwm-gate",
-                                       help="evidence dedup: splice-PWM gate threshold (log2 lift, calibrated)"),
-    merge_mode: str = typer.Option("isoform", "--merge-mode",
-                                   help="isoform|evm (isoform: EVM + isoform resolution + UTR backfill + augment; evm: EVM integration only)"),
-    omark_db: Optional[str] = typer.Option(None, "--omark-db", help="OMAmer database (.h5) for OMArk orthology QC (after BUSCO)"),
-    viewer_off: bool = typer.Option(False, "--no-viewer", help="skip the evidence browser build"),
-    viewer_full: bool = typer.Option(False, "--viewer-full",
-                                     help="evidence browser: embed genome sequence (base-level track). "
-                                          "Default is the lite build (coordinates only, much smaller)"),
-    config: Optional[str] = typer.Option(None, "--config", help="resolved_params.yaml from a previous run"),
-    verbose: bool = typer.Option(False, "--verbose"),
+    # ---------------------------------------------------------- input files
+    genome: Optional[str] = typer.Option(
+        None, "--genome", "-g",
+        help="[bold green]MANDATORY[/bold green]. Reference genome FASTA.",
+        rich_help_panel="Input files"),
+    predictors: Optional[str] = typer.Option(
+        None, "--predictions", "-P",
+        help="[bold green]MANDATORY[/bold green]. De novo gene predictions, "
+             "'name=path' comma list (unnamed -> filename stem), e.g. "
+             "[blue]-P[/blue] helixer=h.gff3,annevo=a.gff3.",
+        rich_help_panel="Input files"),
+    homologs: Optional[str] = typer.Option(
+        None, "--proteins", "-p",
+        help="[bold green]MANDATORY[/bold green]. Homolog protein FASTA, "
+             "'label=path' comma list OK (e.g. [blue]-p[/blue] near=near.pep,far=far.fa; "
+             "unlabeled -> filename stem). Headers: >id|species=Genus_species. "
+             "Multiple UNLABELED files merge into one protein pool (mnp-filtered, "
+             "unweighted); explicit labels keep the relatedness-weighted multi-set mode.",
+        rich_help_panel="Input files"),
+    rna: Optional[List[str]] = typer.Option(
+        None, "--rna", "-r",
+        help="RNA evidence; repeat [blue]-r[/blue] per sample. Each value is a "
+             "comma-separated file list, auto-detected by extension: .bam = aligned "
+             "reads; .gtf/.gff[3] = assembled transcripts; .fastq/.fq(.gz): one file = "
+             "isoseq/long-read (CCS) sample, two files = PE short reads. A .txt/.list "
+             "value is parsed as a sample sheet, one 'ID=files' sample per line. "
+             "Omitting RNA entirely degrades the run to EVM + homolog evidence.",
+        rich_help_panel="Input files"),
+    busco: Optional[str] = typer.Option(
+        None, "--busco",
+        help="Local BUSCO odb lineage directory (offline completeness QC; feeds B_c).",
+        rich_help_panel="Input files"),
+    omark_db: Optional[str] = typer.Option(
+        None, "--omark-db",
+        help="OMAmer database (.h5) for OMArk orthology QC (runs after BUSCO).",
+        rich_help_panel="Input files"),
+    species_map: Optional[str] = typer.Option(
+        None, "--species-map",
+        help="queryID -> species TSV (overrides |species= header tags).",
+        rich_help_panel="Input files"),
+    merge_mode: str = typer.Option(
+        "evm", "--merge-mode",
+        help="[cyan]evm[/cyan] (default): EVM integration only. "
+             "[cyan]isoform[/cyan]: EVM + isoform resolution + UTR backfill + augment "
+             "(requires RNA evidence; auto-falls back to evm without RNA).",
+        rich_help_panel="Input files"),
+    threads: int = typer.Option(
+        8, "--threads", "-t", help="Threads (also sets the EVM genome-split granularity).",
+        rich_help_panel="Input files"),
+    outdir: str = typer.Option(
+        "./annomerge_out", "--outdir", "-o", help="Output directory.",
+        rich_help_panel="Input files"),
+    # ------------------------------------------------------------- scoring
+    mnp_filter: str = typer.Option(
+        "UnStop,UnShift", "--mnp-filter", help=_MNP_HELP,
+        rich_help_panel="Scoring"),
+    w_rna: float = typer.Option(
+        0.45, "--w-rna", help="W_r: weight of the R_s (RNA support) sub-block.",
+        rich_help_panel="Scoring"),
+    w_homolog: float = typer.Option(
+        0.25, "--w-homolog", help="W_h: weight of the H_s (homolog support) sub-block.",
+        rich_help_panel="Scoring"),
+    w_conserve: float = typer.Option(
+        0.15, "--w-conserve",
+        help="W_b: weight of the B_c (BUSCO complete recall) sub-block; skipped "
+             "without --busco.",
+        rich_help_panel="Scoring"),
+    w_structure: float = typer.Option(
+        0.15, "--w-structure",
+        help="W_c: weight of the C_s (1 − structural anomaly rate) sub-block.",
+        rich_help_panel="Scoring"),
+    rna_weights: str = typer.Option(
+        "0.5,0.35,0.15", "--rna-weights",
+        help="R_s internals 'alpha,beta,gamma' (junction support, exon coverage, TPM).",
+        rich_help_panel="Scoring"),
+    fulllength_cov: float = typer.Option(
+        0.9, "--fulllength-cov",
+        help="H_s full-length criterion: a miniprot hit counts as full-length only "
+             "when bidirectional protein coverage >= this value.",
+        rich_help_panel="Scoring"),
+    hs_gold_weight: float = typer.Option(
+        0.5, "--hs-gold-weight",
+        help="Share of Gold-set hits inside H_s (0-1); the remainder comes from "
+             "referee-protein hits.",
+        rich_help_panel="Scoring"),
+    max_anomaly_rate: float = typer.Option(
+        0.08, "--max-anomaly-rate",
+        help="Hard-reject threshold: predictors with a structural anomaly rate above "
+             "this are EXCLUDED from EVM (raise for distant-only homolog evidence).",
+        rich_help_panel="Scoring"),
+    min_predictor_score: float = typer.Option(
+        0.35, "--min-predictor-score",
+        help="Minimum W_raw for a predictor to enter EVM integration.",
+        rich_help_panel="Scoring"),
+    weight_mapping: str = typer.Option(
+        "linear", "--weight-mapping",
+        help="W_raw -> EVM integer weight mapping: [cyan]linear[/cyan] or [cyan]rank[/cyan].",
+        rich_help_panel="Scoring"),
+    ablate: Optional[str] = typer.Option(
+        None, "--ablate",
+        help="Comma list of sub-blocks to disable (rna,homolog,conserve,structure) "
+             "— ablation experiments only.",
+        rich_help_panel="Scoring"),
+    # ---------------------------------------------------- EVM integration
+    w_gold_evm: int = typer.Option(
+        10, "--w-gold-evm", help="EVM evidence weight: TransDecoder Gold set.",
+        rich_help_panel="EVM integration"),
+    w_transcript_evm: int = typer.Option(
+        8, "--w-transcript-evm", help="EVM evidence weight: StringTie transcripts.",
+        rich_help_panel="EVM integration"),
+    w_protein_evm: int = typer.Option(
+        6, "--w-protein-evm",
+        help="EVM evidence weight: miniprot homolog proteins (base; per-set weights "
+             "apply in labeled multi-set mode).",
+        rich_help_panel="EVM integration"),
+    evm_options: Optional[str] = typer.Option(
+        None, "--evm-options",
+        help="Extra EVM settings, 'key=value' comma list. Allowed keys: "
+             "[blue]min_intron[/blue] (bp, default 20; EVM --min_intron_length). "
+             "Example: [blue]--evm-options[/blue] \"min_intron=30\".",
+        rich_help_panel="EVM integration"),
+    # ---------------------------------------------- augment (isoform mode)
+    aug_dedup: str = typer.Option(
+        "geometric", "--aug-dedup",
+        help="Near-duplicate UTR-donor removal, two philosophies: "
+             "[cyan]geometric[/cyan] (default): merge donors whose spans sit within "
+             "±--aug-jitter-bp on both ends (assembly-jitter clustering). "
+             "[cyan]evidence[/cyan]: EviAnn-style voting — a novel splice site must pass "
+             "the splice-PWM gate (--aug-pwm-gate), junction-read corroboration "
+             "(--aug-junc-reads) and expression filters (--aug-tpm-ratio, --aug-min-tpm); "
+             "no bp threshold. Independent of both: --aug-collapse-tol-bp folds "
+             "identical-intron-chain isoforms after dedup.",
+        rich_help_panel="Augment (isoform mode)"),
+    aug_jitter_bp: int = typer.Option(
+        50, "--aug-jitter-bp",
+        help="[cyan]geometric[/cyan] mode only: merge UTR donors closer than this on "
+             "both ends (0 = off).",
+        rich_help_panel="Augment (isoform mode)"),
+    aug_pwm_gate: float = typer.Option(
+        -3.0, "--aug-pwm-gate",
+        help="[cyan]evidence[/cyan] mode only: splice-PWM gate threshold (log2 lift, "
+             "calibrated) for novel non-anchor splice sites.",
+        rich_help_panel="Augment (isoform mode)"),
+    aug_junc_reads: int = typer.Option(
+        3, "--aug-junc-reads",
+        help="[cyan]evidence[/cyan] mode only: minimum junction-read support for a "
+             "novel intron to corroborate a donor.",
+        rich_help_panel="Augment (isoform mode)"),
+    aug_tpm_ratio: float = typer.Option(
+        0.1, "--aug-tpm-ratio",
+        help="[cyan]evidence[/cyan] mode only: keep a donor when TPM >= this ratio x "
+             "representative TPM.",
+        rich_help_panel="Augment (isoform mode)"),
+    aug_min_tpm: float = typer.Option(
+        0.1, "--aug-min-tpm",
+        help="[cyan]evidence[/cyan] mode only: absolute TPM floor for keeping a donor.",
+        rich_help_panel="Augment (isoform mode)"),
+    aug_collapse_tol: int = typer.Option(
+        5, "--aug-collapse-tol-bp",
+        help="Both modes: isoform collapse tolerance — CDS outer boundaries within "
+             "this many bp with an identical intron chain on the same strand count as "
+             "one structure (representative = longest total UTR; 0 = exact).",
+        rich_help_panel="Augment (isoform mode)"),
+    # ----------------------------------------------- assessment & report
+    viewer: str = typer.Option(
+        "lite", "--viewer",
+        help="Evidence browser build: [cyan]full[/cyan] (embeds the genome sequence, "
+             "base-level track, much larger), [cyan]lite[/cyan] (default: coordinates "
+             "only), [cyan]no[/cyan] (skip).",
+        rich_help_panel="Assessment & report"),
+    weight_only: bool = typer.Option(
+        False, "--weight-only", help="Stop after the EVM weight table.",
+        rich_help_panel="Advanced"),
+    # ------------------------------------------------------------- advanced
+    goldset_min_orf: int = typer.Option(
+        50, "--goldset-min-orf",
+        help="Gold set: minimum ORF length (aa) for TransDecoder.LongOrfs (-m).",
+        rich_help_panel="Advanced"),
+    hisat2_options: Optional[str] = typer.Option(
+        None, "--hisat2-options",
+        help="Extra HISAT2 alignment flags, e.g. \"-k 3 --sp max=15\". Inserted into "
+             "every per-sample alignment. Protected: -x, -p, -S, -1, -2, -U, --dta. "
+             + _ADV_CAUTION,
+        rich_help_panel="Advanced"),
+    stringtie_options: Optional[str] = typer.Option(
+        None, "--stringtie-options",
+        help="Extra StringTie flags for per-sample assembly, e.g. \"-f 0.1 -c 5\". "
+             "Protected: the input BAM, -p, -o, -L (isoseq samples get -L "
+             "automatically). The --merge step is pipeline-managed. " + _ADV_CAUTION,
+        rich_help_panel="Advanced"),
+    miniprot_options: Optional[str] = typer.Option(
+        None, "--miniprot-options",
+        help="Extra miniprot flags, e.g. \"-I -S\". Inserted into both PAF and GFF "
+             "runs. Protected: -t, --paf, --gff. " + _ADV_CAUTION,
+        rich_help_panel="Advanced"),
+    transdecoder_options: Optional[str] = typer.Option(
+        None, "--transdecoder-options", help=_TD_HELP,
+        rich_help_panel="Advanced"),
+    config: Optional[str] = typer.Option(
+        None, "--config", help="resolved_params.yaml from a previous run (informational).",
+        rich_help_panel="Advanced"),
+    verbose: bool = typer.Option(False, "--verbose", help="Verbose logging.",
+                                 rich_help_panel="Advanced"),
 ):
-    missing = [n for n, v in (("genome/-g", genome), ("predictors/-P", predictors),
-                              ("homologs/-p", homologs)) if not v]
+
+    missing = [n for n, v in (("--genome/-g", genome), ("--predictions/-P", predictors),
+                              ("--proteins/-p", homologs)) if not v]
     if missing:
         typer.secho(f"missing mandatory option(s): {', '.join(missing)} "
                     f"(or use -c/--check-dependencies for a dependency check)",
                     fg="red", err=True)
         raise typer.Exit(2)
+    mode = merge_mode.lower()
+    if mode not in ("evm", "isoform"):
+        typer.secho(f"unknown --merge-mode {merge_mode!r} (evm|isoform)",
+                    fg="red", err=True)
+        raise typer.Exit(2)
+    vw = viewer.lower()
+    if vw not in ("full", "lite", "no"):
+        typer.secho(f"unknown --viewer {viewer!r} (full|lite|no)", fg="red", err=True)
+        raise typer.Exit(2)
+    evm_opts = _parse_evm_options(evm_options)
+    try:
+        hisat2_opts = parse_extra_opts(
+            hisat2_options, ("-x", "-p", "-S", "-1", "-2", "-U", "--dta"), "hisat2")
+        stringtie_opts = parse_extra_opts(
+            stringtie_options, ("-p", "-o", "-L"), "stringtie")
+        miniprot_opts = parse_extra_opts(
+            miniprot_options, ("-t", "--paf", "--gff"), "miniprot")
+        td_opts = parse_extra_opts(
+            transdecoder_options, ("-t", "-m", "--retain_blastp_hits"), "TransDecoder")
+    except RuntimeError as e:
+        typer.secho(str(e), fg="red", err=True)
+        raise typer.Exit(2)
+
     out = _prepare(outdir, verbose)
     params = {k: v for k, v in locals().items() if k not in ("out",)}
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
         results, vi = _run_evidence_pipeline(
-            out, genome, homologs, rna_list, bam, transcripts, busco,
-            species_map, threads, referee_min_wi, goldset, goldset_min_orf,
-            predictors=predictors, mnp_filter=mnp_filter or "",
+            out, genome, homologs, rna, busco, species_map, threads,
+            goldset_min_orf,
+            predictors=predictors, mnp_filter=_norm_mnp(mnp_filter),
+            miniprot_opts=miniprot_opts, hisat2_opts=hisat2_opts,
+            stringtie_opts=stringtie_opts, td_opts=td_opts,
         )
     except InputError as e:
         typer.secho(f"input error: {e}", fg="red", err=True)
         raise typer.Exit(2)
 
-    # module 3-5: predictor scoring + weight mapping
+    # module 3: predictor scoring + weight mapping
     from .modules.scoring import score_one_predictor, map_weights
     from .modules.validate import parse_predictors
 
@@ -242,10 +474,10 @@ def merge(
             d = details[name]
             s = d["subscores"]
             def f(x): return f"{x:.4f}" if isinstance(x, float) else "NA"
-            fh.write(f"{name}\t{f(d['W_raw'])}\t{f(s['R_s'])}\t{f(s['H_s'])}\t"
-                     f"{f(s['B_c'])}\t{f(s['C_s'])}\t{evm_w.get(name) or 'EXCLUDE'}\t"
-                     f"{d.get('hard_reject', '')}\n")
-    typer.echo(f"\n=== EVM weights ===\n{wtab.read_text()}")
+            fh.write(f"{name}\t{f(d['W_raw'])}\\t{f(s['R_s'])}\\t{f(s['H_s'])}\\t"
+                     f"{f(s['B_c'])}\\t{f(s['C_s'])}\\t{evm_w.get(name) or 'EXCLUDE'}\\t"
+                     f"{d.get('hard_reject', '')}\\n")
+    typer.echo(f"\\n=== EVM weights ===\\n{wtab.read_text()}")
 
     # module 4/5: integration (skipped with --weight-only)
     if weight_only:
@@ -256,13 +488,6 @@ def merge(
     if not evm_preds:
         typer.secho("no predictor passed scoring; integration skipped", fg="red", err=True)
         raise typer.Exit(3)
-    # merge mode: isoform (default, EVM + isoform resolution + augment) or evm
-    n_pred = len(evm_preds)
-    mode = merge_mode
-    if mode not in ("evm", "isoform"):
-        typer.secho(f"unknown --merge-mode {merge_mode!r} (isoform|evm)",
-                    fg="red", err=True)
-        raise typer.Exit(2)
     # isoform resolution needs RNA evidence (StringTie + gold set); with
     # homolog proteins only the pipeline degrades to EVM-only integration
     # and the viewer shows the EVM result (final = evm.sanity.gff3).
@@ -292,12 +517,10 @@ def merge(
         stringtie_gtf=stringtie_gtf,
         miniprot_gff=hom_res.get("gff"),
         goldset_dir=goldset_dir,
-        threads=threads, min_intron=min_intron_evm,
+        threads=threads, min_intron=evm_opts.get("min_intron", 20),
         w_gold=w_gold_evm, w_transcript=w_transcript_evm, w_protein=w_protein_evm,
-        evm_parts=(evm_parts if evm_parts > 0 else threads),
         protein_set_weights=protein_evm_weights,
         protein_membership=membership if multi else None)
-    integ_gff3 = evm_res["evm_gff3"]
     integ_gff3 = evm_res["evm_gff3"]
     integ_d = out / "06.merge"
     typer.secho(f"EVM output: {integ_gff3}", fg="green")
@@ -347,7 +570,7 @@ def merge(
     from .modules.confidence import confidence_annotation
     assess_d = ensure_dir(out / "08.assessment")
     if mode == "evm":
-        ensure_dir(out / "07.augment")   # evm 模式: 仅建空目录
+        ensure_dir(out / "07.augment")   # evm mode: create the empty dir only
     conf_stats = confidence_annotation(
         final_gff3, vi.genome,
         rna_res.get("junctions_bed"),
@@ -381,23 +604,23 @@ def merge(
                   "command": shlex.join(sys.argv),
                   "timestamp": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
                   "threads": threads, "homologs": homologs,
-                  "rna": rna_list or bam or transcripts or "none",
+                  "rna": ",".join(rna or []) or "none",
                   "busco": busco or "none",
-                  "merge_mode": mode,
+                  "merge_mode": mode, "viewer": vw,
+                  "mnp_filter": _norm_mnp(mnp_filter) or "off",
                   "w_rna": w_rna, "w_homolog": w_homolog,
                   "w_conserve": w_conserve, "w_structure": w_structure,
                   "min_predictor_score": min_predictor_score,
-                  "referee_min_wi": referee_min_wi, "goldset": goldset,
-                  "min_intron_evm": min_intron_evm,
+                  "goldset_min_orf": goldset_min_orf,
                   "weight_mapping": weight_mapping})
     typer.secho(f"report: {rep['html']}", fg="green")
-    # evidence browser (igv.js, single-file offline) — generated automatically
-    if not viewer_off:
+    # evidence browser (igv.js, single-file offline)
+    if vw != "no":
         from .modules.viewer import run_viewer
-        vw = run_viewer(out, vi, results, preds, details,
-                        final_gff3, final_d, integ_d, threads,
-                        full=viewer_full)
-        typer.secho(f"evidence browser: {vw['html']}", fg="green")
+        vw_res = run_viewer(out, vi, results, preds, details,
+                            final_gff3, final_d, integ_d, threads,
+                            full=(vw == "full"))
+        typer.secho(f"evidence browser: {vw_res['html']}", fg="green")
     # publish layer removed: the module dirs themselves are the numbered
     # deliverables (01.validate ... 09.result)
     typer.secho(f"deliverables: {out}/01.validate ... 09.result", fg="green")
@@ -529,69 +752,131 @@ def _annotation_to_gff3(anno: Path, dst: Path) -> Path:
     return dst
 
 
-@app.command(help="Evidence auditing / QC of an existing annotation (no EVM integration).")
-def evaluate(
-    genome: Optional[str] = typer.Option(None, "-g", help="MANDATORY (unless -c): reference genome FASTA"),
-    annotation: Optional[str] = typer.Option(None, "-a", help="MANDATORY (unless -c): annotation GFF3/GTF to evaluate"),
-    homologs: Optional[str] = typer.Option(None, "-p", help="MANDATORY (unless -c): homolog protein FASTA, 'label=path' comma list OK (same rules as merge)"),
-    predictors: Optional[str] = typer.Option(None, "-P", help="optional de novo predictions 'name=path' comma list (evidence tracks + denovo_support attributes only; no scoring in evaluate)"),
-    rna_list: Optional[str] = typer.Option(None, "-r", help="RNA list file (fastq/bam/gtf tags)"),
-    bam: Optional[str] = typer.Option(None, "--bam", help="sorted+indexed RNA-seq BAM(s), comma list"),
-    transcripts: Optional[str] = typer.Option(None, "--transcripts", help="StringTie transcripts GTF/GFF"),
-    busco: Optional[str] = typer.Option(None, "--busco", help="local BUSCO odb lineage path (offline)"),
-    omark_db: Optional[str] = typer.Option(None, "--omark-db", help="OMAmer database (.h5) for OMArk orthology QC (after BUSCO)"),
-    paf: Optional[str] = typer.Option(None, "--paf", help="precomputed miniprot PAF"),
-    mnp_filter: Optional[str] = typer.Option(None, "--mnp-filter",
-        help="miniprot homolog quality filter, comma tokens: UnStop,UnShift,Q2R=0.5,topRank=1 ... "
-             "(empty = no filter; same semantics as merge)"),
-    species_map: Optional[str] = typer.Option(None, "--species-map", help="queryID -> species TSV"),
-    referee_min_wi: float = typer.Option(0.6, "--referee-min-wi", help="referee filter wi=cov*ident"),
-    goldset: bool = typer.Option(True, "--goldset/--no-goldset",
-                                 help="build the Gold set from RNA evidence (enables goldset-origin support; needs RNA input)"),
-    goldset_min_orf: int = typer.Option(50, "--goldset-min-orf", help="min ORF length (aa) in Gold set"),
-    threads: int = typer.Option(8, "-t", help="threads"),
-    outdir: str = typer.Option("./annomerge_eval_out", "-o", help="output directory"),
-    viewer_off: bool = typer.Option(False, "--no-viewer", help="skip the evidence browser build"),
-    viewer_full: bool = typer.Option(False, "--viewer-full",
-                                     help="evidence browser: embed genome sequence (base-level track). "
-                                          "Default is the lite build (coordinates only, much smaller)"),
-    config: Optional[str] = typer.Option(None, "--config", help="resolved_params.yaml from a previous run"),
-    verbose: bool = typer.Option(False, "--verbose"),
-):
-    """Evaluate an existing annotation with the SAME assessment chain as the
-    integration flow: evidence collection (RNA / homolog proteins / Gold
-    set) -> coverage-aware confidence tiers -> support tags on every gene
-    and mRNA -> HTML report (BUSCO + OMArk + stats) -> single-file offline
-    evidence browser.
+_EVALUATE_HELP = """[bold]evaluate[/bold]: run the merge assessment chain (evidence
+collection -> confidence tiers -> per-gene support tags -> HTML report +
+evidence browser) on an existing annotation.
 
-    The submitted annotation is treated as READ-ONLY: it is never filtered,
-    renamed or coordinate-transformed (no sanity_filter / renamer here —
-    those exist to repair pipeline-generated models, not user data). The
-    only transformation is a format normalisation to GFF3 (GFF3 copied
-    verbatim; GTF converted with gffread --keep-genes -F), and assessment
-    tags (Tier / RNA_support / Protein_support / denovo_support / Flags)
-    are APPENDED to each gene/mRNA. The Gold-set lift to genome coordinates
-    operates on the StringTie/TransDecoder EVIDENCE transcripts (not on
-    the submitted annotation) and only feeds the goldset evidence track.
-    RNA inputs, -P predictors, --busco and --omark-db are all optional;
-    only -g/-a/-p are mandatory.
-    """
-    missing = [n for n, v in (("genome/-g", genome), ("annotation/-a", annotation),
-                              ("homologs/-p", homologs)) if not v]
+The submitted annotation is [bold]read-only[/bold]: it is never filtered,
+renamed or coordinate-transformed. The only transformation is a format
+normalisation to GFF3 (GFF3 copied verbatim; GTF converted with gffread
+--keep-genes -F); assessment tags (Tier / RNA_support / Protein_support /
+denovo_support / Flags) are appended to each gene/mRNA. The Gold-set lift
+to genome coordinates operates on the StringTie/TransDecoder EVIDENCE
+transcripts (never on the submitted annotation) and only feeds the
+goldset evidence track. Only -g/-a/-p are mandatory; all evidence inputs
+are optional.
+"""
+
+
+@app.command(help=_EVALUATE_HELP)
+def evaluate(
+    # ---------------------------------------------------------- input files
+    genome: Optional[str] = typer.Option(
+        None, "--genome", "-g",
+        help="[bold green]MANDATORY[/bold green]. Reference genome FASTA.",
+        rich_help_panel="Input files"),
+    annotation: Optional[str] = typer.Option(
+        None, "--annotation", "-a",
+        help="[bold green]MANDATORY[/bold green]. Annotation GFF3/GTF to evaluate.",
+        rich_help_panel="Input files"),
+    homologs: Optional[str] = typer.Option(
+        None, "--proteins", "-p",
+        help="[bold green]MANDATORY[/bold green]. Homolog protein FASTA "
+             "('label=path' comma list; same rules as merge --proteins).",
+        rich_help_panel="Input files"),
+    predictors: Optional[str] = typer.Option(
+        None, "--predictions", "-P",
+        help="Optional de novo predictions 'name=path' comma list (evidence "
+             "tracks + denovo_support attributes only; no scoring in evaluate).",
+        rich_help_panel="Input files"),
+    rna: Optional[List[str]] = typer.Option(
+        None, "--rna", "-r", help="RNA evidence (same syntax as merge --rna).",
+        rich_help_panel="Input files"),
+    busco: Optional[str] = typer.Option(
+        None, "--busco", help="Local BUSCO odb lineage path (offline).",
+        rich_help_panel="Input files"),
+    omark_db: Optional[str] = typer.Option(
+        None, "--omark-db", help="OMAmer database (.h5) for OMArk orthology QC.",
+        rich_help_panel="Input files"),
+    species_map: Optional[str] = typer.Option(
+        None, "--species-map", help="queryID -> species TSV.",
+        rich_help_panel="Input files"),
+    mnp_filter: str = typer.Option(
+        "UnStop,UnShift", "--mnp-filter", help=_MNP_HELP,
+        rich_help_panel="Scoring"),
+    goldset_min_orf: int = typer.Option(
+        50, "--goldset-min-orf",
+        help="Gold set: minimum ORF length (aa) for TransDecoder.LongOrfs (-m).",
+        rich_help_panel="Advanced"),
+    threads: int = typer.Option(
+        8, "--threads", "-t", help="Threads.", rich_help_panel="Input files"),
+    outdir: str = typer.Option(
+        "./annomerge_eval_out", "--outdir", "-o", help="Output directory.",
+        rich_help_panel="Input files"),
+    viewer: str = typer.Option(
+        "lite", "--viewer",
+        help="Evidence browser build: [cyan]full[/cyan] / [cyan]lite[/cyan] "
+             "(default) / [cyan]no[/cyan].",
+        rich_help_panel="Assessment & report"),
+    hisat2_options: Optional[str] = typer.Option(
+        None, "--hisat2-options",
+        help="Extra HISAT2 alignment flags. Protected: -x, -p, -S, -1, -2, -U, "
+             "--dta. " + _ADV_CAUTION,
+        rich_help_panel="Advanced"),
+    stringtie_options: Optional[str] = typer.Option(
+        None, "--stringtie-options",
+        help="Extra StringTie flags for per-sample assembly. Protected: input "
+             "BAM, -p, -o, -L. " + _ADV_CAUTION,
+        rich_help_panel="Advanced"),
+    miniprot_options: Optional[str] = typer.Option(
+        None, "--miniprot-options",
+        help="Extra miniprot flags. Protected: -t, --paf, --gff. " + _ADV_CAUTION,
+        rich_help_panel="Advanced"),
+    transdecoder_options: Optional[str] = typer.Option(
+        None, "--transdecoder-options", help=_TD_HELP,
+        rich_help_panel="Advanced"),
+    config: Optional[str] = typer.Option(
+        None, "--config", help="resolved_params.yaml from a previous run (informational).",
+        rich_help_panel="Advanced"),
+    verbose: bool = typer.Option(False, "--verbose", help="Verbose logging.",
+                                 rich_help_panel="Advanced"),
+):
+
+    missing = [n for n, v in (("--genome/-g", genome), ("--annotation/-a", annotation),
+                              ("--proteins/-p", homologs)) if not v]
     if missing:
         typer.secho(f"missing mandatory option(s): {', '.join(missing)} "
                     f"(or use -c/--check-dependencies for a dependency check)",
                     fg="red", err=True)
         raise typer.Exit(2)
+    vw = viewer.lower()
+    if vw not in ("full", "lite", "no"):
+        typer.secho(f"unknown --viewer {viewer!r} (full|lite|no)", fg="red", err=True)
+        raise typer.Exit(2)
+    try:
+        hisat2_opts = parse_extra_opts(
+            hisat2_options, ("-x", "-p", "-S", "-1", "-2", "-U", "--dta"), "hisat2")
+        stringtie_opts = parse_extra_opts(
+            stringtie_options, ("-p", "-o", "-L"), "stringtie")
+        miniprot_opts = parse_extra_opts(
+            miniprot_options, ("-t", "--paf", "--gff"), "miniprot")
+        td_opts = parse_extra_opts(
+            transdecoder_options, ("-t", "-m", "--retain_blastp_hits"), "TransDecoder")
+    except RuntimeError as e:
+        typer.secho(str(e), fg="red", err=True)
+        raise typer.Exit(2)
+
     out = _prepare(outdir, verbose)
     params = {k: v for k, v in locals().items() if k not in ("out",)}
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
         results, vi = _run_evidence_pipeline(
-            out, genome, homologs, rna_list, bam, transcripts, busco,
-            species_map, threads, referee_min_wi, goldset, goldset_min_orf,
+            out, genome, homologs, rna, busco, species_map, threads,
+            goldset_min_orf,
             predictors=predictors, annotation=annotation,
-            mnp_filter=mnp_filter or "",
+            mnp_filter=_norm_mnp(mnp_filter),
+            miniprot_opts=miniprot_opts, hisat2_opts=hisat2_opts,
+            stringtie_opts=stringtie_opts, td_opts=td_opts,
         )
     except InputError as e:
         typer.secho(f"input error: {e}", fg="red", err=True)
@@ -608,11 +893,11 @@ def evaluate(
     # evaluate has no EVM, so lift directly whenever the Gold set exists.
     # This transforms the StringTie/TransDecoder EVIDENCE transcripts
     # (goldset evidence track) — never the submitted annotation.
-    rna = results.get("rna") or {}
+    rna_res = results.get("rna") or {}
     gold_dir = out / "04.goldset"
-    if (gold_dir / "transcripts.fa.transdecoder.gff3").exists() and rna.get("stringtie_gtf"):
+    if (gold_dir / "transcripts.fa.transdecoder.gff3").exists() and rna_res.get("stringtie_gtf"):
         from .modules.evm import lift_goldset
-        lift_goldset(gold_dir, rna["stringtie_gtf"], eval_d,
+        lift_goldset(gold_dir, rna_res["stringtie_gtf"], eval_d,
                      eval_d / "goldset.genome.gff3", genome_fa=vi.genome)
     # module 6: coverage-aware evidence tiering (identical to merge;
     # sanity_tsv=None — nothing was filtered)
@@ -625,9 +910,9 @@ def evaluate(
                        if len(set_w) > 1 else None)
     conf_stats = confidence_annotation(
         final_gff3, vi.genome,
-        rna.get("junctions_bed"),
+        rna_res.get("junctions_bed"),
         hom_res.get("gff"),
-        rna.get("bams", []),
+        rna_res.get("bams", []),
         eval_d / "goldset.genome.gff3",
         None,
         assess_d / "confidence.tsv",
@@ -651,18 +936,18 @@ def evaluate(
                   "command": shlex.join(sys.argv),
                   "timestamp": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
                   "threads": threads, "homologs": homologs,
-                  "rna": rna_list or bam or transcripts or "none",
+                  "rna": ",".join(params.get("rna") or []) or "none",
                   "busco": busco or "none", "omark": omark_db or "none",
-                  "merge_mode": "evaluate", "goldset": goldset,
-                  "referee_min_wi": referee_min_wi})
+                  "merge_mode": "evaluate", "viewer": vw,
+                  "mnp_filter": _norm_mnp(mnp_filter) or "off"})
     typer.secho(f"report: {rep['html']}", fg="green")
     # evidence browser (igv.js, single-file offline) — same as merge
-    if not viewer_off:
+    if vw != "no":
         from .modules.viewer import run_viewer
-        vw = run_viewer(out, vi, results, vi.predictors or {}, {},
-                        final_gff3, eval_d, eval_d, threads,
-                        full=viewer_full)
-        typer.secho(f"evidence browser: {vw['html']}", fg="green")
+        vw_res = run_viewer(out, vi, results, vi.predictors or {}, {},
+                            final_gff3, eval_d, eval_d, threads,
+                            full=(vw == "full"))
+        typer.secho(f"evidence browser: {vw_res['html']}", fg="green")
     typer.secho(f"deliverables: {out}/01.validate ... 09.result", fg="green")
 
 
