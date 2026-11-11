@@ -12,11 +12,8 @@ license = { text = "MIT" }
 dependencies = [
     "typer>=0.9",
     "pyyaml>=6.0",
-    "pandas",
-    "numpy",
-    "pysam",
-    "gffutils",
-    "jinja2",
+    "pysam>=0.22",
+    "jinja2>=3.0",
 ]
 
 [project.scripts]
@@ -24,3 +21,6 @@ annomerge = "annomerge.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+annomerge = ["assets/*.html", "assets/*.js"]
