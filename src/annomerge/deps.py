@@ -39,6 +39,9 @@ class ExeDep:
     envs: tuple[str, ...]             # env vars, in priority order
     exes: tuple[str, ...]             # executables belonging to this dep
     hint: str = ""                    # install hint shown on failure
+    alternatives: tuple[str, ...] = ()  # any one of these also satisfies the dep
+                                         # (e.g. the combined `TransDecoder` wrapper
+                                         #  when the split .LongOrfs/.Predict are absent)
 
 
 @dataclass(frozen=True)
@@ -47,7 +50,7 @@ class HomeDep:
     key: str
     envs: tuple[str, ...]
     markers: tuple[str, ...]          # relative paths that must exist inside
-    path_fallback: str | None = None  # an executable in PATH to derive home from
+    path_fallback: tuple[str, ...] = ()  # executables in PATH to derive home from
     hint: str = ""
 
 
@@ -70,7 +73,8 @@ EXE_DEPS: tuple[ExeDep, ...] = (
            "miniprot: conda install -c bioconda miniprot"),
     ExeDep("transdecoder", ("TRANSDECODER", "TRANSDECODER_HOME"),
            ("TransDecoder.LongOrfs", "TransDecoder.Predict"),
-           "TransDecoder: conda install -c bioconda transdecoder"),
+           "TransDecoder: conda install -c bioconda transdecoder",
+           alternatives=("TransDecoder",)),
     ExeDep("perl", ("PERL",), ("perl",), "perl 5: system package"),
 )
 
@@ -83,7 +87,7 @@ HOME_DEPS: tuple[HomeDep, ...] = (
                  "(export EVM=/path/to/EVidenceModeler)"),
     HomeDep("transdecoder", ("TRANSDECODER", "TRANSDECODER_HOME"),
             ("util/gtf_to_alignment_gff3.pl",),
-            path_fallback="TransDecoder.LongOrfs",
+            path_fallback=("TransDecoder.LongOrfs", "TransDecoder"),
             hint="TransDecoder: conda install -c bioconda transdecoder "
                  "(export TRANSDECODER=/path/to/TransDecoder)"),
 )
@@ -145,9 +149,18 @@ def home(key: str) -> Path:
             f"{var}={val} is set but does not look like a valid {dep.key} "
             f"installation (missing: {', '.join(dep.markers)}). {dep.hint}")
     if dep.path_fallback:
-        hit = shutil.which(dep.path_fallback)
-        if hit:
-            p = Path(hit).resolve().parent
+        hits = [shutil.which(fb) for fb in dep.path_fallback]
+        parents: list[Path] = []
+        for hit in hits:
+            if hit:
+                parents.append(Path(hit).resolve().parent)          # exe dir
+                parents.append(Path(hit).resolve().parent.parent)   # e.g. conda prefix root
+        # conda layout: binaries in <env>/bin/, suite under <env>/opt/<name>-<ver>/
+        for hit in hits:
+            if hit:
+                env_root = Path(hit).resolve().parent.parent
+                parents.extend(sorted(env_root.glob("opt/*")))
+        for p in parents:
             if all((p / m).exists() for m in dep.markers):
                 return p
     raise ToolError(
@@ -186,6 +199,19 @@ def _version_of(exe_path: str) -> str:
     return "?"
 
 
+def _home_version(key: str, p: Path) -> str:
+    """Best-effort version for a directory dependency (no --version binary)."""
+    text = str(p)
+    m = re.search(r"evidencemodeler[-_](\d+(?:\.\d+)+)", text, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"rans\w*ecoder[-_](\d+(?:\.\d+)+)", text, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"[-_](\d+\.\d+(?:\.\d+)?)\s*$", p.name)
+    return m.group(1) if m else "?"
+
+
 def check_all() -> list[dict]:
     """Resolve every dependency; return rows for display (never raises)."""
     rows: list[dict] = []
@@ -203,6 +229,15 @@ def check_all() -> list[dict]:
                 resolved[exe] = (path, src)
             except ToolError:
                 missing.append(exe)
+        if missing and dep.alternatives:
+            # e.g. only the combined `TransDecoder` wrapper is installed
+            for alt in dep.alternatives:
+                try:
+                    resolved[alt] = (which(alt), "PATH")
+                    missing = []
+                    break
+                except ToolError:
+                    continue
         first = next(iter(resolved.values()), (None, None))[0]
         rows.append({
             "dep": dep.key, "env": ",".join(dep.envs), "exes": dep.exes,
@@ -218,25 +253,31 @@ def check_all() -> list[dict]:
                          "ok": True, "missing": [], "path": str(p),
                          "src": "env:" + next((v for v in dep.envs
                                                if os.environ.get(v)), "derived/PATH"),
-                         "version": "dir", "hint": dep.hint})
+                         "version": _home_version(dep.key, p), "hint": dep.hint})
         except ToolError as e:
             rows.append({"dep": dep.key, "env": ",".join(dep.envs), "exes": (),
                          "ok": False, "missing": [dep.key], "path": "-",
                          "src": "-", "version": "-", "hint": dep.hint})
-    # python package sanity (import check, versions from __version__)
+    # python package sanity — the actual runtime deps from pyproject.toml
     py = []
-    for mod in ("pysam", "Bio", "numpy", "pandas", "gffutils", "typer",
-                "jinja2", "yaml"):
+    for mod, dist in (("pysam", "pysam"), ("typer", "typer"),
+                      ("jinja2", "jinja2"), ("yaml", "pyyaml")):
         try:
             m = __import__(mod)
-            py.append(f"{mod}={getattr(m, '__version__', '?')}")
+            ver = getattr(m, "__version__", None)
+            if not ver:
+                try:
+                    from importlib.metadata import version as _dist_ver
+                    ver = _dist_ver(dist)
+                except Exception:
+                    ver = "?"
+            py.append(f"{mod}={ver}")
         except ImportError:
             py.append(f"{mod}=MISSING")
-    rows.append({"dep": "python-packages", "env": "PYTHONPATH", "exes": (),
-                 "ok": "MISSING" not in " ".join(py), "missing": [],
+    rows.append({"dep": "python-packages", "env": "python", "exes": (),
+                 "ok": not any("MISSING" in s for s in py), "missing": [],
                  "path": "-", "src": "-", "version": "; ".join(py),
-                 "hint": "pip install pysam biopython numpy pandas gffutils "
-                         "typer jinja2 pyyaml"})
+                 "hint": "pip install typer pyyaml pysam jinja2"})
     return rows
 
 
@@ -247,7 +288,7 @@ def format_table(rows: list[dict]) -> str:
         status = "OK" if r["ok"] else "MISSING"
         miss = f" ({','.join(r['missing'])})" if r["missing"] else ""
         out.append(f"{r['dep']:<16} {r['env']:<23} {status}{miss:<10} "
-                   f"{r['version'][:16]:<16} {r['src']}: {r['path']}")
+                   f"{r['version'][:42]:<42} {r['src']}: {r['path']}")
         if not r["ok"]:
             out.append(f"    -> {r['hint']}")
     n_bad = sum(1 for r in rows if not r["ok"])
