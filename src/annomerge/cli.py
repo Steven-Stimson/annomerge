@@ -60,11 +60,13 @@ _MNP_HELP = (
     "N mappings per protein, [blue]R2Q[/blue]/[blue]Q2R[/blue] lower bounds of the "
     "reference-vs-query CDS length ratio from each side.")
 
-_TD_HELP = (
+_TD_HELP_BASE = (
     "extra flags for TransDecoder.LongOrfs/Predict, e.g. \"-S --single_best_only\". "
     "Predict-only flags (e.g. --single_best_only, --no_refine_starts) are routed "
     "to Predict automatically; all other flags go to both stages. "
-    "Protected: -t, -m (use --goldset-min-orf), --retain_blastp_hits. " + _ADV_CAUTION)
+    "Protected: -t, -m (use --goldset-min-orf), --retain_blastp_hits. ")
+
+_TD_HELP = _TD_HELP_BASE + _ADV_CAUTION
 
 
 def _version_callback(value: bool):
@@ -125,7 +127,7 @@ def _norm_mnp(spec: str) -> str:
 
 def _run_evidence_pipeline(
     out: Path, genome: str, homologs: str, rna: Optional[List[str]],
-    busco: Optional[str], species_map: Optional[str], threads: int,
+    busco: Optional[str], threads: int,
     goldset_min_orf: int,
     predictors: Optional[str] = None, annotation: Optional[str] = None,
     mnp_filter: str = "",
@@ -136,7 +138,7 @@ def _run_evidence_pipeline(
 ):
     vi = validate(
         genome=genome, homologs=homologs, predictors=predictors,
-        annotation=annotation, rna=rna, busco=busco, species_map=species_map,
+        annotation=annotation, rna=rna, busco=busco,
         workdir=str(out),
     )
     results: dict = {}
@@ -177,7 +179,7 @@ _SCORING_FORMULA = """
   R_s  RNA support: junction/exon coverage + expression (internals α/β/γ, see --rna-weights)
   H_s  homolog support: full-length miniprot hits vs referee proteins and the
        RNA-assembled Gold set (gold-set share = --hs-gold-weight)
-  B_c  conservation: BUSCO complete recall in proteins mode (needs --busco)
+  B_c  conservation: BUSCO complete recall in proteins mode (needs --busco-lineage)
   C_s  structure: 1 − anomaly rate (chimeric / split heuristics from homolog hit patterns)
 
 Sub-blocks without evidence are skipped and the remaining weights are
@@ -189,11 +191,32 @@ usable. W_raw is then mapped to integer EVM weights (--weight-mapping).
 _MERGE_HELP = """[bold]merge[/bold]: score de novo predictors, calibrate EVM
 weights and integrate all evidence into a final annotation.
 
-Minimal example:
+[bold]Examples[/bold]  (repeat a flag or use comma lists for multiple inputs)
 
-    annomerge merge -g genome.fa -P helixer=h.gff3,annevo=a.gff3 \\
-        -p proteins.pep -r rnaseq_r1.fq,rnaseq_r2.fq --busco bacteria_odb10
-""" + _SCORING_FORMULA
+  # minimal: one protein pool + one PE short-read sample
+  annomerge merge -g genome.fa -P denovo1=a.gff3,denovo2=b.gff3 \\
+      -p proteins.pep -r rnaseq_r1.fq,rnaseq_r2.fq --busco-lineage bacteria_odb10
+
+  # multiple protein sets (label=path keeps relatedness-weighted multi-set mode)
+  annomerge merge -g genome.fa -P denovo1=a.gff3,denovo3=c.gff3 \\
+      -p near=near.pep,far=far.fa -r leaf_r1.fq,leaf_r2.fq
+
+  # multiple unlabeled protein files (merged into one mnp-filtered pool)
+  annomerge merge -g genome.fa -P denovo1=a.gff3 -p a.pep,b.pep,c.fa \\
+      -r rnaseq_r1.fq,rnaseq_r2.fq
+
+  # multiple RNA samples: repeat -r, one input type per sample
+  #   (2 fastq = PE pair, 1 fastq = isoseq/CCS, 1 bam, >=1 gtf/gff3)
+  annomerge merge -g genome.fa -P denovo1=a.gff3 -p proteins.pep \\
+      -r pe_r1.fq,pe_r2.fq -r ccs.fq -r aligned.bam -r asm1.gtf,asm2.gtf
+
+  # many RNA samples via a list file (one 'ID=files' sample per line)
+  annomerge merge -g genome.fa -P denovo1=a.gff3 -p proteins.pep -r samples.txt
+
+  # isoform mode (isoform resolution + UTR backfill; needs RNA evidence)
+  annomerge merge -g genome.fa -P denovo1=a.gff3 -p proteins.pep \\
+      -r rnaseq_r1.fq,rnaseq_r2.fq --merge-mode isoform
+"""
 
 
 @app.command(help=_MERGE_HELP)
@@ -207,7 +230,7 @@ def merge(
         None, "--predictions", "-P",
         help="[bold green]MANDATORY[/bold green]. De novo gene predictions, "
              "'name=path' comma list (unnamed -> filename stem), e.g. "
-             "[blue]-P[/blue] helixer=h.gff3,annevo=a.gff3.",
+             "[blue]-P[/blue] denovo1=a.gff3,denovo2=b.gff3.",
         rich_help_panel="Input files"),
     homologs: Optional[str] = typer.Option(
         None, "--proteins", "-p",
@@ -227,16 +250,12 @@ def merge(
              "Omitting RNA entirely degrades the run to EVM + homolog evidence.",
         rich_help_panel="Input files"),
     busco: Optional[str] = typer.Option(
-        None, "--busco",
+        None, "--busco-lineage",
         help="Local BUSCO odb lineage directory (offline completeness QC; feeds B_c).",
         rich_help_panel="Input files"),
     omark_db: Optional[str] = typer.Option(
         None, "--omark-db",
         help="OMAmer database (.h5) for OMArk orthology QC (runs after BUSCO).",
-        rich_help_panel="Input files"),
-    species_map: Optional[str] = typer.Option(
-        None, "--species-map",
-        help="queryID -> species TSV (overrides |species= header tags).",
         rich_help_panel="Input files"),
     merge_mode: str = typer.Option(
         "evm", "--merge-mode",
@@ -251,11 +270,9 @@ def merge(
         "./annomerge_out", "--outdir", "-o", help="Output directory.",
         rich_help_panel="Input files"),
     # ------------------------------------------------------------- scoring
-    mnp_filter: str = typer.Option(
-        "UnStop,UnShift", "--mnp-filter", help=_MNP_HELP,
-        rich_help_panel="Scoring"),
     w_rna: float = typer.Option(
-        0.45, "--w-rna", help="W_r: weight of the R_s (RNA support) sub-block.",
+        0.45, "--w-rna",
+        help=_SCORING_FORMULA + "\nW_r: weight of the R_s (RNA support) sub-block.",
         rich_help_panel="Scoring"),
     w_homolog: float = typer.Option(
         0.25, "--w-homolog", help="W_h: weight of the H_s (homolog support) sub-block.",
@@ -263,7 +280,7 @@ def merge(
     w_conserve: float = typer.Option(
         0.15, "--w-conserve",
         help="W_b: weight of the B_c (BUSCO complete recall) sub-block; skipped "
-             "without --busco.",
+             "without --busco-lineage.",
         rich_help_panel="Scoring"),
     w_structure: float = typer.Option(
         0.15, "--w-structure",
@@ -370,31 +387,34 @@ def merge(
         rich_help_panel="Assessment & report"),
     weight_only: bool = typer.Option(
         False, "--weight-only", help="Stop after the EVM weight table.",
-        rich_help_panel="Advanced"),
+        rich_help_panel="Assessment & report"),
     # ------------------------------------------------------------- advanced
-    goldset_min_orf: int = typer.Option(
-        50, "--goldset-min-orf",
-        help="Gold set: minimum ORF length (aa) for TransDecoder.LongOrfs (-m).",
-        rich_help_panel="Advanced"),
     hisat2_options: Optional[str] = typer.Option(
         None, "--hisat2-options",
-        help="Extra HISAT2 alignment flags, e.g. \"-k 3 --sp max=15\". Inserted into "
-             "every per-sample alignment. Protected: -x, -p, -S, -1, -2, -U, --dta. "
-             + _ADV_CAUTION,
+        help=_ADV_CAUTION + "\n\nExtra HISAT2 alignment flags, e.g. \"-k 3 --sp "
+             "max=15\". Inserted into every per-sample alignment. Protected: "
+             "-x, -p, -S, -1, -2, -U, --dta.",
         rich_help_panel="Advanced"),
     stringtie_options: Optional[str] = typer.Option(
         None, "--stringtie-options",
         help="Extra StringTie flags for per-sample assembly, e.g. \"-f 0.1 -c 5\". "
              "Protected: the input BAM, -p, -o, -L (isoseq samples get -L "
-             "automatically). The --merge step is pipeline-managed. " + _ADV_CAUTION,
+             "automatically). The --merge step is pipeline-managed.",
         rich_help_panel="Advanced"),
     miniprot_options: Optional[str] = typer.Option(
         None, "--miniprot-options",
-        help="Extra miniprot flags, e.g. \"-I -S\". Inserted into both PAF and GFF "
-             "runs. Protected: -t, --paf, --gff. " + _ADV_CAUTION,
+        help="Extra miniprot flags, e.g. \"-I -S\". Inserted into both PAF and "
+             "GFF runs. Protected: -t, --paf, --gff.",
+        rich_help_panel="Advanced"),
+    mnp_filter: str = typer.Option(
+        "UnStop,UnShift", "--mnp-filter", help=_MNP_HELP,
         rich_help_panel="Advanced"),
     transdecoder_options: Optional[str] = typer.Option(
-        None, "--transdecoder-options", help=_TD_HELP,
+        None, "--transdecoder-options", help=_TD_HELP_BASE,
+        rich_help_panel="Advanced"),
+    goldset_min_orf: int = typer.Option(
+        50, "--goldset-min-orf",
+        help="Gold set: minimum ORF length (aa) for TransDecoder.LongOrfs (-m).",
         rich_help_panel="Advanced"),
     config: Optional[str] = typer.Option(
         None, "--config", help="resolved_params.yaml from a previous run (informational).",
@@ -438,7 +458,7 @@ def merge(
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
         results, vi = _run_evidence_pipeline(
-            out, genome, homologs, rna, busco, species_map, threads,
+            out, genome, homologs, rna, busco, threads,
             goldset_min_orf,
             predictors=predictors, mnp_filter=_norm_mnp(mnp_filter),
             miniprot_opts=miniprot_opts, hisat2_opts=hisat2_opts,
@@ -793,13 +813,10 @@ def evaluate(
         None, "--rna", "-r", help="RNA evidence (same syntax as merge --rna).",
         rich_help_panel="Input files"),
     busco: Optional[str] = typer.Option(
-        None, "--busco", help="Local BUSCO odb lineage path (offline).",
+        None, "--busco-lineage", help="Local BUSCO odb lineage path (offline).",
         rich_help_panel="Input files"),
     omark_db: Optional[str] = typer.Option(
         None, "--omark-db", help="OMAmer database (.h5) for OMArk orthology QC.",
-        rich_help_panel="Input files"),
-    species_map: Optional[str] = typer.Option(
-        None, "--species-map", help="queryID -> species TSV.",
         rich_help_panel="Input files"),
     mnp_filter: str = typer.Option(
         "UnStop,UnShift", "--mnp-filter", help=_MNP_HELP,
@@ -871,7 +888,7 @@ def evaluate(
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
         results, vi = _run_evidence_pipeline(
-            out, genome, homologs, rna, busco, species_map, threads,
+            out, genome, homologs, rna, busco, threads,
             goldset_min_orf,
             predictors=predictors, annotation=annotation,
             mnp_filter=_norm_mnp(mnp_filter),

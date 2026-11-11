@@ -5,7 +5,7 @@ Checks, per CLI design v2.1:
   - -p homolog FASTA is MANDATORY; headers must carry species tags (>id|species=Genus_species)
   - -P predictor list parsing (name=path, comma-separated; unnamed -> filename stem)
   - -r RNA list file parsing (fastq/bam/bam_isoseq/gtf tags), mutually exclusive with --bam/--transcripts
-  - --busco local BUSCO odb lineage (offline completeness QC)
+  - --busco-lineage local BUSCO odb lineage (offline completeness QC)
   - GFF seqids must be a subset of genome seqids (fail-fast)
 """
 from __future__ import annotations
@@ -286,7 +286,6 @@ class ValidatedInputs:
     rna_samples: list[RnaSample] = field(default_factory=list)
     transcripts: Path | None = None         # precomputed StringTie GTF
     busco: Path | None = None
-    species_map: Path | None = None
 
     @property
     def has_rna(self) -> bool:
@@ -315,7 +314,6 @@ def validate(
     annotation: str | None = None,
     rna: list[str] | None = None,
     busco: str | None = None,
-    species_map: str | None = None,
     workdir: str | None = None,
 ) -> ValidatedInputs:
     """Fail-fast validation shared by merge and evaluate.
@@ -360,7 +358,7 @@ def validate(
         _, membership = merge_homolog_fastas(h_sets, hp)
 
     if busco:
-        busco_p = _require(busco, "BUSCO lineage (--busco)")
+        busco_p = _require(busco, "BUSCO lineage (--busco-lineage)")
     else:
         busco_p = None
 
@@ -391,14 +389,12 @@ def validate(
         anno_p = _require(annotation, "annotation GFF3 (-a)")
         check_gff_seqids(anno_p, gids, "annotation (-a)")
 
-    sm = _require(species_map, "species map (--species-map)") if species_map else None
-
     vi = ValidatedInputs(
         genome=g, genome_ids=gids, homologs=hp,
         homolog_sets=h_sets, homolog_membership=membership,
         predictors=preds,
         annotation=anno_p, rna_samples=samples, transcripts=tr,
-        busco=busco_p, species_map=sm,
+        busco=busco_p,
     )
     log.info(
         "validation OK: predictors=%d rna_samples=%d transcripts=%s busco=%s",
