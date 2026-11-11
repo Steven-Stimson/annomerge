@@ -5,7 +5,7 @@ Checks, per CLI design v2.1:
   - -p homolog FASTA is MANDATORY; headers must carry species tags (>id|species=Genus_species)
   - -P predictor list parsing (name=path, comma-separated; unnamed -> filename stem)
   - -r RNA list file parsing (fastq/bam/bam_isoseq/gtf tags), mutually exclusive with --bam/--transcripts
-  - --busco / --core mutually exclusive
+  - --busco local BUSCO odb lineage (offline completeness QC)
   - GFF seqids must be a subset of genome seqids (fail-fast)
 """
 from __future__ import annotations
@@ -216,7 +216,6 @@ class ValidatedInputs:
     rna_samples: list[RnaSample] = field(default_factory=list)
     transcripts: Path | None = None         # precomputed StringTie GTF
     busco: Path | None = None
-    core: Path | None = None
     species_map: Path | None = None
 
     @property
@@ -248,7 +247,6 @@ def validate(
     bam: str | None = None,
     transcripts: str | None = None,
     busco: str | None = None,
-    core: str | None = None,
     species_map: str | None = None,
     workdir: str | None = None,
 ) -> ValidatedInputs:
@@ -293,10 +291,10 @@ def validate(
         hp = Path(workdir) / "input" / "homologs.merged.faa"
         _, membership = merge_homolog_fastas(h_sets, hp)
 
-    if busco and core:
-        raise InputError("--busco and --core are mutually exclusive")
-    busco_p = _require(busco, "BUSCO lineage (--busco)") if busco else None
-    core_p = _require(core, "core protein FASTA (--core)") if core else None
+    if busco:
+        busco_p = _require(busco, "BUSCO lineage (--busco)")
+    else:
+        busco_p = None
 
     if rna_list and (bam or transcripts):
         raise InputError("-r is mutually exclusive with --bam/--transcripts")
@@ -325,10 +323,10 @@ def validate(
         homolog_sets=h_sets, homolog_membership=membership,
         predictors=preds,
         annotation=anno_p, rna_samples=samples, transcripts=tr,
-        busco=busco_p, core=core_p, species_map=sm,
+        busco=busco_p, species_map=sm,
     )
     log.info(
-        "validation OK: predictors=%d rna_samples=%d transcripts=%s busco=%s core=%s",
-        len(preds), len(samples), bool(tr), bool(busco_p), bool(core_p),
+        "validation OK: predictors=%d rna_samples=%d transcripts=%s busco=%s",
+        len(preds), len(samples), bool(tr), bool(busco_p),
     )
     return vi

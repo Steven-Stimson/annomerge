@@ -22,7 +22,25 @@ from .utils import ensure_dir, setup_logging
 
 app = typer.Typer(
     name="annomerge",
-    help="AnnoMerge: EVM weight calibration + evidence auditing for gene annotation.",
+    help="""AnnoMerge: EVM weight calibration + evidence auditing for gene annotation.
+
+Subcommands (工作方式):
+  merge     整合流程 — de novo 预测打分定权 -> EVM 整合 -> isoform 解析/UTR 回补
+            -> sanity 修复 -> 置信分级 -> HTML 报告 + 单文件离线证据浏览器。
+            输入: -g 基因组 -P de novo 预测 -p 同源蛋白 [-r/--bam/--transcripts RNA]
+            [--busco 库] [--omark-db 库]
+  evaluate  评估流程 — 对用户已有注释跑与 merge 完全相同的评估链
+            (证据收集 -> 置信分级 -> 逐基因支持度标签 -> 报告 + 证据浏览器),
+            注释只读: 不过滤、不改 ID、不提升坐标。
+            输入: -g 基因组 -a 待评估 GFF3/GTF -p 同源蛋白
+            [-r/--bam/--transcripts RNA] [-P de novo 证据轨道] [--busco/--omark-db]
+
+Global options:
+  -c, --check-dependencies  检查相关依赖及版本信息 (exit 0=齐全, 3=有缺失)
+  -v, --version             输出版本信息
+  -h, --help                输出本帮助 (子命令 --help 看各自参数)
+""",
+    context_settings={"help_option_names": ["-h", "--help"]},
     add_completion=False,
     no_args_is_help=True,
 )
@@ -34,10 +52,23 @@ def _version_callback(value: bool):
         raise typer.Exit()
 
 
+def _deps_callback(value: bool):
+    if value:
+        from .deps import check_all, format_table
+        typer.echo(format_table(check_all()))
+        n_bad = sum(1 for r in check_all() if not r["ok"])
+        raise typer.Exit(3 if n_bad else 0)
+
+
 @app.callback()
 def _main(
-    version: Optional[bool] = typer.Option(None, "--version", callback=_version_callback,
+    version: Optional[bool] = typer.Option(None, "--version", "-v",
+                                           callback=_version_callback,
                                            is_eager=True, help="report version and exit"),
+    check_dependencies: bool = typer.Option(False, "--check-dependencies", "-c",
+                                            callback=_deps_callback,
+                                            is_eager=True, expose_value=False,
+                                            help="verify all external dependencies and exit"),
 ):
     """AnnoMerge: EVM weight calibration + evidence auditing."""
 
@@ -56,7 +87,7 @@ def _stub(stage: str):
 def _run_evidence_pipeline(
     out: Path, genome: str, homologs: str, rna_list: Optional[str],
     bam: Optional[str], transcripts: Optional[str], busco: Optional[str],
-    core: Optional[str],    species_map: Optional[str], threads: int,
+    species_map: Optional[str], threads: int,
     referee_min_wi: float, goldset: bool, goldset_min_orf: int,
     predictors: Optional[str] = None, annotation: Optional[str] = None,
     mnp_filter: str = "",
@@ -64,7 +95,7 @@ def _run_evidence_pipeline(
     vi = validate(
         genome=genome, homologs=homologs, predictors=predictors,
         annotation=annotation, rna_list=rna_list, bam=bam,
-        transcripts=transcripts, busco=busco, core=core, species_map=species_map,
+        transcripts=transcripts, busco=busco, species_map=species_map,
         workdir=str(out),
     )
     results: dict = {}
@@ -102,7 +133,6 @@ def merge(
     bam: Optional[str] = typer.Option(None, "--bam", help="sorted+indexed RNA-seq BAM(s), comma list"),
     transcripts: Optional[str] = typer.Option(None, "--transcripts", help="StringTie transcripts GTF/GFF"),
     busco: Optional[str] = typer.Option(None, "--busco", help="local BUSCO odb lineage path (offline)"),
-    core: Optional[str] = typer.Option(None, "--core", help="custom core conserved protein FASTA"),
     paf: Optional[str] = typer.Option(None, "--paf", help="precomputed miniprot PAF"),
     mnp_filter: Optional[str] = typer.Option(None, "--mnp-filter",
         help="miniprot homolog quality filter, comma tokens: UnStop,UnShift,Q2R=0.5,topRank=1 ... "
@@ -180,7 +210,7 @@ def merge(
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
         results, vi = _run_evidence_pipeline(
-            out, genome, homologs, rna_list, bam, transcripts, busco, core,
+            out, genome, homologs, rna_list, bam, transcripts, busco,
             species_map, threads, referee_min_wi, goldset, goldset_min_orf,
             predictors=predictors, mnp_filter=mnp_filter or "",
         )
@@ -569,7 +599,7 @@ def evaluate(
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
         results, vi = _run_evidence_pipeline(
-            out, genome, homologs, rna_list, bam, transcripts, busco, None,
+            out, genome, homologs, rna_list, bam, transcripts, busco,
             species_map, threads, referee_min_wi, goldset, goldset_min_orf,
             predictors=predictors, annotation=annotation,
             mnp_filter=mnp_filter or "",
