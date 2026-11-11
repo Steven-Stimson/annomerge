@@ -1,8 +1,8 @@
 """annomerge CLI (typer). Two subcommands: merge / evaluate.
 
 merge:   evidence collection (RNA / homolog proteins / Gold set) -> predictor
-         scoring -> EVM weight calibration -> EVM integration -> (isoform
-         mode) isoform resolution / UTR backfill -> sanity repair ->
+         scoring -> EVM weight calibration -> EVM integration -> (--augment)
+         isoform resolution / UTR backfill -> sanity repair ->
          confidence tiers -> HTML report + single-file offline browser.
 evaluate: the same assessment chain on an existing annotation (read-only).
 """
@@ -213,9 +213,9 @@ weights and integrate all evidence into a final annotation.
   # many RNA samples via a list file (one 'ID=files' sample per line)
   annomerge merge -g genome.fa -P denovo1=a.gff3 -p proteins.pep -r samples.txt
 
-  # isoform mode (isoform resolution + UTR backfill; needs RNA evidence)
+  # --augment: isoform resolution + UTR backfill (needs RNA evidence)
   annomerge merge -g genome.fa -P denovo1=a.gff3 -p proteins.pep \\
-      -r rnaseq_r1.fq,rnaseq_r2.fq --merge-mode isoform
+      -r rnaseq_r1.fq,rnaseq_r2.fq --augment
 """
 
 
@@ -256,12 +256,6 @@ def merge(
     omark_db: Optional[str] = typer.Option(
         None, "--omark-db",
         help="OMAmer database (.h5) for OMArk orthology QC (runs after BUSCO).",
-        rich_help_panel="Input files"),
-    merge_mode: str = typer.Option(
-        "evm", "--merge-mode",
-        help="[cyan]evm[/cyan] (default): EVM integration only. "
-             "[cyan]isoform[/cyan]: EVM + isoform resolution + UTR backfill + augment "
-             "(requires RNA evidence; auto-falls back to evm without RNA).",
         rich_help_panel="Input files"),
     threads: int = typer.Option(
         8, "--threads", "-t", help="Threads (also sets the EVM genome-split granularity).",
@@ -336,7 +330,13 @@ def merge(
              "[blue]min_intron[/blue] (bp, default 20; EVM --min_intron_length). "
              "Example: [blue]--evm-options[/blue] \"min_intron=30\".",
         rich_help_panel="EVM integration"),
-    # ---------------------------------------------- augment (isoform mode)
+    # ------------------------------------------------------------- augment
+    augment: bool = typer.Option(
+        False, "--augment",
+        help="Run the augment module after EVM integration: isoform "
+             "resolution + UTR backfill + near-duplicate UTR-donor removal. "
+             "Requires RNA evidence; auto-falls back to EVM-only without RNA.",
+        rich_help_panel="Augment"),
     aug_dedup: str = typer.Option(
         "geometric", "--aug-dedup",
         help="Near-duplicate UTR-donor removal, two philosophies: "
@@ -347,37 +347,37 @@ def merge(
              "(--aug-junc-reads) and expression filters (--aug-tpm-ratio, --aug-min-tpm); "
              "no bp threshold. Independent of both: --aug-collapse-tol-bp folds "
              "identical-intron-chain isoforms after dedup.",
-        rich_help_panel="Augment (isoform mode)"),
+        rich_help_panel="Augment"),
     aug_jitter_bp: int = typer.Option(
         50, "--aug-jitter-bp",
         help="[cyan]geometric[/cyan] mode only: merge UTR donors closer than this on "
              "both ends (0 = off).",
-        rich_help_panel="Augment (isoform mode)"),
+        rich_help_panel="Augment"),
     aug_pwm_gate: float = typer.Option(
         -3.0, "--aug-pwm-gate",
         help="[cyan]evidence[/cyan] mode only: splice-PWM gate threshold (log2 lift, "
              "calibrated) for novel non-anchor splice sites.",
-        rich_help_panel="Augment (isoform mode)"),
+        rich_help_panel="Augment"),
     aug_junc_reads: int = typer.Option(
         3, "--aug-junc-reads",
         help="[cyan]evidence[/cyan] mode only: minimum junction-read support for a "
              "novel intron to corroborate a donor.",
-        rich_help_panel="Augment (isoform mode)"),
+        rich_help_panel="Augment"),
     aug_tpm_ratio: float = typer.Option(
         0.1, "--aug-tpm-ratio",
         help="[cyan]evidence[/cyan] mode only: keep a donor when TPM >= this ratio x "
              "representative TPM.",
-        rich_help_panel="Augment (isoform mode)"),
+        rich_help_panel="Augment"),
     aug_min_tpm: float = typer.Option(
         0.1, "--aug-min-tpm",
         help="[cyan]evidence[/cyan] mode only: absolute TPM floor for keeping a donor.",
-        rich_help_panel="Augment (isoform mode)"),
+        rich_help_panel="Augment"),
     aug_collapse_tol: int = typer.Option(
         5, "--aug-collapse-tol-bp",
         help="Both modes: isoform collapse tolerance — CDS outer boundaries within "
              "this many bp with an identical intron chain on the same strand count as "
              "one structure (representative = longest total UTR; 0 = exact).",
-        rich_help_panel="Augment (isoform mode)"),
+        rich_help_panel="Augment"),
     # ----------------------------------------------- assessment & report
     viewer: str = typer.Option(
         "lite", "--viewer",
@@ -430,11 +430,7 @@ def merge(
                     f"(or use -c/--check-dependencies for a dependency check)",
                     fg="red", err=True)
         raise typer.Exit(2)
-    mode = merge_mode.lower()
-    if mode not in ("evm", "isoform"):
-        typer.secho(f"unknown --merge-mode {merge_mode!r} (evm|isoform)",
-                    fg="red", err=True)
-        raise typer.Exit(2)
+    mode = "isoform" if augment else "evm"
     vw = viewer.lower()
     if vw not in ("full", "lite", "no"):
         typer.secho(f"unknown --viewer {viewer!r} (full|lite|no)", fg="red", err=True)
@@ -511,10 +507,10 @@ def merge(
     # isoform resolution needs RNA evidence (StringTie + gold set); with
     # homolog proteins only the pipeline degrades to EVM-only integration
     # and the viewer shows the EVM result (final = evm.sanity.gff3).
-    if not vi.has_rna and mode == "isoform":
+    if not vi.has_rna and augment:
         mode = "evm"
         typer.secho(
-            "no RNA evidence: --merge-mode isoform unavailable "
+            "no RNA evidence: --augment unavailable "
             "(isoform resolution / UTR backfill need RNA); "
             "falling back to EVM-only integration", fg="yellow", err=True)
     gold_dir = out / "04.goldset"
@@ -626,7 +622,7 @@ def merge(
                   "threads": threads, "homologs": homologs,
                   "rna": ",".join(rna or []) or "none",
                   "busco": busco or "none",
-                  "merge_mode": mode, "viewer": vw,
+                  "augment": augment, "viewer": vw,
                   "mnp_filter": _norm_mnp(mnp_filter) or "off",
                   "w_rna": w_rna, "w_homolog": w_homolog,
                   "w_conserve": w_conserve, "w_structure": w_structure,
@@ -955,7 +951,7 @@ def evaluate(
                   "threads": threads, "homologs": homologs,
                   "rna": ",".join(params.get("rna") or []) or "none",
                   "busco": busco or "none", "omark": omark_db or "none",
-                  "merge_mode": "evaluate", "viewer": vw,
+                  "augment": False, "viewer": vw,
                   "mnp_filter": _norm_mnp(mnp_filter) or "off"})
     typer.secho(f"report: {rep['html']}", fg="green")
     # evidence browser (igv.js, single-file offline) — same as merge
