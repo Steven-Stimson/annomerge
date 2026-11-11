@@ -405,6 +405,36 @@ def _annotation_to_gff3(anno: Path, dst: Path) -> Path:
         dst.write_bytes(anno.read_bytes())
         log.info("evaluate: annotation already GFF3 -> copied (%s)", dst.name)
         return dst
+    # GTF: prefer gffread --keep-genes -F (battle-tested converter; keeps
+    # gene records and all attributes), then normalise transcript -> mRNA
+    # (the assessment chain parses the mRNA feature type). Pure-Python
+    # writer below is the fallback when gffread is unavailable.
+    import shutil, subprocess
+    gffread = shutil.which("gffread")
+    if gffread:
+        tmp = dst.with_name(dst.name + ".gffread")
+        r = subprocess.run([gffread, "--keep-genes", "-F", "-o", str(tmp), str(anno)],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            n_g = 0
+            with open(tmp) as fh, open(dst, "w") as out:
+                out.write("##gff-version 3\n")
+                for ln in fh:
+                    if ln.startswith("#"):
+                        continue
+                    f = ln.rstrip("\n").split("\t")
+                    if len(f) < 9:
+                        continue
+                    if f[2] == "transcript":
+                        f[2] = "mRNA"
+                    if f[2] == "gene":
+                        n_g += 1
+                    out.write("\t".join(f) + "\n")
+            tmp.unlink()
+            log.info("evaluate: GTF -> GFF3 via gffread --keep-genes: %d genes", n_g)
+            return dst
+        log.warning("evaluate: gffread failed (%s); falling back to in-Python GTF conversion",
+                    (r.stderr or r.stdout or "").strip()[:200])
 
     def _attrs(s: str) -> dict:
         av = {}
@@ -481,7 +511,6 @@ def evaluate(
     bam: Optional[str] = typer.Option(None, "--bam", help="sorted+indexed RNA-seq BAM(s), comma list"),
     transcripts: Optional[str] = typer.Option(None, "--transcripts", help="StringTie transcripts GTF/GFF"),
     busco: Optional[str] = typer.Option(None, "--busco", help="local BUSCO odb lineage path (offline)"),
-    core: Optional[str] = typer.Option(None, "--core", help="custom core conserved protein FASTA"),
     omark_db: Optional[str] = typer.Option(None, "--omark-db", help="OMAmer database (.h5) for OMArk orthology QC (after BUSCO)"),
     paf: Optional[str] = typer.Option(None, "--paf", help="precomputed miniprot PAF"),
     mnp_filter: Optional[str] = typer.Option(None, "--mnp-filter",
@@ -506,11 +535,21 @@ def evaluate(
 ):
     """Evaluate an existing annotation with the SAME assessment chain as the
     integration flow: evidence collection (RNA / homolog proteins / Gold
-    set) -> sanity filter -> coverage-aware confidence tiers -> support
-    tags on every gene and mRNA -> HTML report (BUSCO + OMArk + stats)
-    -> single-file offline evidence browser. Original IDs are preserved
-    (no renamer). RNA inputs, -P predictors, --busco/--core and --omark-db
-    are all optional; only -g/-a/-p are mandatory.
+    set) -> coverage-aware confidence tiers -> support tags on every gene
+    and mRNA -> HTML report (BUSCO + OMArk + stats) -> single-file offline
+    evidence browser.
+
+    The submitted annotation is treated as READ-ONLY: it is never filtered,
+    renamed or coordinate-transformed (no sanity_filter / renamer here —
+    those exist to repair pipeline-generated models, not user data). The
+    only transformation is a format normalisation to GFF3 (GFF3 copied
+    verbatim; GTF converted with gffread --keep-genes -F), and assessment
+    tags (Tier / RNA_support / Protein_support / denovo_support / Flags)
+    are APPENDED to each gene/mRNA. The Gold-set lift to genome coordinates
+    operates on the StringTie/TransDecoder EVIDENCE transcripts (not on
+    the submitted annotation) and only feeds the goldset evidence track.
+    RNA inputs, -P predictors, --busco and --omark-db are all optional;
+    only -g/-a/-p are mandatory.
     """
     if check_dependencies:
         from .deps import check_all, format_table
@@ -530,7 +569,7 @@ def evaluate(
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
         results, vi = _run_evidence_pipeline(
-            out, genome, homologs, rna_list, bam, transcripts, busco, core,
+            out, genome, homologs, rna_list, bam, transcripts, busco, None,
             species_map, threads, referee_min_wi, goldset, goldset_min_orf,
             predictors=predictors, annotation=annotation,
             mnp_filter=mnp_filter or "",
@@ -539,27 +578,25 @@ def evaluate(
         typer.secho(f"input error: {e}", fg="red", err=True)
         raise typer.Exit(2)
 
-    # ---- module 6 (evaluate): normalise the annotation to GFF3 (GTF
-    # converted in-Python; GFF3 passed through — gffread would drop the
-    # gene features), sanity-filter exactly like the integration flow, then
-    # run the identical assessment chain. Original IDs are preserved.
-    from .modules.sanity import sanity_filter
+    # ---- module 6 (evaluate): normalise the annotation to GFF3 ONLY as a
+    # format conversion (GFF3 copied verbatim; GTF -> gffread --keep-genes
+    # -F). NO sanity filter / renamer / coordinate lift here: the user's
+    # annotation is the assessment target and stays exactly as submitted
+    # (original IDs, original models; assessment tags are appended later).
     eval_d = ensure_dir(out / "06.evaluate")
-    raw_gff3 = _annotation_to_gff3(Path(annotation), eval_d / "annotation.gff3")
-    sanity_stats = sanity_filter(
-        raw_gff3, vi.genome,
-        eval_d / "eval.sanity.gff3", eval_d / "sanity_filter.tsv")
-    typer.secho(f"sanity filter: {sanity_stats or 'skipped (exists)'}", fg="green")
-    final_gff3 = eval_d / "eval.sanity.gff3"
+    final_gff3 = _annotation_to_gff3(Path(annotation), eval_d / "annotation.gff3")
     # Gold set lift to genome coordinates: merge does this inside EVM;
     # evaluate has no EVM, so lift directly whenever the Gold set exists.
+    # This transforms the StringTie/TransDecoder EVIDENCE transcripts
+    # (goldset evidence track) — never the submitted annotation.
     rna = results.get("rna") or {}
     gold_dir = out / "04.goldset"
     if (gold_dir / "transcripts.fa.transdecoder.gff3").exists() and rna.get("stringtie_gtf"):
         from .modules.evm import lift_goldset
         lift_goldset(gold_dir, rna["stringtie_gtf"], eval_d,
                      eval_d / "goldset.genome.gff3", genome_fa=vi.genome)
-    # module 6: coverage-aware evidence tiering (identical to merge)
+    # module 6: coverage-aware evidence tiering (identical to merge;
+    # sanity_tsv=None — nothing was filtered)
     from .modules.confidence import confidence_annotation, annotate_support
     assess_d = ensure_dir(out / "08.assessment")
     hom_res = results.get("homolog") or {}
@@ -573,7 +610,7 @@ def evaluate(
         hom_res.get("gff"),
         rna.get("bams", []),
         eval_d / "goldset.genome.gff3",
-        eval_d / "sanity_filter.tsv",
+        None,
         assess_d / "confidence.tsv",
         protein_weights=protein_weights)
     typer.secho(f"confidence tiers: {conf_stats or 'skipped (exists)'}", fg="green")
