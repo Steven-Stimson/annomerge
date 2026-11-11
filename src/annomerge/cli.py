@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import typer
+import typer.rich_utils  # noqa: F401  (binds the submodule attr used below)
 
 from . import __version__
 from .config import dump_params
@@ -219,7 +220,45 @@ weights and integrate all evidence into a final annotation.
 """
 
 
-@app.command(help=_MERGE_HELP)
+class _PanelDescCommand(typer.core.TyperCommand):
+    """TyperCommand variant that prints a description paragraph above a named
+    rich help panel (typer has no native panel-level description)."""
+
+    PANEL_DESCS: dict = {}
+
+    def format_help(self, ctx, formatter):
+        descs = self.PANEL_DESCS
+        if not descs:
+            return super().format_help(ctx, formatter)
+        orig = typer.rich_utils._print_options_panel
+
+        def _with_desc(*args, **kwargs):
+            name = kwargs.get("name") or (args[0] if args else "")
+            console = kwargs.get("console")
+            desc = descs.get(name)
+            if desc and console is not None:
+                console.print(__import__("rich.panel", fromlist=["Panel"]).Panel(
+                    typer.rich_utils._make_rich_text(
+                        text=desc, markup_mode=kwargs.get("markup_mode") or "rich"),
+                    box=__import__("rich.box", fromlist=["ROUNDED"]).ROUNDED,
+                    border_style="dim", padding=(0, 1)))
+            return orig(*args, **kwargs)
+
+        typer.rich_utils._print_options_panel = _with_desc
+        try:
+            super().format_help(ctx, formatter)
+        finally:
+            typer.rich_utils._print_options_panel = orig
+
+
+class _MergeHelpCommand(_PanelDescCommand):
+    PANEL_DESCS = {
+        "Scoring": _SCORING_FORMULA.strip(),
+        "Advanced": _ADV_CAUTION,
+    }
+
+
+@app.command(help=_MERGE_HELP, cls=_MergeHelpCommand)
 def merge(
     # ---------------------------------------------------------- input files
     genome: Optional[str] = typer.Option(
@@ -266,7 +305,7 @@ def merge(
     # ------------------------------------------------------------- scoring
     w_rna: float = typer.Option(
         0.45, "--w-rna",
-        help=_SCORING_FORMULA + "\nW_r: weight of the R_s (RNA support) sub-block.",
+        help="W_r: weight of the R_s (RNA support) sub-block.",
         rich_help_panel="Scoring"),
     w_homolog: float = typer.Option(
         0.25, "--w-homolog", help="W_h: weight of the H_s (homolog support) sub-block.",
@@ -391,7 +430,7 @@ def merge(
     # ------------------------------------------------------------- advanced
     hisat2_options: Optional[str] = typer.Option(
         None, "--hisat2-options",
-        help=_ADV_CAUTION + "\n\nExtra HISAT2 alignment flags, e.g. \"-k 3 --sp "
+        help="Extra HISAT2 alignment flags, e.g. \"-k 3 --sp "
              "max=15\". Inserted into every per-sample alignment. Protected: "
              "-x, -p, -S, -1, -2, -U, --dta.",
         rich_help_panel="Advanced"),
