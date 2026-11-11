@@ -291,7 +291,23 @@ def check_all() -> list[dict]:
                  "ok": not any("MISSING" in s for s in py), "missing": [],
                  "path": "-", "src": "-", "version": "; ".join(py),
                  "hint": "pip install typer pyyaml pysam jinja2"})
-    return rows
+    # deps registered both as ExeDep and HomeDep (transdecoder: entry points +
+    # util/ script suite) display as a single merged row
+    merged: dict[str, dict] = {}
+    order: list[str] = []
+    for r in rows:
+        if r["dep"] in merged:
+            m = merged[r["dep"]]
+            m["ok"] = m["ok"] and r["ok"]
+            m["missing"] = m["missing"] + r["missing"]
+            if m["version"] in ("-", "?") and r["version"] not in ("-", "?"):
+                m["version"] = r["version"]
+            if m["path"] == "-" and r["path"] != "-":
+                m["path"], m["src"] = r["path"], r["src"]
+        else:
+            merged[r["dep"]] = dict(r)
+            order.append(r["dep"])
+    return [merged[k] for k in order]
 
 
 _GREEN = "\033[32m"
