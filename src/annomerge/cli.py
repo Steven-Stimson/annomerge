@@ -24,21 +24,28 @@ app = typer.Typer(
     name="annomerge",
     help="""AnnoMerge: EVM weight calibration + evidence auditing for gene annotation.
 
-Subcommands (工作方式):
-  merge     整合流程 — de novo 预测打分定权 -> EVM 整合 -> isoform 解析/UTR 回补
-            -> sanity 修复 -> 置信分级 -> HTML 报告 + 单文件离线证据浏览器。
-            输入: -g 基因组 -P de novo 预测 -p 同源蛋白 [-r/--bam/--transcripts RNA]
-            [--busco 库] [--omark-db 库]
-  evaluate  评估流程 — 对用户已有注释跑与 merge 完全相同的评估链
-            (证据收集 -> 置信分级 -> 逐基因支持度标签 -> 报告 + 证据浏览器),
-            注释只读: 不过滤、不改 ID、不提升坐标。
-            输入: -g 基因组 -a 待评估 GFF3/GTF -p 同源蛋白
-            [-r/--bam/--transcripts RNA] [-P de novo 证据轨道] [--busco/--omark-db]
+Subcommands:
+  merge     Integration pipeline — score de novo predictors and calibrate
+            EVM weights -> EVM integration -> isoform resolution / UTR
+            backfill -> sanity repair -> confidence tiers -> HTML report
+            + single-file offline evidence browser.
+            Inputs: -g genome -P de novo predictions -p homolog proteins
+            [-r/--bam/--transcripts RNA] [--busco lineage] [--omark-db db]
+  evaluate  Assessment pipeline — run the SAME assessment chain as merge on
+            an existing annotation (evidence collection -> confidence tiers
+            -> per-gene support tags -> report + evidence browser).
+            The annotation is read-only: never filtered, renamed or
+            coordinate-lifted.
+            Inputs: -g genome -a annotation GFF3/GTF -p homolog proteins
+            [-r/--bam/--transcripts RNA] [-P de novo evidence tracks]
+            [--busco lineage] [--omark-db db]
 
 Global options:
-  -c, --check-dependencies  检查相关依赖及版本信息 (exit 0=齐全, 3=有缺失)
-  -v, --version             输出版本信息
-  -h, --help                输出本帮助 (子命令 --help 看各自参数)
+  -c, --check-dependencies  check all external dependencies and versions
+                            (exit 0 = all present, 3 = missing)
+  -v, --version             print version and exit
+  -h, --help                show this help (use <subcommand> --help for
+                            subcommand options)
 """,
     context_settings={"help_option_names": ["-h", "--help"]},
     add_completion=False,
@@ -179,8 +186,6 @@ def merge(
              "structure; representative = longest total UTR (0 = exact)"),
     aug_pwm_gate: float = typer.Option(-3.0, "--aug-pwm-gate",
                                        help="evidence dedup: splice-PWM gate threshold (log2 lift, calibrated)"),
-    check_dependencies: bool = typer.Option(False, "--check-dependencies", "-c",
-                                            help="verify all external dependencies and exit"),
     merge_mode: str = typer.Option("isoform", "--merge-mode",
                                    help="isoform|evm (isoform: EVM + isoform resolution + UTR backfill + augment; evm: EVM integration only)"),
     omark_db: Optional[str] = typer.Option(None, "--omark-db", help="OMAmer database (.h5) for OMArk orthology QC (after BUSCO)"),
@@ -190,14 +195,7 @@ def merge(
                                           "Default is the lite build (coordinates only, much smaller)"),
     config: Optional[str] = typer.Option(None, "--config", help="resolved_params.yaml from a previous run"),
     verbose: bool = typer.Option(False, "--verbose"),
-    version: Optional[bool] = typer.Option(None, "--version", callback=_version_callback, is_eager=True),
 ):
-    if check_dependencies:
-        from .deps import check_all, format_table
-        table = format_table(check_all())
-        typer.echo(table)
-        n_bad = sum(1 for r in check_all() if not r["ok"])
-        raise typer.Exit(3 if n_bad else 0)
     missing = [n for n, v in (("genome/-g", genome), ("predictors/-P", predictors),
                               ("homologs/-p", homologs)) if not v]
     if missing:
@@ -557,11 +555,8 @@ def evaluate(
     viewer_full: bool = typer.Option(False, "--viewer-full",
                                      help="evidence browser: embed genome sequence (base-level track). "
                                           "Default is the lite build (coordinates only, much smaller)"),
-    check_dependencies: bool = typer.Option(False, "--check-dependencies", "-c",
-                                            help="verify all external dependencies and exit"),
     config: Optional[str] = typer.Option(None, "--config", help="resolved_params.yaml from a previous run"),
     verbose: bool = typer.Option(False, "--verbose"),
-    version: Optional[bool] = typer.Option(None, "--version", callback=_version_callback, is_eager=True),
 ):
     """Evaluate an existing annotation with the SAME assessment chain as the
     integration flow: evidence collection (RNA / homolog proteins / Gold
@@ -581,12 +576,6 @@ def evaluate(
     RNA inputs, -P predictors, --busco and --omark-db are all optional;
     only -g/-a/-p are mandatory.
     """
-    if check_dependencies:
-        from .deps import check_all, format_table
-        table = format_table(check_all())
-        typer.echo(table)
-        n_bad = sum(1 for r in check_all() if not r["ok"])
-        raise typer.Exit(3 if n_bad else 0)
     missing = [n for n, v in (("genome/-g", genome), ("annotation/-a", annotation),
                               ("homologs/-p", homologs)) if not v]
     if missing:
