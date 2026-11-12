@@ -10,6 +10,3 @@ conda create -n annomerge -c conda-forge -c bioconda pysam typer jinja2 pyyaml m
 # step2 clone this repository 
 git clone https://github.com/Steven-Stimson/annomerge.git
 ```
-## License
-
-TBD
