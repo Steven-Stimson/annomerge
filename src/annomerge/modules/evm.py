@@ -294,7 +294,8 @@ def _evm_run_one(genome_fa: Path, combined: Path, evidence: dict,
                      "--genome", str(genome_fa),
                      "--gene_predictions", str(combined),
                      "--segmentSize", "100000", "--overlapSize", "10000",
-                     "--partition_listing", str(plist)]
+                     "--partition_listing", str(plist),
+                     "--partition_dir", str(d)]
         if "stringtie" in evidence:
             part_args += ["--transcript_alignments", str(evidence["stringtie"])]
         if "miniprot" in evidence:
@@ -326,7 +327,9 @@ def _evm_run_one(genome_fa: Path, combined: Path, evidence: dict,
         if len(f) >= 2:
             pg = Path(f[1]) / "evm.out.gff3"
             if pg.exists():
-                out[f[1].split("/")[-1]] = pg
+                # key = partitions.list 第 1 列的原始 accession（带点号）；
+                # 目录名（第 2 列末段）被 EVM 把 '.' 换成了 '_'，不能直接当 key
+                out[f[0]] = pg
     return out
 
 
