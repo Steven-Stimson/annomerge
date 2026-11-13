@@ -371,7 +371,8 @@ def render_html(ctx: dict, out_html: Path,
                       evidence=ctx.get("evidence", {}),
                       versions=ctx.get("versions", {}),
                       assessment=ctx.get("assessment", {}),
-                      integ=ctx.get("integ"))
+                      integ=ctx.get("integ"),
+                      orthodb=ctx.get("orthodb"))
     Path(out_html).write_text(html)
     log.info("report html -> %s", out_html)
     return Path(out_html)
@@ -542,6 +543,23 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
     ctx["assessment"] = quality_assessment(ctx)
     # integration-only sections 2.1/2.2 (None for evaluate runs)
     ctx["integ"] = _integration_stats(out, final_gff3)
+    # orthology-database support tags (gene level): runs only when a BUSCO
+    # lineage and/or an OMAmer DB was provided AND produced results; writes
+    # BUSCO_support/BUSCO_group/OMArk_support/OMArk_HOG onto gene rows of the
+    # final GFF3 so downstream GFF3 consumers (incl. the evidence browser)
+    # see the same verdict. Counts feed report section 3.4.
+    from .confidence import annotate_orthodb_support
+    od = annotate_orthodb_support(
+        final_gff3, assess,
+        busco_lineage=str(busco_lineage) if busco_lineage else None,
+        omark_db=str(omark_db) if omark_db else None)
+    ctx["orthodb"] = {
+        "applied": od["applied"],
+        "busco_supported": od["busco_supported"],
+        "omark_supported": od["omark_supported"],
+        "busco_lineage": Path(busco_lineage).name if busco_lineage else None,
+        "omark_db": Path(omark_db).name if omark_db else None,
+    }
     # finish time + elapsed, for section 1 (Run Summary)
     from datetime import datetime
     _end = datetime.now()

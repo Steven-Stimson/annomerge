@@ -654,3 +654,87 @@ def annotate_support(gff3: Path, conf_tsv: Path,
     log.info("annotate_support: %d genes, %d mRNAs, %d CDS renumbered",
              n_gene, n_tx, n_cds)
     return {"genes": n_gene, "mrnas": n_tx, "cds": n_cds}
+
+
+# ------------------------------------------- orthology-database support tags
+def annotate_orthodb_support(gff3: Path, assess_dir: Path,
+                             busco_lineage: str | None = None,
+                             omark_db: str | None = None) -> dict:
+    """Tag gene rows with BUSCO/OMArk support after their runs (idempotent).
+
+    Assessment happens on the longest-isoform protein per gene, so the tags
+    live on the gene feature only (never the mRNAs, which were not assessed):
+      BUSCO_support=<lineage name>   + BUSCO_group=<busco id,...>
+      OMArk_support=<omamer db name> + OMArk_HOG=<HOG:...>
+    A gene is BUSCO-supported when its protein is Complete or Duplicated in
+    full_table.tsv; OMArk-supported when classified Consistent_* in the .ump.
+    Absent results (no db given / run failed) -> silent no-op. Old copies of
+    these attributes are stripped before re-writing, so reruns stay clean.
+    """
+    # ---- BUSCO: full_table.tsv, one row per BUSCO group
+    busco_genes: dict = {}        # gene id -> {busco ids}
+    if busco_lineage:
+        tables = sorted((Path(assess_dir) / "busco" / "busco_run"
+                         ).glob("run_*/full_table.tsv"))
+        if tables:
+            with open(tables[0]) as fh:
+                for ln in fh:
+                    if ln.startswith("#"):
+                        continue
+                    f = ln.rstrip("\n").split("\t")
+                    if len(f) < 3 or f[1] not in ("Complete", "Duplicated"):
+                        continue
+                    busco_genes.setdefault(f[2], set()).add(f[0])
+    # ---- OMArk: .ump (per-protein category), .tsv (protein -> HOG)
+    omark_genes: dict = {}        # gene id -> category (Consistent_* only)
+    hog_of: dict = {}             # gene id -> HOG id
+    if omark_db:
+        ump = Path(assess_dir) / "omark" / "omamer_hits.ump"
+        if ump.exists():
+            cat = ""
+            with open(ump) as fh:
+                for ln in fh:
+                    if ln.startswith(">"):
+                        cat = ln[1:].strip()
+                    elif ln.strip() and cat.startswith("Consistent"):
+                        omark_genes[ln.strip()] = cat
+            tsv = ump.with_suffix(".tsv")
+            if tsv.exists() and omark_genes:
+                with open(tsv) as fh:
+                    for ln in fh:
+                        f = ln.rstrip("\n").split("\t")
+                        if len(f) >= 2 and f[0] in omark_genes \
+                                and f[0] not in hog_of:
+                            hog_of[f[0]] = f[1]
+    if not busco_genes and not omark_genes:
+        return {"busco_supported": 0, "omark_supported": 0, "applied": False}
+    lineage_name = Path(busco_lineage).name if busco_lineage else None
+    db_name = Path(omark_db).name if omark_db else None
+    old = {"BUSCO_support", "BUSCO_group", "OMArk_support", "OMArk_HOG"}
+    lines = Path(gff3).read_text().splitlines()
+    n_b = n_o = 0
+    out = []
+    for ln in lines:
+        p = ln.split("\t")
+        if len(p) < 9 or p[2] != "gene":
+            out.append(ln)
+            continue
+        kv = [x for x in p[8].split(";") if x and x.split("=", 1)[0] not in old]
+        av = {x.split("=", 1)[0]: x.split("=", 1)[1]
+              for x in kv if "=" in x}
+        gid = av.get("ID")
+        if gid and gid in busco_genes:
+            kv.append(f"BUSCO_support={lineage_name}")
+            kv.append("BUSCO_group=" + ",".join(sorted(busco_genes[gid])))
+            n_b += 1
+        if gid and gid in omark_genes:
+            kv.append(f"OMArk_support={db_name}")
+            if gid in hog_of:
+                kv.append(f"OMArk_HOG={hog_of[gid]}")
+            n_o += 1
+        p[8] = ";".join(kv)
+        out.append("\t".join(p))
+    Path(gff3).write_text("\n".join(out) + "\n")
+    log.info("orthology DB tags: BUSCO-supported %d genes, "
+             "OMArk-supported %d genes", n_b, n_o)
+    return {"busco_supported": n_b, "omark_supported": n_o, "applied": True}

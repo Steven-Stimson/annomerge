@@ -157,6 +157,30 @@ suggests possible contamination or over-annotation.</p>
 <p class="note">OMArk not run: no OMAmer database available.</p>
 {% endif %}
 
+<h3>3.4 Orthology Database Support (gene-level tags)</h3>
+{% if orthodb and orthodb.applied %}
+<p>Genes whose representative protein was supported by the orthology
+databases (per-gene verdicts are written into the final GFF3 as
+<code>BUSCO_support</code>/<code>BUSCO_group</code> and
+<code>OMArk_support</code>/<code>OMArk_HOG</code>):</p>
+<table>
+  <tr><th>Database</th><th class="num">Supported genes</th><th class="num">Fraction</th></tr>
+  {% if orthodb.busco_supported %}
+  <tr><td>BUSCO <code>{{ orthodb.busco_lineage }}</code></td>
+      <td class="num">{{ orthodb.busco_supported }}</td>
+      <td class="num">{{ "%.1f"|format(100 * orthodb.busco_supported / gene_set.n_genes) }}%</td></tr>
+  {% endif %}
+  {% if orthodb.omark_supported %}
+  <tr><td>OMArk <code>{{ orthodb.omark_db }}</code></td>
+      <td class="num">{{ orthodb.omark_supported }}</td>
+      <td class="num">{{ "%.1f"|format(100 * orthodb.omark_supported / gene_set.n_genes) }}%</td></tr>
+  {% endif %}
+</table>
+{% else %}
+<p class="note">No BUSCO lineage / OMAmer database support tags were added
+(BUSCO/OMArk not run or nothing supported a gene).</p>
+{% endif %}
+
 <h2>4. Dependencies</h2>
 <table class="kv">
   {% for name, ver in versions.rows %}

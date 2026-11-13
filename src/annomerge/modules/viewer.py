@@ -94,7 +94,11 @@ def _parse_final_gff3(final_gff3: Path) -> tuple:
             if ftype == "gene":
                 gid = av.get("ID")
                 if gid and gid not in info:
-                    info[gid] = {"tx": 0, "cds": 0, "exon": 0}
+                    info[gid] = {"tx": 0, "cds": 0, "exon": 0,
+                                 "busco_support": av.get("BUSCO_support"),
+                                 "busco_group": av.get("BUSCO_group"),
+                                 "omark_support": av.get("OMArk_support"),
+                                 "omark_hog": av.get("OMArk_HOG")}
                     order.append(gid)
             elif ftype == "mRNA":
                 tid = av.get("ID")
@@ -312,6 +316,10 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
                 r["tx"] = st["tx"]
                 r["cds"] = st["cds"]
                 r["exon"] = st["exon"]
+                for k in ("busco_support", "busco_group",
+                          "omark_support", "omark_hog"):
+                    if st.get(k):
+                        r[k] = st[k]
             r["gff_order"] = order_idx.get(r["gene"], 10 ** 9)
             for iso in r["isoforms"]:
                 ce = tx_ce.get(iso["tid"])

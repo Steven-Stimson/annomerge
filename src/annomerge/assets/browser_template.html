@@ -538,6 +538,13 @@ function renderDetail(g) {
         <span class="k">GoldSet origin</span><span class="v ${g.goldset === "yes" ? "gs-yes" : "gs-no"}">${g.goldset === "yes" ? "yes" : "no"}</span>
       </div>
     </div>
+    ${g.busco_support || g.omark_support ? `<div class="dt-section">
+      <div class="dt-title">Orthology DB support</div>
+      <div class="dt-grid">
+        ${g.busco_support ? `<span class="k">BUSCO</span><span class="v">${esc(g.busco_support)} <span class="dim">(${esc(g.busco_group || "-")})</span></span>` : ""}
+        ${g.omark_support ? `<span class="k">OMArk</span><span class="v">${esc(g.omark_support)} <span class="dim">(${esc(g.omark_hog || "-")})</span></span>` : ""}
+      </div>
+    </div>` : ""}
     <div class="dt-section">
       <div class="dt-title">Gene list indicators</div>
       <div class="dt-grid">
