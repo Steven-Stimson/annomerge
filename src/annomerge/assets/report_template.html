@@ -70,7 +70,7 @@
 score (de&nbsp;novo predictors, <code>scoring/evm_weights.tsv</code>) and the
 EVM weight used during integration (<code>evm/weights.txt</code>):</p>
 <table>
-  <tr><th>Evidence type</th><th>Evidence source</th><th class="num">Score (W_raw)</th><th class="num">EVM weight</th></tr>
+  <tr><th>Evidence type</th><th>Evidence source</th><th class="num">Score</th><th class="num">EVM weight</th></tr>
   {% for e in integ.evidence_rows %}
   <tr><td>{{ e.kind }}</td><td>{{ e.evidence }}</td><td class="num">{{ e.score }}</td><td class="num">{{ e.evm_weight }}</td></tr>
   {% endfor %}
@@ -146,9 +146,9 @@ suggests possible contamination or over-annotation.</p>
   <tr><th>Category</th><th class="num">Count</th><th class="num">Fraction</th></tr>
   <tr><td>Consistent with HOGs</td><td class="num">{{ omark.consistent }}</td><td class="num">{{ omark.consistent_pct }}%</td></tr>
   <tr><td>Inconsistent</td><td class="num">{{ omark.inconsistent }}</td><td class="num">{{ omark.inconsistent_pct }}%</td></tr>
-  <tr><td>Unknown (no HOG)</td><td class="num">{{ omark.unknown }}</td><td class="num"></td></tr>
+  <tr><td>Unknown (no HOG)</td><td class="num">{{ omark.unknown }}</td><td class="num">{{ omark.unknown_pct }}%</td></tr>
   <tr><td>Duplicated (contamination)</td><td class="num">{{ omark.duplicated }}</td><td class="num">{{ omark.duplicated_pct }}%</td></tr>
-  <tr><td>Total proteins assessed</td><td class="num">{{ omark.total }}</td><td class="num"></td></tr>
+  <tr><td>Total proteins assessed</td><td class="num">{{ omark.total }}</td><td class="num">100.0%</td></tr>
 </table>
 {% else %}
 <p class="note">OMArk not run: {{ omark.error }}</p>

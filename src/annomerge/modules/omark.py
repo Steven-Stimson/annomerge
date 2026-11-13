@@ -56,9 +56,11 @@ def parse_omark_summary(txt: str, db: Path, version: str) -> dict:
         out["consistent"], out["inconsistent"] = _num(m.group(1)), _num(m.group(2))
         out["contamination"], out["unknown"] = _num(m.group(3)), _num(m.group(4))
     m = re.search(r"^A:([\d.]+)%\[P:[\d.]+%,F:[\d.]+%\],I:[\d.]+%\["
-                  r"P:[\d.]+%,F:[\d.]+%\],C:([\d.]+)%", txt, re.M)
+                  r"P:[\d.]+%,F:[\d.]+%\],C:([\d.]+)%\["
+                  r"P:[\d.]+%,F:[\d.]+%\],U:([\d.]+)%", txt, re.M)
     if m:
         out["consistent_pct"], out["contamination_pct"] = m.group(1), m.group(2)
+        out["unknown_pct"] = m.group(3)
     m = re.search(r"^S:([\d,]+),D:([\d,]+)\[U:[\d,]+,E:[\d,]+\],M:([\d,]+)",
                   txt, re.M)
     if m:
@@ -98,6 +100,8 @@ def parse_omark_summary(txt: str, db: Path, version: str) -> dict:
         out["consistent_pct"] = _pct(out.get("consistent"), total)
     if "inconsistent_pct" not in out:
         out["inconsistent_pct"] = _pct(out.get("inconsistent"), total)
+    if "unknown_pct" not in out:
+        out["unknown_pct"] = _pct(out.get("unknown"), total)
     # contamination = OMArk "Likely Contamination" (C:), NOT duplicated HOGs
     if "contamination_pct" not in out:
         out["contamination_pct"] = _pct(out.get("contamination"), total) \

@@ -266,25 +266,35 @@ def software_versions() -> dict:
     except Exception:
         td_v = "not found"
     rows.append(("TransDecoder", td_v))
-    # EVidenceModeler ships no --version; the release number lives in the
-    # top-level directory name of the distribution tarball (EVidenceModeler-X.Y.Z)
+    # EVidenceModeler ships no --version. Version sources, in priority order:
+    #   1. the resolved install directory name (conda: opt/evidencemodeler-2.1.0)
+    #   2. the top-level dir of the distribution tarball (EVidenceModeler-X.Y.Z)
     evm_v = None
     try:
-        import tarfile
         evm_home = home("evm")
-        for tg in sorted(evm_home.parent.glob("evm*.tar.gz")):
-            try:
-                with tarfile.open(tg) as tf:
-                    names = tf.getnames()
-            except Exception:
-                continue
-            m = re.search(r"EVidenceModeler-(\d+\.\d+(?:\.\d+)?)",
-                          "\n".join(names))
-            if m:
-                evm_v = m.group(1)
-                break
+        m = re.search(r"evidencemodeler[-_](\d+\.\d+(?:\.\d+)?)",
+                      str(evm_home), re.I)
+        if m:
+            evm_v = m.group(1)
     except Exception:
         evm_v = None
+    if not evm_v:
+        try:
+            import tarfile
+            evm_home = home("evm")
+            for tg in sorted(evm_home.parent.glob("evm*.tar.gz")):
+                try:
+                    with tarfile.open(tg) as tf:
+                        names = tf.getnames()
+                except Exception:
+                    continue
+                m = re.search(r"EVidenceModeler-(\d+\.\d+(?:\.\d+)?)",
+                              "\n".join(names))
+                if m:
+                    evm_v = m.group(1)
+                    break
+        except Exception:
+            evm_v = None
     rows.append(("EVidenceModeler", evm_v or "unknown"))
     # BUSCO: `busco --version` writes logs and dies on read-only mounts;
     # derive the version from the resolved installation path instead.
