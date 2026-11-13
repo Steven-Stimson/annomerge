@@ -80,7 +80,8 @@ def _deps_callback(value: bool):
     if value:
         from .deps import check_all, format_table
         typer.echo(format_table(check_all()))
-        n_bad = sum(1 for r in check_all() if not r["ok"])
+        n_bad = sum(1 for r in check_all()
+                    if not r["ok"] and not r.get("optional"))
         raise typer.Exit(3 if n_bad else 0)
 
 

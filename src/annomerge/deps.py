@@ -42,6 +42,8 @@ class ExeDep:
     alternatives: tuple[str, ...] = ()  # any one of these also satisfies the dep
                                          # (e.g. the combined `TransDecoder` wrapper
                                          #  when the split .LongOrfs/.Predict are absent)
+    optional: bool = False              # missing -> WARN (yellow), never counted
+                                         # as a hard failure (busco/omark add-ons)
 
 
 @dataclass(frozen=True)
@@ -68,7 +70,8 @@ EXE_DEPS: tuple[ExeDep, ...] = (
     ExeDep("diamond", ("DIAMOND", "DIAMOND_HOME"), ("diamond",),
            "diamond: conda install -c bioconda diamond"),
     ExeDep("busco", ("BUSCO", "BUSCO_HOME"), ("busco",),
-           "busco: conda install -c bioconda busco (5.7.x for odb10 lineage)"),
+           "busco: conda install -c bioconda busco (5.7.x for odb10 lineage) "
+           "(only needed with --busco-lineage)", optional=True),
     ExeDep("miniprot", ("MINIPROT", "MINIPROT_HOME"), ("miniprot",),
            "miniprot: conda install -c bioconda miniprot"),
     ExeDep("transdecoder", ("TRANSDECODER", "TRANSDECODER_HOME"),
@@ -76,6 +79,12 @@ EXE_DEPS: tuple[ExeDep, ...] = (
            "TransDecoder: conda install -c bioconda transdecoder",
            alternatives=("TransDecoder",)),
     ExeDep("perl", ("PERL",), ("perl",), "perl 5: system package"),
+    ExeDep("omark", ("OMARK", "OMARK_HOME"), ("omark",),
+           "omark: conda install -c bioconda omark (only needed with --omark-db)",
+           optional=True),
+    ExeDep("omamer", ("OMAMER", "OMAMER_HOME"), ("omamer",),
+           "omamer: conda install -c bioconda omamer (only needed with --omark-db)",
+           optional=True),
 )
 
 HOME_DEPS: tuple[HomeDep, ...] = (
@@ -97,7 +106,7 @@ _HOME_LOOKUP: dict[str, HomeDep] = {dep.key: dep for dep in HOME_DEPS}
 
 # ---------------------------------------------------------------- resolution
 def _probe_dir(dirp: Path, exe: str) -> str | None:
-    for cand in (dirp / exe, dirp / "bin" / exe):
+    for cand in (dirp / exe, dirp / "bin" / exe, dirp / "util" / exe):
         if cand.is_file() and os.access(cand, os.X_OK):
             return str(cand)
     return None
@@ -117,7 +126,7 @@ def which(exe: str) -> str:
                 if hit:
                     return hit
                 log.warning("%s=%s is a directory but %s not found inside "
-                            "(probed %s and bin/)", var, val, exe, p)
+                            "(probed %s, bin/ and util/)", var, val, exe, p)
             elif p.is_file() and os.access(p, os.X_OK):
                 if p.name == exe or len(dep.exes) == 1:
                     return str(p)
@@ -128,6 +137,20 @@ def which(exe: str) -> str:
     hit = shutil.which(exe)
     if hit:
         return hit
+    # conda layout fallback: sometimes only a wrapper is on PATH (e.g.
+    # bin/TransDecoder -> ../opt/transdecoder/TransDecoder) while the real
+    # scripts (TransDecoder.LongOrfs/.Predict, util/) live next to the
+    # wrapper target.  Follow a resolvable sibling/alternative of the same
+    # dependency and probe its real directory.
+    for anchor in (exe, *(dep.alternatives if dep else ())):
+        wrapper = shutil.which(anchor)
+        if not wrapper:
+            continue
+        real_dir = Path(wrapper).resolve().parent
+        for sub in (".", "util", "bin"):
+            cand = real_dir / sub / exe
+            if cand.is_file() and os.access(cand, os.X_OK):
+                return str(cand)
     tried = ", ".join(dep.envs) if dep else ""
     raise ToolError(
         f"external tool not found: {exe!r}. "
@@ -225,6 +248,31 @@ def _home_version(key: str, p: Path) -> str:
     return m.group(1) if m else "?"
 
 
+def _dist_version(key: str, exe_path: str | None) -> str:
+    """Python-distribution tools (omark/omamer) report via importlib; CLI tools
+    (and wrappers whose --version argparse would only print usage) via --version."""
+    try:
+        from importlib.metadata import version as _v
+        return _v(key)
+    except Exception:
+        pass
+    if exe_path and "TransDecoder" in Path(exe_path).name:
+        # perl script with the version embedded: my $VERSION = "5.7.1";
+        # (not every script carries it — the wrapper does, so probe siblings)
+        cands = [Path(exe_path),
+                 Path(exe_path).parent / "TransDecoder.Predict",
+                 Path(exe_path).parent.parent / "TransDecoder"]
+        for f in cands:
+            try:
+                head = f.read_text(errors="replace")[:4000]
+            except OSError:
+                continue
+            m = re.search(r"\$VERSION\s*=\s*[\"']([\d.]+)", head)
+            if m:
+                return m.group(1)
+    return _version_of(exe_path) if exe_path else "-"
+
+
 def check_all() -> list[dict]:
     """Resolve every dependency; return rows for display (never raises)."""
     rows: list[dict] = []
@@ -254,9 +302,9 @@ def check_all() -> list[dict]:
         first = next(iter(resolved.values()), (None, None))[0]
         rows.append({
             "dep": dep.key, "env": ",".join(dep.envs), "exes": dep.exes,
-            "ok": not missing, "missing": missing,
+            "ok": not missing, "missing": missing, "optional": dep.optional,
             "path": first or "-", "src": next(iter(resolved.values()), (None, "-"))[1],
-            "version": _version_of(first) if first else "-",
+            "version": _dist_version(dep.key, first) if first else "-",
             "hint": dep.hint,
         })
     for dep in HOME_DEPS:
@@ -271,6 +319,26 @@ def check_all() -> list[dict]:
             rows.append({"dep": dep.key, "env": ",".join(dep.envs), "exes": (),
                          "ok": False, "missing": [dep.key], "path": "-",
                          "src": "-", "version": "-", "hint": dep.hint})
+    # optional OMArk support: ete3's NCBI taxonomy db.  omark needs it on the
+    # first run, where it would otherwise try to download taxdump.tar.gz from
+    # the NCBI FTP site — that fails behind proxies, so surface it here.
+    taxa_db = Path.home() / ".etetoolkit" / "taxa.sqlite"
+    if taxa_db.is_file() and taxa_db.stat().st_size > 0:
+        rows.append({"dep": "ete3-taxonomy", "env": "HOME", "exes": (),
+                     "ok": True, "missing": [], "optional": True,
+                     "path": str(taxa_db), "src": "home",
+                     "version": f"{taxa_db.stat().st_size / 1e6:.0f} MB", "hint": ""})
+    else:
+        rows.append({"dep": "ete3-taxonomy", "env": "HOME", "exes": (),
+                     "ok": False, "missing": ["taxa.sqlite"], "optional": True,
+                     "path": str(taxa_db), "src": "-", "version": "-",
+                     "hint": "ete3 NCBI taxonomy db not found; on the first omark "
+                             "run ete3 would download taxdump.tar.gz from the NCBI "
+                             "FTP site (usually blocked by proxies). Build it "
+                             "manually: download taxdump.tar.gz from "
+                             "https://ftp.ncbi.nlm.nih.gov/pub/taxonomy/ then run "
+                             "python -c \"from ete3 import NCBITaxa; "
+                             "NCBITaxa().update_taxonomy_database('taxdump.tar.gz')\""})
     # python package sanity — the actual runtime deps from pyproject.toml
     py = []
     for mod, dist in (("pysam", "pysam"), ("typer", "typer"),
@@ -322,6 +390,9 @@ def format_table(rows: list[dict]) -> str:
     for r in rows:
         if r["ok"]:
             status = f"{_GREEN}OK{_RESET}"
+        elif r.get("optional"):
+            miss = f" ({','.join(r['missing'])})" if r["missing"] else ""
+            status = f"{_YELLOW}WARN{miss}{_RESET}"
         else:
             miss = f" ({','.join(r['missing'])})" if r["missing"] else ""
             status = f"{_RED}MISSING{miss}{_RESET}"
@@ -329,12 +400,17 @@ def format_table(rows: list[dict]) -> str:
                    f"{r['version'][:42]:<42} {r['src']}: {r['path']}")
         if not r["ok"]:
             out.append(f"    {_YELLOW}->{_RESET} {r['hint']}")
-    n_bad = sum(1 for r in rows if not r["ok"])
+    n_ok = sum(1 for r in rows if r["ok"])
+    n_bad = sum(1 for r in rows if not r["ok"] and not r.get("optional"))
+    n_warn = sum(1 for r in rows if not r["ok"] and r.get("optional"))
     out.append("-" * 78)
     if n_bad:
-        out.append(f"{len(rows) - n_bad}/{len(rows)} dependencies OK; "
+        out.append(f"{n_ok}/{len(rows)} dependencies OK; "
                    f"{_RED}{n_bad} MISSING{_RESET}")
     else:
-        out.append(f"{_GREEN}{len(rows)}/{len(rows)} dependencies OK"
+        out.append(f"{_GREEN}{n_ok}/{len(rows)} dependencies OK"
                    f" — ready to run.{_RESET}")
+    if n_warn:
+        out.append(f"{_YELLOW}{n_warn} optional dependency warning(s) — "
+                   f"busco/omark features unavailable until installed.{_RESET}")
     return "\n".join(out)
