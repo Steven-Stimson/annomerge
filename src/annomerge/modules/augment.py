@@ -7,7 +7,7 @@ Design increment v2.3 (AnnoMerge_isoform模式设计增量_v2.3.md):
                   ORF as AS isoform; fusion donors naturally fail and drop.
   L2 goldset-only transcripts not overlapping any EVM gene -> genes by
                   overlap clustering (best ORF per transcript).
-  L3 de novo     at loci covered by neither -> W_raw arbitration (reuse
+  L3 de novo     at loci covered by neither -> P arbitration (reuse
                   priority._arbitrate_loci).
   UTR backfill   two-tier for UTR-less transcripts: tier1 StringTie donors
                   (no ORF required), tier2 de novo donors; <=5000bp/side.

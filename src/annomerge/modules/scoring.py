@@ -1,6 +1,7 @@
 """Module 3: predictor global scoring.
 
-W_raw = w_r * R_s + w_h * H_s'' + w_b * B_c + w_c * C_s   (defaults 0.45/0.25/0.15/0.15)
+P = w_r * R_s + w_h * H_s'' + w_b * B_c + w_o * O_s + w_c * C_s
+                                           (defaults 0.45/0.25/0.15/0.10/0.15)
 
 Sub-blocks:
   R_s = alpha * J_s* + beta * E_sp + gamma * M_e      (RNA support; 0.5/0.35/0.15)
@@ -10,6 +11,7 @@ Sub-blocks:
   H_s'': full-length bidirectional match rate of predictor proteins vs
       homolog referee set; enhanced by Gold set (--hs-gold-weight)
   B_c : BUSCO complete recall (proteins mode, local lineage, offline)
+  O_s : OMArk Consistent fraction (needs --omark-db; skipped otherwise)
   C_s : 1 - structural anomaly rate (chimeric / split heuristics via homolog hits)
 
 Degradation: missing evidence -> NA + weight renormalization (w_i/(1-w_missing));
@@ -315,6 +317,23 @@ def compute_bc(pred_faa: Path, busco_path: Path, out_dir: Path, threads: int) ->
     m = re.search(r"C:([\d.]+)%", summary_candidates[0].read_text())
     bc = float(m.group(1)) / 100.0 if m else None
     return {"B_c": bc, "busco_summary": str(summary_candidates[0])}
+# ---------------------------------------------------------------- O_s
+def compute_os(pred_faa: Path, omark_db: Path, out_dir: Path, threads: int) -> dict:
+    """O_s: OMArk Consistent fraction (A: line of the .sum), 0..1.
+
+    Runs omamer search + omark per predictor protein set; cached under
+    out_dir (a *.sum file reuses the previous result).
+    """
+    from .omark import run_omark
+    ctx = run_omark(Path(pred_faa), Path(omark_db), ensure_dir(out_dir), threads)
+    if not ctx.get("ok"):
+        raise RuntimeError(f"OMArk failed for {pred_faa}: {ctx.get('error')}")
+    pct = ctx.get("consistent_pct")
+    os_ = float(pct) / 100.0 if pct is not None else None
+    return {"O_s": os_, "omark_consistent_pct": pct,
+            "omark_contamination_pct": ctx.get("contamination_pct"),
+            "omark_inconsistent": ctx.get("inconsistent"),
+            "omark_summary": ctx.get("summary_file")}
 
 
 # ---------------------------------------------------------------- C_s
@@ -436,7 +455,7 @@ def aggregate(subscores: dict[str, float | None],
 
 def map_weights(scores: dict[str, float | None], mapping: str = "linear",
                 min_score: float = 0.35) -> dict[str, int | None]:
-    """Map W_raw to EVM prediction weights 1..5.
+    """Map P (prediction score) to EVM prediction weights 1..5.
     >=2 predictors: relative scaling (linear: min-max; rank: by rank order).
     Single predictor: absolute mapping round(1 + 4*W). Below min_score -> None (excluded).
     """
@@ -540,6 +559,20 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
         detail.update(b)
         sub["B_c"] = b["B_c"]
 
+    # ---- O_s
+    if "omark" in ablate or not cfg.get("omark_db"):
+        sub["O_s"] = None
+        detail["O_s_note"] = "ablated" if "omark" in ablate else "no --omark-db"
+    else:
+        try:
+            o = compute_os(pred_faa, Path(cfg["omark_db"]), pdir / "omark", threads)
+            detail.update(o)
+            sub["O_s"] = o["O_s"]
+        except Exception as e:
+            log.warning("module 3 [%s]: O_s unavailable: %s", name, e)
+            sub["O_s"] = None
+            detail["O_s_note"] = f"omark failed: {e}"
+
     # ---- C_s
     if "structure" in ablate:
         sub["C_s"] = None
@@ -556,8 +589,9 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
         detail["C_s_note"] = "no homolog hits"
 
     w, eff = aggregate(sub, {"R_s": cfg["w_rna"], "H_s": cfg["w_homolog"],
-                             "B_c": cfg["w_conserve"], "C_s": cfg["w_structure"]})
-    detail["W_raw"] = w
+                             "B_c": cfg["w_conserve"], "O_s": cfg.get("w_omark", 0.0),
+                             "C_s": cfg["w_structure"]})
+    detail["P"] = w
     detail["subscores"] = sub
     detail["effective_weights"] = eff
     if sub.get("C_s") is not None and detail.get("r_anomaly") is not None \
@@ -571,7 +605,7 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
         import json as _json
         _json.dump({k: v for k, v in detail.items() if not k.startswith("_")},
                    fh, indent=2, ensure_ascii=False, default=str)
-    log.info("module 3 [%s] W_raw=%s subscores=%s", name,
+    log.info("module 3 [%s] P=%s subscores=%s", name,
              f"{w:.4f}" if w is not None else "NA",
              {k: (f"{v:.3f}" if v is not None else "NA") for k, v in sub.items()})
     return detail

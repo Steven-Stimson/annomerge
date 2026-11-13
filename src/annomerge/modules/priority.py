@@ -10,8 +10,8 @@ predictor scenario). Instead of EVM weighted consensus:
      to the highest-scored predictor's copy.
   5. locus arbitration: a locus contested by several predictors (different
      structures, same seqid+strand, overlapping spans) is OWNED by the
-     highest-scoring predictor (W_raw, tie-break R_s); its transcripts there
-     are kept, lower scorers' are dropped. Exact (W_raw, R_s) ties keep every
+     highest-scoring predictor (P, tie-break R_s); its transcripts there
+     are kept, lower scorers' are dropped. Exact (P, R_s) ties keep every
      tied predictor's transcripts and are flagged in the stats.
 Output is a gene/mRNA/exon/CDS GFF3 in the same shape as the EVM output, so
 module 5b (sanity filter) and module 6 (confidence tiering) run unchanged.
@@ -65,7 +65,7 @@ def _overlaps(index: dict, seqid: str, strand: str, s: int, e: int) -> bool:
 
 # ---------------------------------------------------------------- merge
 def _sc(scores: dict | None, name: str) -> float:
-    """Predictor W_raw (0.0 if unknown)."""
+    """Predictor P (0.0 if unknown)."""
     if not scores:
         return 0.0
     v = scores.get(name, (0.0, 0.0))[0]
@@ -73,7 +73,7 @@ def _sc(scores: dict | None, name: str) -> float:
 
 
 def _rs(scores: dict | None, name: str) -> float:
-    """Predictor R_s, tie-breaker after W_raw (0.0 if unknown)."""
+    """Predictor R_s, tie-breaker after P (0.0 if unknown)."""
     if not scores:
         return 0.0
     v = scores.get(name, (0.0, 0.0))[1]
@@ -92,7 +92,7 @@ def _arbitrate_loci(records: list) -> tuple:
     """Group records into overlap-connected loci per (seqid, strand); the
     highest-scoring predictor OWNS each locus (all its tx there are kept).
     Different-structure-same-locus tx from lower-scoring predictors are
-    dropped. Tie at (W_raw, R_s) -> keep every tied predictor's tx, flagged.
+    dropped. Tie at (P, R_s) -> keep every tied predictor's tx, flagged.
 
     Returns (kept_records, stats). Local evidence override (design doc d):
     intentionally not implemented yet — global score is the only arbiter.
@@ -145,7 +145,7 @@ def _arbitrate_loci(records: list) -> tuple:
 def run_priority_merge(vi, out_dir: Path, preds: dict,
                        stringtie_gtf: Path, goldset_dir: Path,
                        scores: dict | None = None) -> dict:
-    """preds: {name: gff3_path}; scores: {name: (W_raw, R_s)} or None.
+    """preds: {name: gff3_path}; scores: {name: (P, R_s)} or None.
     Returns {merged_gff3, goldset_gff, dir, stats}.
 
     goldset transcripts are kept verbatim. de novo transcripts at goldset-free
@@ -153,7 +153,7 @@ def run_priority_merge(vi, out_dir: Path, preds: dict,
     exon set collapses to the highest-scored copy; (2) per-locus arbitration —
     at a locus contested by >1 predictor, the highest-scoring predictor owns
     the locus and its transcripts there are kept (different structures from
-    lower scorers are dropped; exact (W_raw, R_s) ties keep all tied, flagged).
+    lower scorers are dropped; exact (P, R_s) ties keep all tied, flagged).
     """
     d = ensure_dir(Path(out_dir))
     log.info("module 4/5 [priority]: %d predictors + goldset", len(preds))

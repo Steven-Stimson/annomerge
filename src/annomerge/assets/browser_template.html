@@ -195,8 +195,8 @@ let sortDir = "asc";
 let chromOrder = new Map();   // chrom name -> index in fai
 let denovoMeta = [];          // [{pred, w, color}]
 function wTag(d) {
-  // " (W=0.86)" suffix, hidden when the run carries no predictor scores
-  return (d.w === null || d.w === undefined) ? "" : " (W=" + Number(d.w).toFixed(2) + ")";
+  // " (score=0.86)" suffix, hidden when the run carries no predictor scores
+  return (d.w === null || d.w === undefined) ? "" : " (score=" + Number(d.w).toFixed(2) + ")";
 }
 function setStatus(msg) { document.getElementById("status").textContent = msg; }
 function gidNum(g) {

@@ -174,20 +174,22 @@ def _run_evidence_pipeline(
 
 
 _SCORING_FORMULA = """
-[bold]Scoring model[/bold] (module 3 — every de novo predictor gets one W_raw):
+[bold]Scoring model[/bold] (module 3 — every de novo predictor gets one P (Prediction score)):
 
-    W_raw = w_r·R_s + w_h·H_s + w_b·B_c + w_c·C_s   (default 0.45/0.25/0.15/0.15)
+    P = w_r·R_s + w_h·H_s + w_b·B_c + w_o·O_s + w_c·C_s
+                                          (default 0.45/0.25/0.15/0.10/0.15)
 
   R_s  RNA support: junction/exon coverage + expression (internals α/β/γ, see --rna-weights)
   H_s  homolog support: full-length miniprot hits vs referee proteins and the
        RNA-assembled Gold set (gold-set share = --hs-gold-weight)
   B_c  conservation: BUSCO complete recall in proteins mode (needs --busco-lineage)
+  O_s  orthology consistency: OMArk Consistent fraction (needs --omark-db)
   C_s  structure: 1 − anomaly rate (chimeric / split heuristics from homolog hit patterns)
 
 Sub-blocks without evidence are skipped and the remaining weights are
 renormalized. A predictor is hard-rejected (EXCLUDE, never enters EVM) when
 its anomaly rate exceeds --max-anomaly-rate or fewer than 2 sub-blocks are
-usable. W_raw is then mapped to integer EVM weights (--weight-mapping).
+usable. P is then mapped to integer EVM weights (--weight-mapping).
 """
 
 _MERGE_HELP = """[bold]merge[/bold]: score de novo predictors, calibrate EVM
@@ -320,6 +322,11 @@ def merge(
         0.15, "--w-structure",
         help="W_c: weight of the C_s (1 − structural anomaly rate) sub-block.",
         rich_help_panel="Scoring"),
+    w_omark: float = typer.Option(
+        0.10, "--w-omark",
+        help="W_o: weight of the O_s (OMArk consistent fraction) sub-block; "
+             "skipped without --omark-db.",
+        rich_help_panel="Scoring"),
     rna_weights: str = typer.Option(
         "0.5,0.35,0.15", "--rna-weights",
         help="R_s internals 'alpha,beta,gamma' (junction support, exon coverage, TPM).",
@@ -341,15 +348,15 @@ def merge(
         rich_help_panel="Scoring"),
     min_predictor_score: float = typer.Option(
         0.35, "--min-predictor-score",
-        help="Minimum W_raw for a predictor to enter EVM integration.",
+        help="Minimum P (prediction score) for a predictor to enter EVM integration.",
         rich_help_panel="Scoring"),
     weight_mapping: str = typer.Option(
         "linear", "--weight-mapping",
-        help="W_raw -> EVM integer weight mapping: [cyan]linear[/cyan] or [cyan]rank[/cyan].",
+        help="P -> EVM integer weight mapping: [cyan]linear[/cyan] or [cyan]rank[/cyan].",
         rich_help_panel="Scoring"),
     ablate: Optional[str] = typer.Option(
         None, "--ablate",
-        help="Comma list of sub-blocks to disable (rna,homolog,conserve,structure) "
+        help="Comma list of sub-blocks to disable (rna,homolog,conserve,omark,structure) "
              "— ablation experiments only.",
         rich_help_panel="Scoring"),
     # ---------------------------------------------------- EVM integration
@@ -511,29 +518,32 @@ def merge(
     a, b_, g_ = map(float, rna_weights.split(","))
     cfg = dict(rna_alpha=a, rna_beta=b_, rna_gamma=g_,
                w_rna=w_rna, w_homolog=w_homolog, w_conserve=w_conserve,
-               w_structure=w_structure, fulllength_cov=fulllength_cov,
+               w_structure=w_structure, w_omark=w_omark,
+               omark_db=omark_db,
+               fulllength_cov=fulllength_cov,
                hs_gold_weight=hs_gold_weight, max_anomaly_rate=max_anomaly_rate,
                ablate=(ablate.split(",") if ablate else []))
     preds = parse_predictors(predictors)
     score_dir = ensure_dir(out / "05.score")
-    details, wraw = {}, {}
+    details, p_scores = {}, {}
     for name, gff in preds.items():
         d = score_one_predictor(name, gff, vi, score_dir, threads, results, cfg)
         details[name] = d
-        wraw[name] = None if d.get("hard_reject") else d["W_raw"]
+        p_scores[name] = None if d.get("hard_reject") else d["P"]
 
-    evm_w = map_weights(wraw, mapping=weight_mapping, min_score=min_predictor_score)
+    evm_w = map_weights(p_scores, mapping=weight_mapping, min_score=min_predictor_score)
     wtab = score_dir / "evm_weights.tsv"
     with open(wtab, "w") as fh:
-        fh.write("predictor\tW_raw\tR_s\tH_s\tB_c\tC_s\tevm_weight\tnote\n")
+        fh.write("predictor\tP\tR_s\tH_s\tB_c\tO_s\tC_s\tevm_weight\tnote\n")
         for name in preds:
             d = details[name]
             s = d["subscores"]
             def f(x): return f"{x:.4f}" if isinstance(x, float) else "NA"
-            fh.write(f"{name}\t{f(d['W_raw'])}\\t{f(s['R_s'])}\\t{f(s['H_s'])}\\t"
-                     f"{f(s['B_c'])}\\t{f(s['C_s'])}\\t{evm_w.get(name) or 'EXCLUDE'}\\t"
-                     f"{d.get('hard_reject', '')}\\n")
-    typer.echo(f"\\n=== EVM weights ===\\n{wtab.read_text()}")
+            fh.write(f"{name}\t{f(d['P'])}\t{f(s['R_s'])}\t{f(s['H_s'])}\t"
+                     f"{f(s['B_c'])}\t{f(s.get('O_s'))}\t{f(s['C_s'])}\t"
+                     f"{evm_w.get(name) or 'EXCLUDE'}\t"
+                     f"{d.get('hard_reject', '')}\n")
+    typer.echo(f"\n=== EVM weights ===\n{wtab.read_text()}")
 
     # module 4/5: integration (skipped with --weight-only)
     if weight_only:
@@ -601,7 +611,7 @@ def merge(
             goldset_gff=integ_d / "goldset.genome.gff3",
             stringtie_gtf=stringtie_gtf,
             preds={name: preds[name] for name in evm_preds},
-            scores={n: (wraw.get(n) or 0.0,
+            scores={n: (p_scores.get(n) or 0.0,
                         (details.get(n, {}).get("subscores") or {}).get("R_s") or 0.0)
                     for n in evm_preds},
             jitter_merge_bp=aug_jitter_bp,

@@ -390,18 +390,18 @@ def _split_protein_tracks(pgff: Path, data_dir: Path,
 def build_tracks_json(preds: dict, details: dict, data_dir: Path,
                       out_json: Path, protein_tracks: list | None = None,
                       coverage: dict | None = None) -> list:
-    """denovo predictor tracks, colored by W_raw (desc). Copies each GFF3
+    """denovo predictor tracks, colored by P (desc). Copies each GFF3
     into data_dir as denovo_<name>.gff3. Also records the per-set protein
     tracks and the per-sample/merged RNA coverage metadata."""
     denovo = []
     for name, path in preds.items():
-        # W_raw comes from predictor scoring (merge mode); evaluate mode
-        # has no scoring -> w stays None and the browser hides the "W="
+        # P comes from predictor scoring (merge mode); evaluate mode
+        # has no scoring -> w stays None and the browser hides the "score="
         # suffix from de novo track names/cards.
         w = None
         d = (details or {}).get(name) or {}
-        if isinstance(d.get("W_raw"), (int, float)):
-            w = round(float(d["W_raw"]), 3)
+        if isinstance(d.get("P"), (int, float)):
+            w = round(float(d["P"]), 3)
         dst = data_dir / f"denovo_{name}.gff3"
         if Path(path).exists() and not dst.exists():
             inject_utr_features(Path(path), dst)
