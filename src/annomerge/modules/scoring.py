@@ -1,18 +1,17 @@
 """Module 3: predictor global scoring.
 
-P = w_r * R_s + w_h * H_s'' + w_c * C_s + w_b * B_c + w_o * O_s
-                                (defaults w_r=0.45, w_h=0.25, w_c=0.15, w_b=0.15, w_o=0.10)
+P = w_r * R_s + w_h * H_s'' + w_b * B_c + w_o * O_s
+                          (defaults w_r=0.45, w_h=0.40, w_b=0.15, w_o=0.10)
 
 Sub-blocks:
   R_s = alpha * J_s* + beta * E_sp + gamma * M_e      (RNA support; 0.5/0.35/0.15)
       J_s*: junction support rate (multi-intron transcripts only)
       E_sp: exon precision, gffcompare vs StringTie transcripts
       M_e : single-exon bias correction vs RNA single-exon fraction
-  H_s'': full-length bidirectional match rate of predictor proteins vs
-      homolog referee set; enhanced by Gold set (--hs-gold-weight)
-  C_s : 1 - structural anomaly rate (chimeric / split heuristics via homolog hits)
-      (H_s and C_s are the homolog-protein sub-blocks, derived from the same
-      miniprot referee hits)
+  H_s'': structure-aware homolog support — fraction of predicted proteins that
+      are BOTH full-length bidirectional matches vs the homolog referee set
+      AND structurally clean (no chimeric/split anomaly from the same
+      miniprot referee hits); enhanced by Gold set (--hs-gold-weight)
   B_c : BUSCO complete recall (proteins mode, local lineage, offline)
   O_s : OMArk Consistent fraction (needs --omark-db; skipped otherwise)
 
@@ -233,18 +232,23 @@ def _diamond_blastp(query: Path, db_faa: Path, out_tsv: Path, threads: int,
 
 
 def full_length_match_rate(blast_tsv: Path, min_cov: float = 0.9,
-                           subject_weights: dict | None = None) -> tuple[float, set, dict]:
+                           subject_weights: dict | None = None) -> tuple[float, set, dict, dict]:
     """Fraction of query proteins with >=1 hit satisfying bidirectional coverage.
 
     subject_weights: {subject_id: weight} — relatedness weights of homolog
     sets (0.5-2.0). When given, each matched query contributes
     weight(subject)/2 (so support from the closest possible set = 1.0 and
     the score stays in [0,1]); unmatched contribute 0.
+
+    Returns (rate, matched_qids, hits, qweight): qweight maps each matched
+    query to its weight contribution (1.0 when unweighted), so callers can
+    re-score any SUBSET of matched proteins with the same weighting (used by
+    the structure-aware joint H_s).
     """
     qtotal = set()
     matched = set()
+    qweight: dict[str, float] = {}
     hits: dict[str, list] = {}
-    wsum = 0.0
     with open(blast_tsv) as fh:
         for line in fh:
             f = line.rstrip("\n").split("\t")
@@ -260,15 +264,13 @@ def full_length_match_rate(blast_tsv: Path, min_cov: float = 0.9,
             })
             if qcov >= min_cov and scov >= min_cov and q not in matched:
                 matched.add(q)
-                if subject_weights:
-                    wsum += subject_weights.get(s, 1.0) / 2.0
+                qweight[q] = (subject_weights.get(s, 1.0) / 2.0
+                              if subject_weights else 1.0)
     if not qtotal:
         rate = None
-    elif subject_weights:
-        rate = wsum / len(qtotal)
     else:
-        rate = len(matched) / len(qtotal)
-    return rate, matched, hits
+        rate = sum(qweight.values()) / len(qtotal)
+    return rate, matched, hits, qweight
 
 
 def compute_hs(pred_faa: Path, referee_faa: Path, gold_faa: Path | None,
@@ -277,20 +279,25 @@ def compute_hs(pred_faa: Path, referee_faa: Path, gold_faa: Path | None,
                subject_weights: dict | None = None) -> dict:
     """H_s: full-length match rate vs referee set (relatedness-weighted when
     subject_weights given: support from closer homolog sets counts more).
-    The gold-set component is never weighted (same-genome proteins)."""
+    The gold-set component is never weighted (same-genome proteins).
+    _matched/_qweight expose the matched ids + per-protein weight so the
+    caller can compute the structure-aware joint rate (matched AND clean)."""
     hs_dir = ensure_dir(out_dir)
     out = {}
     tsv = _diamond_blastp(pred_faa, referee_faa, hs_dir / "pred_vs_referee.tsv",
                           threads, hs_dir)
-    hs_hom, matched, hits = full_length_match_rate(tsv, full_cov, subject_weights)
+    hs_hom, matched, hits, qweight = full_length_match_rate(
+        tsv, full_cov, subject_weights)
     out["Hs_homolog"] = hs_hom
     out["n_fullmatch_referee"] = len(matched)
+    out["_matched"] = matched
+    out["_qweight"] = qweight
 
     hs_gold = None
     if gold_faa and Path(gold_faa).exists():
         tsv_g = _diamond_blastp(pred_faa, gold_faa, hs_dir / "pred_vs_goldset.tsv",
                                 threads, hs_dir)
-        hs_gold, matched_g, _ = full_length_match_rate(tsv_g, full_cov)
+        hs_gold, matched_g, _, _ = full_length_match_rate(tsv_g, full_cov)
         out["Hs_gold"] = hs_gold
         out["n_fullmatch_gold"] = len(matched_g)
 
@@ -298,7 +305,7 @@ def compute_hs(pred_faa: Path, referee_faa: Path, gold_faa: Path | None,
         out["Hs"] = (1 - gold_weight) * hs_hom + gold_weight * hs_gold
     else:
         out["Hs"] = hs_hom if hs_hom is not None else hs_gold
-    out["_hits_cache"] = tsv  # reused by C_s
+    out["_hits_cache"] = tsv  # reused by the structural-anomaly scan
     return out
 
 
@@ -570,7 +577,7 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
         detail.update(r)
         sub["R_s"] = r["R_s"]
 
-    # ---- H_s''
+    # ---- H_s'' (structure-aware: full-length AND anomaly-free)
     if "homolog" in ablate:
         sub["H_s"] = None
         detail["H_s_note"] = "ablated"
@@ -582,8 +589,35 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
                        cfg["fulllength_cov"], cfg["hs_gold_weight"],
                        subject_weights=subject_weights)
         detail.update({k: v for k, v in h.items() if not k.startswith("_")})
-        sub["H_s"] = h["Hs"]
         detail["_hits_cache"] = h["_hits_cache"]
+        # joint criterion: from the full-length matched proteins, drop the
+        # structurally anomalous ones (chimeric / split) and recompute the
+        # (relatedness-weighted) match rate on the remaining clean set
+        if "structure" in ablate:
+            detail["H_s_note"] = "structure screen ablated: plain full-length rate"
+            sub["H_s"] = h["Hs"]
+        else:
+            loci = load_referee_loci(evidence["homolog"]["alignments"])
+            c = compute_cs(pred_faa, h["_hits_cache"], loci,
+                           subject_weights=subject_weights)
+            detail.update({k: v for k, v in c.items()
+                           if not isinstance(v, list) and k != "C_s"})
+            detail["anomalous_ids"] = sorted(set(c["chimeric_ids"]) | set(c["split_ids"]))
+            anomalous = set(c["chimeric_ids"]) | set(c["split_ids"])
+            n_pred = sum(1 for l in open(pred_faa) if l.startswith(">"))
+            clean = h["_matched"] - anomalous
+            if not n_pred:
+                hs_hom_joint = None
+            else:
+                hs_hom_joint = sum(h["_qweight"].get(q, 1.0) for q in clean) / n_pred
+            detail["Hs_homolog_joint"] = hs_hom_joint
+            detail["n_fullmatch_clean"] = len(clean)
+            hs_gold = h.get("Hs_gold")
+            gw = cfg["hs_gold_weight"]
+            if hs_gold is not None and hs_hom_joint is not None:
+                sub["H_s"] = (1 - gw) * hs_hom_joint + gw * hs_gold
+            else:
+                sub["H_s"] = hs_hom_joint if hs_hom_joint is not None else hs_gold
 
     # ---- B_c
     if "conserve" in ablate or not vi.busco:
@@ -608,30 +642,14 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
             sub["O_s"] = None
             detail["O_s_note"] = f"omark failed: {e}"
 
-    # ---- C_s
-    if "structure" in ablate:
-        sub["C_s"] = None
-        detail["C_s_note"] = "ablated"
-    elif detail.get("_hits_cache"):
-        loci = load_referee_loci(evidence["homolog"]["alignments"])
-        c = compute_cs(pred_faa, detail["_hits_cache"], loci,
-                       subject_weights=subject_weights)
-        detail.update({k: v for k, v in c.items() if not isinstance(v, list)})
-        detail["anomalous_ids"] = sorted(set(c["chimeric_ids"]) | set(c["split_ids"]))
-        sub["C_s"] = c["C_s"]
-    else:
-        sub["C_s"] = None
-        detail["C_s_note"] = "no homolog hits"
-
     weights = {"R_s": cfg["w_rna"], "H_s": cfg["w_homolog"],
-               "B_c": cfg["w_conserve"], "O_s": cfg.get("w_omark", 0.0),
-               "C_s": cfg["w_structure"]}
+               "B_c": cfg["w_conserve"], "O_s": cfg.get("w_omark", 0.0)}
     coverage = None
     if cfg.get("weight_mode") == "adaptive":
         # adaptive: scale each database-driven sub-block by its informative
-        # coverage (fraction of proteins with a usable verdict); R_s/H_s/C_s
+        # coverage (fraction of proteins with a usable verdict); R_s/H_s
         # are global rate metrics over the whole prediction -> 1.0
-        coverage = {"R_s": 1.0, "H_s": 1.0, "C_s": 1.0,
+        coverage = {"R_s": 1.0, "H_s": 1.0,
                     "B_c": detail.get("B_c_informative") or 0.0,
                     "O_s": detail.get("O_s_informative") or 0.0}
         detail["informative_coverage"] = coverage

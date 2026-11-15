@@ -139,15 +139,15 @@ distributions below):</p>
 
 {% if integ %}
 <h3>2.4 Scoring</h3>
-<p class="formula">P = w_r&middot;R_s + w_h&middot;H_s + w_c&middot;C_s + w_b&middot;B_c + w_o&middot;O_s
-&nbsp;&nbsp;(default w_r=0.45, w_h=0.25, w_c=0.15, w_b=0.15, w_o=0.10)</p>
-<p class="muted">H_s and C_s are the homolog-protein sub-blocks: both derive from the
-same miniprot referee hits (H_s = full-length match rate; C_s = 1 &minus;
-chimeric/split anomaly rate). Missing sub-blocks are skipped and the
-remaining weights renormalized; with <code>--weight-mode adaptive</code> the
-B_c / O_s weights are additionally scaled by their informative coverage (the
-fraction of proteins the database actually gave a verdict on). Per-predictor
-P composition:</p>
+<p class="formula">P = w_r&middot;R_s + w_h&middot;H_s + w_b&middot;B_c + w_o&middot;O_s
+&nbsp;&nbsp;(default w_r=0.45, w_h=0.40, w_b=0.15, w_o=0.10)</p>
+<p class="muted">H_s is structure-aware: a predicted protein counts only when it
+has a full-length referee match AND is free of chimeric/split anomalies
+(both criteria derive from the same miniprot hits). Missing sub-blocks are
+skipped and the remaining weights renormalized; with <code>--weight-mode
+adaptive</code> the B_c / O_s weights are additionally scaled by their
+informative coverage (the fraction of proteins the database actually gave a
+verdict on). Per-predictor P composition:</p>
 {% if integ.scoring_notes %}
 <table>
   <tr><th>Predictor</th><th>Effective weights</th><th>Sub-blocks not scored</th><th>Informative coverage &lt; 1</th></tr>
@@ -215,10 +215,10 @@ augment was performed (sections 2.4-2.6 are merge-only).</p>
 <p>The final annotation scored with the same P formula as the de novo
 predictors (fixed default weights):</p>
 <table>
-  <tr><th>P</th><th>R_s</th><th>H_s</th><th>C_s</th><th>B_c</th><th>O_s</th></tr>
+  <tr><th>P</th><th>R_s</th><th>H_s</th><th>B_c</th><th>O_s</th></tr>
   <tr>
     <td class="num"><strong>{{ "%.4f"|format(final_score.P) if final_score.P is not none else "NA" }}</strong></td>
-    {% for k in ["R_s", "H_s", "C_s", "B_c", "O_s"] %}
+    {% for k in ["R_s", "H_s", "B_c", "O_s"] %}
     <td class="num">{{ "%.4f"|format(final_score.subscores[k]) if final_score.subscores.get(k) is not none else "NA" }}</td>
     {% endfor %}
   </tr>

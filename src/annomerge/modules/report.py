@@ -725,7 +725,7 @@ def final_annotation_score(out: Path, final_gff3: Path, genome_fa: Path,
                            homologs_faa=None, referee_ids=None) -> dict | None:
     """Score the FINAL annotation with the same P formula as the predictors
     (fixed default weights). B_c / O_s reuse the BUSCO / OMArk results already
-    computed for this report; R_s / H_s / C_s are computed on the final GFF3
+    computed for this report; R_s / H_s are computed on the final GFF3
     and cached under 08.assessment/final_scoring."""
     from .scoring import (compute_rs, compute_hs, compute_cs, aggregate,
                           extract_referee_faa, load_referee_loci,
@@ -748,24 +748,28 @@ def final_annotation_score(out: Path, final_gff3: Path, genome_fa: Path,
                                           work / "referee.faa")
         if ref_faa:
             h = compute_hs(pred_faa, ref_faa, None, work / "hs", threads, 0.9)
-            sub["H_s"] = h["Hs"]
             alignments = Path(out) / "03.homolog" / "alignments.tsv"
             if alignments.exists() and h.get("_hits_cache"):
+                # structure-aware joint H_s: full-length AND anomaly-free
                 loci = load_referee_loci(alignments)
                 c = compute_cs(pred_faa, h["_hits_cache"], loci)
-                sub["C_s"] = c["C_s"]
+                anomalous = set(c["chimeric_ids"]) | set(c["split_ids"])
+                clean = h["_matched"] - anomalous
+                n_pred = sum(1 for l in open(pred_faa) if l.startswith(">"))
+                sub["H_s"] = (sum(h["_qweight"].get(q, 1.0) for q in clean) / n_pred
+                              if n_pred else None)
             else:
-                sub["C_s"] = None
+                sub["H_s"] = h["Hs"]
         else:
-            sub["H_s"] = sub["C_s"] = None
+            sub["H_s"] = None
         busco = ctx.get("busco") or {}
         sub["B_c"] = (busco["complete_pct"] / 100.0) \
             if busco.get("ok") and busco.get("complete_pct") is not None else None
         omark = ctx.get("omark") or {}
         sub["O_s"] = (float(omark["consistent_pct"]) / 100.0) \
             if omark.get("ok") and omark.get("consistent_pct") is not None else None
-        w, eff = aggregate(sub, {"R_s": 0.45, "H_s": 0.25, "B_c": 0.15,
-                                 "O_s": 0.10, "C_s": 0.15})
+        w, eff = aggregate(sub, {"R_s": 0.45, "H_s": 0.40, "B_c": 0.15,
+                                 "O_s": 0.10})
         log.info("final annotation P=%s subscores=%s",
                  f"{w:.4f}" if w is not None else "NA",
                  {k: (f"{v:.3f}" if isinstance(v, float) else "NA")
