@@ -372,10 +372,278 @@ def render_html(ctx: dict, out_html: Path,
                       versions=ctx.get("versions", {}),
                       assessment=ctx.get("assessment", {}),
                       integ=ctx.get("integ"),
+                      workflow=ctx.get("workflow", {}),
+                      tags=ctx.get("tags", {}),
+                      final_score=ctx.get("final_score"),
                       orthodb=ctx.get("orthodb"))
     Path(out_html).write_text(html)
     log.info("report html -> %s", out_html)
     return Path(out_html)
+
+
+# --------------------------------------------------------- inline SVG charts
+def _esc(s: str) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def svg_bars(rows: list, maxv: float = 100.0, width: int = 520,
+             bar_h: int = 18, color: str = "#4C72B0") -> str:
+    """Horizontal percentage bar chart as inline SVG (no JS, offline-safe)."""
+    if not rows:
+        return ""
+    label_w = max(80, min(220, max(len(str(r[0])) for r in rows) * 7 + 12))
+    h = (bar_h + 6) * len(rows) + 10
+    plot_w = width - label_w - 70
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{h}" '
+             f'font-family="Helvetica,Arial,sans-serif" font-size="12">']
+    y = 5
+    for label, v in rows:
+        w = max(1.0, plot_w * min(float(v), maxv) / maxv)
+        parts.append(f'<text x="{label_w - 6}" y="{y + bar_h - 5}" '
+                     f'text-anchor="end">{_esc(label)}</text>')
+        parts.append(f'<rect x="{label_w}" y="{y}" width="{w:.1f}" '
+                     f'height="{bar_h}" fill="{color}" rx="2"/>')
+        parts.append(f'<text x="{label_w + w + 6:.1f}" y="{y + bar_h - 5}">'
+                     f'{float(v):.1f}%</text>')
+        y += bar_h + 6
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def svg_histogram(vals: list, bins: int = 20, width: int = 520,
+                  height: int = 170, color: str = "#4C72B0",
+                  title: str = "") -> str:
+    """Vertical histogram of values in [0,1] as inline SVG."""
+    vals = [float(v) for v in vals if v is not None]
+    if not vals:
+        return ""
+    lo, hi = min(vals), max(vals)
+    span = (hi - lo) or 1e-9
+    counts = [0] * bins
+    for v in vals:
+        i = min(bins - 1, int((v - lo) / span * bins))
+        counts[i] += 1
+    top = max(counts) or 1
+    pad_l, pad_b, pad_t = 44, 30, 22
+    plot_w, plot_h = width - pad_l - 12, height - pad_b - pad_t
+    bw = plot_w / bins
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+             f'font-family="Helvetica,Arial,sans-serif" font-size="11">']
+    if title:
+        parts.append(f'<text x="{pad_l}" y="14" font-size="12" font-weight="bold">'
+                     f'{_esc(title)}</text>')
+    for i, c in enumerate(counts):
+        bh = plot_h * c / top
+        x = pad_l + i * bw
+        parts.append(f'<rect x="{x:.1f}" y="{pad_t + plot_h - bh:.1f}" '
+                     f'width="{max(bw - 1.5, 1):.1f}" height="{bh:.1f}" '
+                     f'fill="{color}"/>')
+    # axes + x range labels
+    parts.append(f'<line x1="{pad_l}" y1="{pad_t + plot_h}" x2="{width - 12}" '
+                 f'y2="{pad_t + plot_h}" stroke="#888"/>')
+    parts.append(f'<text x="{pad_l}" y="{height - 10}">{lo:.2f}</text>')
+    parts.append(f'<text x="{width - 12}" y="{height - 10}" text-anchor="end">{hi:.2f}</text>')
+    parts.append(f'<text x="{pad_l - 6}" y="{pad_t + 10}" text-anchor="end">{top}</text>')
+    parts.append(f'<text x="{pad_l - 6}" y="{pad_t + plot_h}" text-anchor="end">0</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+# ------------------------------------------------- workflow evidence figures
+def rna_alignment_stats(out: Path) -> list:
+    """Per-sample HISAT2 overall alignment rate from 02.rnaseq/bam/*.hisat2.log."""
+    rows = []
+    for logf in sorted(Path(out).glob("02.rnaseq/bam/*.hisat2.log")):
+        m = re.search(r"([\d.]+)% overall alignment rate",
+                      logf.read_text(errors="ignore"))
+        if m:
+            rows.append({"sample": logf.name.replace(".hisat2.log", ""),
+                         "rate": float(m.group(1))})
+    return rows
+
+
+def protein_alignment_stats(out: Path) -> dict:
+    """Homolog protein alignment: coverage/identity distributions + mnp filter."""
+    res: dict = {"qcov": [], "ident": [], "n_mapped": 0, "n_raw": 0,
+                 "mnp_rows": [], "mnp_removed": 0}
+    tsv = Path(out) / "03.homolog" / "alignments.tsv"
+    if tsv.exists():
+        seen: set = set()
+        with open(tsv) as fh:
+            header = next(fh).rstrip("\n").split("\t")
+            ci = {n: i for i, n in enumerate(header)}
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                if len(f) < len(header):
+                    continue
+                q = f[ci["query"]]
+                if q in seen:          # one record per protein for the distribution
+                    continue
+                seen.add(q)
+                res["qcov"].append(float(f[ci["qcov"]]))
+                res["ident"].append(float(f[ci["ident"]]))
+        res["n_mapped"] = len(seen)
+    raw_paf = Path(out) / "03.homolog" / "miniprot.raw.paf"
+    if raw_paf.exists():
+        queries: set = set()
+        with open(raw_paf) as fh:
+            for line in fh:
+                queries.add(line.split("\t", 1)[0])
+        res["n_raw"] = len(queries)
+    mnp = Path(out) / "03.homolog" / "mnp_filter.tsv"
+    if mnp.exists():
+        with open(mnp) as fh:
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                if len(f) == 2 and f[0] != "reason" and f[1].isdigit():
+                    res["mnp_rows"].append((f[0], int(f[1])))
+                    res["mnp_removed"] += int(f[1])
+    return res
+
+
+def goldset_stats(out: Path) -> dict:
+    """Gold set: StringTie transcripts in, TransDecoder ORFs out, protein length."""
+    gdir = Path(out) / "04.goldset"
+    res: dict = {}
+    t_fa, g_fa = gdir / "transcripts.fa", gdir / "goldset.faa"
+    if t_fa.exists():
+        res["n_transcripts"] = sum(1 for l in open(t_fa) if l.startswith(">"))
+    if g_fa.exists():
+        lens, cur = [], 0
+        for l in open(g_fa):
+            if l.startswith(">"):
+                if cur:
+                    lens.append(cur)
+                cur = 0
+            else:
+                cur += len(l.strip())
+        if cur:
+            lens.append(cur)
+        res["n_proteins"] = len(lens)
+        if lens:
+            lens.sort()
+            res["median_protein_aa"] = lens[len(lens) // 2]
+            res["mean_protein_aa"] = round(sum(lens) / len(lens), 1)
+    return res
+
+
+def _read_kv(tsv: Path) -> dict:
+    out: dict = {}
+    if tsv.exists():
+        for line in open(tsv):
+            f = line.rstrip("\n").split("\t")
+            if len(f) == 2 and f[0] != "key":
+                out[f[0]] = f[1]
+    return out
+
+
+# ------------------------------------------------- final-annotation scoring
+def final_annotation_score(out: Path, final_gff3: Path, genome_fa: Path,
+                           threads: int, ctx: dict,
+                           rna_junctions=None, stringtie_gtf=None,
+                           homologs_faa=None, referee_ids=None) -> dict | None:
+    """Score the FINAL annotation with the same P formula as the predictors
+    (fixed default weights). B_c / O_s reuse the BUSCO / OMArk results already
+    computed for this report; R_s / H_s / C_s are computed on the final GFF3
+    and cached under 08.assessment/final_scoring."""
+    from .scoring import (compute_rs, compute_hs, compute_cs, aggregate,
+                          extract_referee_faa, load_referee_loci,
+                          extract_proteins)
+    work = ensure_dir(Path(out) / "08.assessment" / "final_scoring")
+    sub: dict = {}
+    try:
+        pred_faa = extract_proteins(Path(genome_fa), Path(final_gff3),
+                                    work / "proteins.faa")
+        if rna_junctions and stringtie_gtf and Path(str(rna_junctions)).exists():
+            r = compute_rs(Path(final_gff3), Path(str(rna_junctions)),
+                           Path(str(stringtie_gtf)), work, 0.5, 0.35, 0.15)
+            sub["R_s"] = r["R_s"]
+        else:
+            sub["R_s"] = None
+        ref_faa = None
+        if homologs_faa and referee_ids and Path(str(referee_ids)).exists():
+            ref_faa = extract_referee_faa(Path(str(homologs_faa)),
+                                          Path(str(referee_ids)),
+                                          work / "referee.faa")
+        if ref_faa:
+            h = compute_hs(pred_faa, ref_faa, None, work / "hs", threads, 0.9)
+            sub["H_s"] = h["Hs"]
+            alignments = Path(out) / "03.homolog" / "alignments.tsv"
+            if alignments.exists() and h.get("_hits_cache"):
+                loci = load_referee_loci(alignments)
+                c = compute_cs(pred_faa, h["_hits_cache"], loci)
+                sub["C_s"] = c["C_s"]
+            else:
+                sub["C_s"] = None
+        else:
+            sub["H_s"] = sub["C_s"] = None
+        busco = ctx.get("busco") or {}
+        sub["B_c"] = (busco["complete_pct"] / 100.0) \
+            if busco.get("ok") and busco.get("complete_pct") is not None else None
+        omark = ctx.get("omark") or {}
+        sub["O_s"] = (float(omark["consistent_pct"]) / 100.0) \
+            if omark.get("ok") and omark.get("consistent_pct") is not None else None
+        w, eff = aggregate(sub, {"R_s": 0.45, "H_s": 0.25, "B_c": 0.15,
+                                 "O_s": 0.10, "C_s": 0.15})
+        log.info("final annotation P=%s subscores=%s",
+                 f"{w:.4f}" if w is not None else "NA",
+                 {k: (f"{v:.3f}" if isinstance(v, float) else "NA")
+                  for k, v in sub.items()})
+        return {"P": w, "subscores": sub,
+                "effective_weights": {k: round(v, 3) for k, v in eff.items() if v > 0}}
+    except Exception as e:
+        log.warning("final annotation scoring failed: %s", e)
+        return None
+
+
+# --------------------------------------------------------------- tag table
+def tag_overview(final_gff3: Path) -> dict:
+    """Count every support tag written onto the final GFF3 (transcript-level
+    for Tier/RNA/protein/denovo/flags, gene-level for BUSCO/OMArk)."""
+    tiers, flags, denovo = Counter(), Counter(), Counter()
+    rna_yes = prot_yes = busco_sup = omark_sup = n_tx = 0
+    with open(final_gff3) as fh:
+        for ln in fh:
+            if ln.startswith("#"):
+                continue
+            f = ln.rstrip("\n").split("\t")
+            if len(f) < 9:
+                continue
+            attrs = f[8]
+            if f[2] == "mRNA":
+                n_tx += 1
+                m = re.search(r"Tier=([^;]+)", attrs)
+                if m:
+                    tiers[m.group(1)] += 1
+                m = re.search(r"RNA_support=([\d.]+)", attrs)
+                if m and float(m.group(1)) > 0:
+                    rna_yes += 1
+                m = re.search(r"Protein_support=([\d.]+)", attrs)
+                if m and float(m.group(1)) > 0:
+                    prot_yes += 1
+                m = re.search(r"denovo_support=([^;]+)", attrs)
+                if m:
+                    for kv in m.group(1).split(","):
+                        k, _, v = kv.partition(":")
+                        try:
+                            if float(v) > 0:
+                                denovo[k] += 1
+                        except ValueError:
+                            pass
+                m = re.search(r"Flags=([^;]+)", attrs)
+                if m:
+                    for fl in m.group(1).split(","):
+                        fl = fl.strip()
+                        if fl and fl != ".":
+                            flags[fl] += 1
+            elif f[2] == "gene":
+                busco_sup += "BUSCO_support=" in attrs
+                omark_sup += "OMArk_support=" in attrs
+    return {"n_transcripts": n_tx, "tiers": dict(tiers),
+            "rna_supported": rna_yes, "protein_supported": prot_yes,
+            "denovo_supported": dict(denovo), "intrinsic_flags": dict(flags),
+            "busco_supported_genes": busco_sup, "omark_supported_genes": omark_sup}
 
 
 # ------------------------------------------------------------- orchestrate
@@ -537,7 +805,9 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
                final_d: Path, busco_lineage: Path | None,
                threads: int,
                run_meta: dict | None = None,
-               omark_db: Path | None = None) -> dict:
+               omark_db: Path | None = None,
+               rna_junctions=None, stringtie_gtf=None,
+               homologs_faa=None, referee_ids=None) -> dict:
     """Collect every report input; writes 09.result/report.html + stats.json
     and 08.assessment/BUSCO (+OMArk). Returns context."""
     d = ensure_dir(Path(out) / "09.result")
@@ -563,8 +833,26 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
         ctx["omark"] = None
     ctx["versions"] = software_versions()
     ctx["assessment"] = quality_assessment(ctx)
-    # integration-only sections 2.1/2.2 (None for evaluate runs)
+    # integration-only sections 2.4-2.6 (None for evaluate runs)
     ctx["integ"] = _integration_stats(out, final_gff3)
+    # workflow evidence figures (section 2)
+    wf = {
+        "mode": (run_meta or {}).get("mode"),
+        "rna_align": rna_alignment_stats(out),
+        "protein": protein_alignment_stats(out),
+        "goldset": goldset_stats(out),
+        "augment": _read_kv(Path(out) / "07.augment" / "augment_stats.tsv"),
+    }
+    from markupsafe import Markup
+    wf["rna_chart"] = Markup(svg_bars(
+        [(r["sample"], r["rate"]) for r in wf["rna_align"]]))
+    wf["qcov_hist"] = Markup(svg_histogram(
+        wf["protein"].get("qcov") or [], title="Query coverage (fraction of protein aligned)"))
+    wf["ident_hist"] = Markup(svg_histogram(
+        wf["protein"].get("ident") or [], title="Alignment identity"))
+    ctx["workflow"] = wf
+    # support-tag census (section 3.4)
+    ctx["tags"] = tag_overview(final_gff3)
     # orthology-database support tags (gene level): runs only when a BUSCO
     # lineage and/or an OMAmer DB was provided AND produced results; writes
     # BUSCO_support/BUSCO_group/OMArk_support/OMArk_HOG onto gene rows of the
@@ -582,6 +870,11 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
         "busco_lineage": Path(busco_lineage).name if busco_lineage else None,
         "omark_db": Path(omark_db).name if omark_db else None,
     }
+    # section 3.0: score the final annotation with the predictor P formula
+    ctx["final_score"] = final_annotation_score(
+        out, final_gff3, genome_fa, threads, ctx,
+        rna_junctions=rna_junctions, stringtie_gtf=stringtie_gtf,
+        homologs_faa=homologs_faa, referee_ids=referee_ids)
     # finish time + elapsed, for section 1 (Run Summary)
     from datetime import datetime
     _end = datetime.now()

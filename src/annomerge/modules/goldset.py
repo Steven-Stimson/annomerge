@@ -78,7 +78,7 @@ def run_goldset(vi: ValidatedInputs, out_dir: Path, threads: int,
     td_dir = gdir / "transdecoder"
     orfs = gdir / "transcripts.fa.transdecoder_dir" / "longest_orfs.pep"
     if not lazy([orfs], desc="TransDecoder.LongOrfs"):
-        run(f"cd {gdir} && {which('TransDecoder.LongOrfs')} -t {tfa} -m {min_orf_aa} "
+        run(f"cd {gdir} && {which('TransDecoder.LongOrfs')} -t {tfa.resolve()} -m {min_orf_aa} "
             + " ".join(lo_opts),
             shell=True, log_file=gdir / "longorfs.log", desc="TransDecoder.LongOrfs")
 
@@ -98,8 +98,8 @@ def run_goldset(vi: ValidatedInputs, out_dir: Path, threads: int,
     # 4. TransDecoder.Predict with homology retention
     final_pep = gdir / "transcripts.fa.transdecoder.pep"
     if not lazy([final_pep], desc="TransDecoder.Predict"):
-        run(f"cd {gdir} && {which('TransDecoder.Predict')} -t {tfa} "
-            f"--retain_blastp_hits {blast_out} "
+        run(f"cd {gdir} && {which('TransDecoder.Predict')} -t {tfa.resolve()} "
+            f"--retain_blastp_hits {blast_out.resolve()} "
             + " ".join(lo_opts + pr_opts),
             shell=True, log_file=gdir / "predict.log", desc="TransDecoder.Predict")
 
