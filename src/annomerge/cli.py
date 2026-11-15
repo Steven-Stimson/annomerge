@@ -187,9 +187,11 @@ _SCORING_FORMULA = """
   C_s  structure: 1 − anomaly rate (chimeric / split heuristics from homolog hit patterns)
 
 Sub-blocks without evidence are skipped and the remaining weights are
-renormalized. A predictor enters EVM only when its P reaches
---min-predictor-score (and a P cannot be computed at all with fewer than
-2 usable sub-blocks). P is then mapped to integer EVM weights
+renormalized (--weight-mode adaptive additionally scales the B_c / O_s
+weights by their informative coverage — the fraction of proteins the
+database actually gave a verdict on). A predictor enters EVM only when its
+P reaches --min-predictor-score (and a P cannot be computed at all with
+fewer than 2 usable sub-blocks). P is then mapped to integer EVM weights
 (--weight-mapping).
 """
 
@@ -350,6 +352,13 @@ def merge(
         "linear", "--weight-mapping",
         help="P -> EVM integer weight mapping: [cyan]linear[/cyan] or [cyan]rank[/cyan].",
         rich_help_panel="Scoring"),
+    weight_mode: str = typer.Option(
+        "fixed", "--weight-mode",
+        help="P aggregation mode: [cyan]fixed[/cyan] (default, classic) or "
+             "[cyan]adaptive[/cyan] (scale the B_c / O_s sub-block weights by "
+             "their informative coverage — the fraction of proteins the "
+             "database actually gave a verdict on).",
+        rich_help_panel="Scoring"),
     ablate: Optional[str] = typer.Option(
         None, "--ablate",
         help="Comma list of sub-blocks to disable (rna,homolog,conserve,omark,structure) "
@@ -478,6 +487,10 @@ def merge(
     if vw not in ("full", "lite", "no"):
         typer.secho(f"unknown --viewer {viewer!r} (full|lite|no)", fg="red", err=True)
         raise typer.Exit(2)
+    wm = weight_mode.lower()
+    if wm not in ("fixed", "adaptive"):
+        typer.secho(f"unknown --weight-mode {weight_mode!r} (fixed|adaptive)", fg="red", err=True)
+        raise typer.Exit(2)
     evm_opts = _parse_evm_options(evm_options)
     try:
         hisat2_opts = parse_extra_opts(
@@ -518,6 +531,7 @@ def merge(
                omark_db=omark_db,
                fulllength_cov=fulllength_cov,
                hs_gold_weight=hs_gold_weight,
+               weight_mode=weight_mode,
                ablate=(ablate.split(",") if ablate else []))
     preds = parse_predictors(predictors)
     score_dir = ensure_dir(out / "05.score")
@@ -530,13 +544,16 @@ def merge(
     evm_w = map_weights(p_scores, mapping=weight_mapping, min_score=min_predictor_score)
     wtab = score_dir / "evm_weights.tsv"
     with open(wtab, "w") as fh:
-        fh.write("predictor\tP\tR_s\tH_s\tB_c\tO_s\tC_s\tevm_weight\tnote\n")
+        fh.write("predictor\tP\tR_s\tH_s\tB_c\tO_s\tC_s\teffective_weights\tevm_weight\tnote\n")
         for name in preds:
             d = details[name]
             s = d["subscores"]
             def f(x): return f"{x:.4f}" if isinstance(x, float) else "NA"
+            eff = ";".join(f"{k}={v:.3f}" for k, v in
+                           (d.get("effective_weights") or {}).items() if v > 0)
             fh.write(f"{name}\t{f(d['P'])}\t{f(s['R_s'])}\t{f(s['H_s'])}\t"
                      f"{f(s['B_c'])}\t{f(s.get('O_s'))}\t{f(s['C_s'])}\t"
+                     f"{eff or 'NA'}\t"
                      f"{evm_w.get(name) or 'EXCLUDE'}\t"
                      f"{d.get('hard_reject', '')}\n")
     typer.echo(f"\n=== EVM weights ===\n{wtab.read_text()}")

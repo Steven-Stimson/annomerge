@@ -316,7 +316,23 @@ def compute_bc(pred_faa: Path, busco_path: Path, out_dir: Path, threads: int) ->
     txt = summary_candidates[0].read_text()
     m = re.search(r"C:([\d.]+)%", summary_candidates[0].read_text())
     bc = float(m.group(1)) / 100.0 if m else None
-    return {"B_c": bc, "busco_summary": str(summary_candidates[0])}
+    out = {"B_c": bc, "busco_summary": str(summary_candidates[0])}
+    # informative coverage: fraction of predicted proteins assigned to any
+    # BUSCO group (non-Missing rows of full_table.tsv)
+    tables = sorted(bdir.glob("busco_out/run_*/full_table.tsv"))
+    if tables:
+        assessed: set = set()
+        with open(tables[0]) as fh:
+            for ln in fh:
+                if ln.startswith("#"):
+                    continue
+                f = ln.rstrip("\n").split("\t")
+                if len(f) >= 3 and f[1] != "Missing" and f[2]:
+                    assessed.add(f[2])
+        n_pred = sum(1 for l in open(pred_faa) if l.startswith(">"))
+        out["n_busco_assessed"] = len(assessed)
+        out["B_c_informative"] = len(assessed) / n_pred if n_pred else None
+    return out
 # ---------------------------------------------------------------- O_s
 def compute_os(pred_faa: Path, omark_db: Path, out_dir: Path, threads: int) -> dict:
     """O_s: OMArk Consistent fraction (A: line of the .sum), 0..1.
@@ -330,10 +346,19 @@ def compute_os(pred_faa: Path, omark_db: Path, out_dir: Path, threads: int) -> d
         raise RuntimeError(f"OMArk failed for {pred_faa}: {ctx.get('error')}")
     pct = ctx.get("consistent_pct")
     os_ = float(pct) / 100.0 if pct is not None else None
-    return {"O_s": os_, "omark_consistent_pct": pct,
-            "omark_contamination_pct": ctx.get("contamination_pct"),
-            "omark_inconsistent": ctx.get("inconsistent"),
-            "omark_summary": ctx.get("summary_file")}
+    out = {"O_s": os_, "omark_consistent_pct": pct,
+           "omark_contamination_pct": ctx.get("contamination_pct"),
+           "omark_inconsistent": ctx.get("inconsistent"),
+           "omark_summary": ctx.get("summary_file")}
+    # informative coverage: Consistent + Inconsistent + Contamination all
+    # mean the database gave a verdict (Unknown = no information)
+    verdicts = [ctx.get("consistent"), ctx.get("inconsistent"),
+                ctx.get("contamination")]
+    unknown = ctx.get("unknown")
+    if all(isinstance(x, int) for x in verdicts) and isinstance(unknown, int):
+        total = sum(verdicts) + unknown
+        out["O_s_informative"] = sum(verdicts) / total if total else None
+    return out
 
 
 # ---------------------------------------------------------------- C_s
@@ -440,16 +465,24 @@ def load_referee_loci(alignments_tsv: Path) -> dict[str, tuple]:
 # ---------------------------------------------------------------- aggregation
 
 def aggregate(subscores: dict[str, float | None],
-              weights: dict[str, float]) -> tuple[float | None, dict[str, float]]:
-    """Weighted sum with NA renormalization. Refuse if <2 sub-blocks available."""
+              weights: dict[str, float],
+              coverage: dict[str, float] | None = None) -> tuple[float | None, dict[str, float]]:
+    """Weighted sum with NA renormalization. Refuse if <2 sub-blocks available.
+
+    coverage (optional, adaptive mode): per-sub-block informative coverage in
+    [0,1] — the fraction of predicted proteins the block actually gave a
+    usable verdict on (e.g. OMArk non-Unknown fraction, BUSCO proteins hit).
+    Effective weight = w * coverage, then renormalized over available blocks.
+    """
     avail = {k: (v, weights[k]) for k, v in subscores.items()
              if v is not None and weights.get(k, 0) > 0}
     eff = {k: 0.0 for k in weights}
     if len(avail) < 2:
         return None, eff
-    wsum = sum(w for _, w in avail.values())
+    cov = coverage or {}
+    wsum = sum(w * cov.get(k, 1.0) for k, (_, w) in avail.items())
     for k, (v, w) in avail.items():
-        eff[k] = w / wsum
+        eff[k] = w * cov.get(k, 1.0) / wsum
     return sum(v * eff[k] for k, (v, _) in avail.items()), eff
 
 
@@ -588,9 +621,19 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
         sub["C_s"] = None
         detail["C_s_note"] = "no homolog hits"
 
-    w, eff = aggregate(sub, {"R_s": cfg["w_rna"], "H_s": cfg["w_homolog"],
-                             "B_c": cfg["w_conserve"], "O_s": cfg.get("w_omark", 0.0),
-                             "C_s": cfg["w_structure"]})
+    weights = {"R_s": cfg["w_rna"], "H_s": cfg["w_homolog"],
+               "B_c": cfg["w_conserve"], "O_s": cfg.get("w_omark", 0.0),
+               "C_s": cfg["w_structure"]}
+    coverage = None
+    if cfg.get("weight_mode") == "adaptive":
+        # adaptive: scale each database-driven sub-block by its informative
+        # coverage (fraction of proteins with a usable verdict); R_s/H_s/C_s
+        # are global rate metrics over the whole prediction -> 1.0
+        coverage = {"R_s": 1.0, "H_s": 1.0, "C_s": 1.0,
+                    "B_c": detail.get("B_c_informative") or 0.0,
+                    "O_s": detail.get("O_s_informative") or 0.0}
+        detail["informative_coverage"] = coverage
+    w, eff = aggregate(sub, weights, coverage)
     detail["P"] = w
     detail["subscores"] = sub
     detail["effective_weights"] = eff

@@ -75,6 +75,21 @@ EVM weight used during integration (<code>evm/weights.txt</code>):</p>
   <tr><td>{{ e.kind }}</td><td>{{ e.evidence }}</td><td class="num">{{ e.score }}</td><td class="num">{{ e.evm_weight }}</td></tr>
   {% endfor %}
 </table>
+{% if integ.scoring_notes %}
+<p class="muted">Per-predictor P composition (effective sub-block weights after
+NA renormalization / adaptive coverage scaling):</p>
+<table>
+  <tr><th>Predictor</th><th>Effective weights</th><th>Sub-blocks not scored</th><th>Informative coverage &lt; 1</th></tr>
+  {% for s in integ.scoring_notes %}
+  <tr>
+    <td>{{ s.predictor }}</td>
+    <td class="num">{% for k, v in s.effective_weights.items() %}{{ k }}&nbsp;{{ "%.2f"|format(v) }}{% if not loop.last %}, {% endif %}{% endfor %}</td>
+    <td>{% for k, v in s.missing.items() %}{{ k[:-5] }} ({{ v }}){% if not loop.last %}; {% endif %}{% else %}none{% endfor %}</td>
+    <td class="num">{% for k, v in s.coverage.items() %}{{ k }}&nbsp;{{ v }}{% if not loop.last %}, {% endif %}{% else %}&mdash;{% endfor %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
 <p>After EVM integration: <strong>{{ integ.evm_genes }}</strong> genes /
 <strong>{{ integ.evm_transcripts }}</strong> transcripts.</p>
 

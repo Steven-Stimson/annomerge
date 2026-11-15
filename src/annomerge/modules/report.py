@@ -438,8 +438,30 @@ def _integration_stats(out: Path, final_gff3: Path) -> dict | None:
         fin_gs = gene_set_stats(final_gff3)
     except Exception:
         return None
+    # per-predictor scoring transparency: effective sub-block weights (after
+    # NA renormalization / adaptive coverage scaling) and sub-blocks that
+    # could not be scored — so users see exactly what each P was built on
+    scoring_notes = []
+    score_root = Path(out) / "05.score"
+    for name in pred_score:
+        dj = score_root / name / "score_detail.json"
+        if not dj.exists():
+            continue
+        try:
+            d = json.loads(dj.read_text())
+        except Exception:
+            continue
+        eff = {k: round(v, 3) for k, v in
+               (d.get("effective_weights") or {}).items() if v > 0}
+        missing = {k: v for k, v in d.items()
+                   if k.endswith("_note") and d.get("subscores", {}).get(k[:-5]) is None}
+        cov = {k[:-12]: round(v, 3) for k, v in
+               (d.get("informative_coverage") or {}).items() if v < 1.0}
+        scoring_notes.append({"predictor": name, "effective_weights": eff,
+                              "missing": missing, "coverage": cov})
     return {
         "evidence_rows": ev_rows,
+        "scoring_notes": scoring_notes,
         "evm_genes": evm_gs["n_genes"],
         "evm_transcripts": evm_gs["n_transcripts"],
         "added_genes": max(0, fin_gs["n_genes"] - evm_gs["n_genes"]),
