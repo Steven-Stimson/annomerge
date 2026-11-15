@@ -47,6 +47,9 @@
   details[open] > summary::before { content: "\25BC\FE0E "; }
   details > summary:hover { color: #4C72B0; }
   .chart { margin: 8px 0; }
+  .chart svg { max-width: 100%; height: auto; }
+  .diagram { margin: 12px 0; }
+  .diagram svg { width: 100%; height: auto; }
   .placeholder { background: #fbfcfe; border: 1.5px dashed #9db4d0;
                  border-radius: 8px; padding: 14px 18px; margin: 12px 0;
                  color: #456; }
@@ -81,20 +84,11 @@
 <details>
 <summary>2. Workflow</summary>
 
-<div class="placeholder">
-<strong>Pipeline diagram placeholder</strong> — the final SVG will be embedded here.
-<pre>Inputs (genome FASTA / de novo predictions / homolog proteins / RNA-seq / BUSCO lineage / OMAmer DB)
-  -> Evidence collection, three branches
-       RNA branch:      HISAT2 alignment -> StringTie assembly -> Gold set via TransDecoder
-       Homolog branch:  miniprot alignment -> mnp filter -> referee protein set
-       Database branch: BUSCO lineage + OMArk (OMAmer DB)
-  -> Scoring (five sub-blocks R_s / H_s / B_c / O_s / C_s -> P score -> EVM weight mapping)
-  -> EVM integration
-  -> Sanity filter
-  -> (with --augment) isoform resolution + UTR backfill
-  -> Confidence tiering + support tags
-  -> Deliverables (HTML report / evidence browser / final GFF3 + protein &amp; CDS sequences)</pre>
-</div>
+{% if workflow_diagram %}
+<div class="diagram">{{ workflow_diagram }}</div>
+{% else %}
+<p class="note">Workflow diagram not available.</p>
+{% endif %}
 
 <h3>2.1 RNA alignment</h3>
 {% if workflow.rna_align %}
@@ -115,8 +109,7 @@
 <p>{{ workflow.protein.n_mapped }} of {{ workflow.protein.n_raw or "?" }} homolog
 proteins mapped onto the genome (one best record per protein shown in the
 distributions below):</p>
-<div class="chart">{{ workflow.qcov_hist }}</div>
-<div class="chart">{{ workflow.ident_hist }}</div>
+<div class="chart">{{ workflow.density_plot }}</div>
 {% if workflow.protein.mnp_rows %}
 <p>mnp filter: {{ workflow.protein.mnp_removed }} alignment(s) removed.</p>
 <table>
@@ -181,13 +174,8 @@ EVM weight used during integration (<code>evm/weights.txt</code>):</p>
 
 <h3>2.6 Augment</h3>
 {% if workflow.augment %}
-<p>Augment mode: <code>{{ workflow.augment.dedup_mode }}</code></p>
-<div class="placeholder">
-<strong>Augment mode diagram placeholders</strong> — final SVGs will be embedded here.
-<pre>geometric mode: UTR donor extraction -> ±jitter span clustering -> representative selection (longest UTR) -> identical-intron-chain collapse
-
-evidence mode:  UTR donor extraction -> splice-PWM gate -> junction-read corroboration -> TPM-ratio filter -> identical-intron-chain collapse</pre>
-</div>
+<p>Augment mode: <code>{{ workflow.augment.dedup_mode }}</code> (dedup strategies
+are shown in the workflow diagram above).</p>
 <p>Augment recovered <strong>{{ integ.added_genes }}</strong> additional genes and
 <strong>{{ integ.added_transcripts }}</strong> additional transcripts on top of the
 EVM consensus. Key statistics:</p>

@@ -358,13 +358,18 @@ def quality_assessment(ctx: dict) -> dict:
 # --------------------------------------------------------------------- html
 _TEMPLATE = (Path(__file__).resolve().parent.parent / "assets"
              / "report_template.html").read_text()
+_WORKFLOW_SVG = (Path(__file__).resolve().parent.parent / "assets"
+                 / "workflow_diagram.svg")
 def render_html(ctx: dict, out_html: Path,
                 meta: dict | None = None) -> Path:
     """Render the single-page report."""
     from jinja2 import Environment, BaseLoader
+    from markupsafe import Markup
     env = Environment(loader=BaseLoader(), autoescape=True)
     tpl = env.from_string(_TEMPLATE)
+    diagram = Markup(_WORKFLOW_SVG.read_text()) if _WORKFLOW_SVG.exists() else None
     html = tpl.render(meta=meta or ctx.get("meta", {}),
+                      workflow_diagram=diagram,
                       gene_set=ctx.get("gene_set", {}),
                       busco=ctx.get("busco", {}),
                       omark=ctx.get("omark", {}),
@@ -451,6 +456,180 @@ def svg_histogram(vals: list, bins: int = 20, width: int = 520,
 
 
 # ------------------------------------------------- workflow evidence figures
+def _gauss_smooth_2d(grid: list, sigma: float = 2.0) -> list:
+    """Separable Gaussian smoothing of a 2D count grid (rows x cols)."""
+    import math
+    radius = max(2, int(3 * sigma))
+    kern = [math.exp(-0.5 * (k / sigma) ** 2) for k in range(-radius, radius + 1)]
+    s = sum(kern)
+    kern = [k / s for k in kern]
+    nr, nc = len(grid), len(grid[0])
+
+    def blur(src, horizontal: bool) -> list:
+        out = [[0.0] * nc for _ in range(nr)]
+        for r in range(nr):
+            for c in range(nc):
+                acc = 0.0
+                for k in range(-radius, radius + 1):
+                    if horizontal:
+                        cc = c + k
+                        v = src[r][cc] if 0 <= cc < nc else 0
+                    else:
+                        rr = r + k
+                        v = src[rr][c] if 0 <= rr < nr else 0
+                    acc += kern[k + radius] * v
+                out[r][c] = acc
+        return out
+
+    return blur(blur(grid, True), False)
+
+
+def svg_density_marginal(xs: list, ys: list, x_label: str, y_label: str,
+                         x_log: bool = False, xbins: int = 150, ybins: int = 90,
+                         width: int = 620, height: int = 470,
+                         title: str = "") -> str:
+    """NanoPlot-style SMOOTH density scatter with marginal KDE curves.
+
+    Central panel: Gaussian-smoothed 2D density field with NanoPlot's YlGnBu
+    gradient (cream -> green -> teal -> dark blue). Marginals: filled smooth
+    density curves in NanoPlot teal-green. Pure inline SVG, no JS."""
+    import math
+    pts = [(float(x), float(y)) for x, y in zip(xs, ys)
+           if x is not None and y is not None and float(x) > 0]
+    if not pts:
+        return ""
+    xs_v = [p[0] for p in pts]
+    ys_v = [p[1] for p in pts]
+    if x_log:
+        xs_v = [math.log10(v) for v in xs_v]
+    x_lo, x_hi = min(xs_v), max(xs_v)
+    y_lo, y_hi = min(ys_v), max(ys_v)
+    x_sp = (x_hi - x_lo) or 1e-9
+    y_sp = (y_hi - y_lo) or 1e-9
+    grid = [[0] * xbins for _ in range(ybins)]
+    for x, y in pts:
+        xx = math.log10(x) if x_log else x
+        i = min(xbins - 1, int((xx - x_lo) / x_sp * xbins))
+        j = min(ybins - 1, int((y - y_lo) / y_sp * ybins))
+        grid[j][i] += 1
+    sm = _gauss_smooth_2d(grid, sigma=2.2)
+    vmax = max(max(r) for r in sm) or 1.0
+
+    # geometry: top marginal sits ABOVE the main panel; both start below the
+    # optional title. Fixes the previous overflow where curves were drawn
+    # upward from the main panel's top edge and escaped the canvas.
+    pad_l = 64
+    title_h = 26 if title else 0
+    top_h, right_w, gap = 95, 115, 8
+    main_t = title_h + top_h + gap            # main panel top edge
+    main_w = width - pad_l - right_w - gap - 14
+    main_h = height - main_t - 30
+    cw, ch = main_w / xbins, main_h / ybins
+    NANO_GREEN = "#4cb391"                    # NanoPlot signature teal-green
+
+    # NanoPlot YlGnBu-style gradient stops (low -> high density)
+    _STOPS = [(0.00, (255, 255, 204)), (0.25, (161, 218, 180)),
+              (0.50, (65, 182, 196)), (0.75, (44, 127, 184)),
+              (1.00, (37, 52, 148))]
+
+    def dens_color(v: float) -> str:
+        if v <= 1e-4 * vmax:
+            return "#ffffff"
+        t = math.log10(1 + 9 * v / vmax)          # 0..1, log compressed
+        for (t0, c0), (t1, c1) in zip(_STOPS, _STOPS[1:]):
+            if t <= t1:
+                f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+                r = int(c0[0] + (c1[0] - c0[0]) * f)
+                g = int(c0[1] + (c1[1] - c0[1]) * f)
+                b = int(c0[2] + (c1[2] - c0[2]) * f)
+                return f"#{r:02x}{g:02x}{b:02x}"
+        r, g, b = _STOPS[-1][1]
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+             f'height="{height}" font-family="Helvetica,Arial,sans-serif" font-size="11">']
+    if title:
+        parts.append(f'<text x="{pad_l}" y="17" font-size="13" font-weight="bold">'
+                     f'{_esc(title)}</text>')
+    # main smoothed density field (y axis: high values on top)
+    for j in range(ybins):
+        row = sm[j]
+        y0 = main_t + (ybins - 1 - j) * ch
+        for i in range(xbins):
+            v = row[i]
+            if v <= 1e-4 * vmax:
+                continue
+            parts.append(f'<rect x="{pad_l + i * cw:.2f}" y="{y0:.2f}" '
+                         f'width="{cw + 0.05:.2f}" height="{ch + 0.05:.2f}" '
+                         f'fill="{dens_color(v)}"/>')
+    parts.append(f'<rect x="{pad_l}" y="{main_t}" width="{main_w:.1f}" '
+                 f'height="{main_h:.1f}" fill="none" stroke="#94a3b8"/>')
+
+    def smooth_1d(counts: list, sigma: float = 2.0) -> list:
+        return _gauss_smooth_2d([counts], sigma=sigma)[0]
+
+    def filled_curve(vals: list, orientation: str, base: float, span: float,
+                     amp: float, color: str) -> str:
+        n = len(vals)
+        mx = max(vals) or 1.0
+        pts_s = []
+        for i, v in enumerate(vals):
+            frac = i / (n - 1)
+            if orientation == "top":
+                px = pad_l + frac * span
+                py = base - amp * v / mx
+            else:  # right
+                px = base + amp * v / mx
+                py = main_t + main_h - frac * span
+            pts_s.append(f"{px:.1f},{py:.1f}")
+        if orientation == "top":
+            d = (f"M {pad_l:.1f},{base:.1f} L " + " L ".join(pts_s) +
+                 f" L {pad_l + span:.1f},{base:.1f} Z")
+        else:
+            d = (f"M {base:.1f},{main_t + main_h:.1f} L " + " L ".join(pts_s) +
+                 f" L {base:.1f},{main_t:.1f} Z")
+        return (f'<path d="{d}" fill="{color}" fill-opacity="0.55" '
+                f'stroke="{color}" stroke-width="1.2"/>')
+
+    # top marginal: smoothed x-density curve; baseline = main panel top edge,
+    # curve grows upward into its own band -> never leaves the canvas
+    xcnt = [sum(grid[j][i] for j in range(ybins)) for i in range(xbins)]
+    xsm = smooth_1d(xcnt, sigma=2.5)
+    parts.append(filled_curve(xsm, "top", main_t, main_w, top_h - 4, NANO_GREEN))
+    # right marginal: smoothed y-density curve
+    ycnt = [sum(row) for row in grid]
+    ysm = smooth_1d(ycnt, sigma=2.5)
+    rx = pad_l + main_w + gap
+    parts.append(filled_curve(ysm, "right", rx, main_h, right_w - 4, NANO_GREEN))
+
+    # axes labels
+    def tick(v, log):
+        if log:
+            p = int(round(v))
+            return f"10^{p}" if p < 4 else f"1e{p}"
+        return f"{v:.2f}"
+    y_base = main_t + main_h
+    for frac in (0.0, 0.5, 1.0):
+        vx = x_lo + frac * x_sp
+        parts.append(f'<text x="{pad_l + frac * main_w:.1f}" y="{y_base + 14}" '
+                     f'text-anchor="middle">{tick(vx, x_log)}</text>')
+    parts.append(f'<text x="{pad_l + main_w / 2:.1f}" y="{height - 4}" '
+                 f'text-anchor="middle" font-size="12">{_esc(x_label)}</text>')
+    for frac in (0.0, 0.5, 1.0):
+        vy = y_lo + frac * y_sp
+        parts.append(f'<text x="{pad_l - 5}" y="{y_base - frac * main_h + 4:.1f}" '
+                     f'text-anchor="end">{vy:.2f}</text>')
+    parts.append(f'<text x="14" y="{main_t + main_h / 2:.1f}" text-anchor="middle" '
+                 f'font-size="12" transform="rotate(-90 14 {main_t + main_h / 2:.1f})">'
+                 f'{_esc(y_label)}</text>')
+    parts.append(f'<text x="{pad_l + main_w:.1f}" y="{title_h + 12:.1f}" '
+                 f'text-anchor="end" font-size="10" fill="#64748b">'
+                 f'n = {len(pts)}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+# ------------------------------------------------- workflow evidence figures
 def rna_alignment_stats(out: Path) -> list:
     """Per-sample HISAT2 overall alignment rate from 02.rnaseq/bam/*.hisat2.log."""
     rows = []
@@ -465,7 +644,7 @@ def rna_alignment_stats(out: Path) -> list:
 
 def protein_alignment_stats(out: Path) -> dict:
     """Homolog protein alignment: coverage/identity distributions + mnp filter."""
-    res: dict = {"qcov": [], "ident": [], "n_mapped": 0, "n_raw": 0,
+    res: dict = {"qcov": [], "ident": [], "qlen": [], "n_mapped": 0, "n_raw": 0,
                  "mnp_rows": [], "mnp_removed": 0}
     tsv = Path(out) / "03.homolog" / "alignments.tsv"
     if tsv.exists():
@@ -483,6 +662,7 @@ def protein_alignment_stats(out: Path) -> dict:
                 seen.add(q)
                 res["qcov"].append(float(f[ci["qcov"]]))
                 res["ident"].append(float(f[ci["ident"]]))
+                res["qlen"].append(int(f[ci["qlen"]]))
         res["n_mapped"] = len(seen)
     raw_paf = Path(out) / "03.homolog" / "miniprot.raw.paf"
     if raw_paf.exists():
@@ -850,6 +1030,9 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
         wf["protein"].get("qcov") or [], title="Query coverage (fraction of protein aligned)"))
     wf["ident_hist"] = Markup(svg_histogram(
         wf["protein"].get("ident") or [], title="Alignment identity"))
+    wf["density_plot"] = Markup(svg_density_marginal(
+        wf["protein"].get("qcov") or [], wf["protein"].get("ident") or [],
+        x_label="Query coverage", y_label="Alignment identity"))
     ctx["workflow"] = wf
     # support-tag census (section 3.4)
     ctx["tags"] = tag_overview(final_gff3)
