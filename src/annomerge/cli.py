@@ -175,16 +175,16 @@ def _run_evidence_pipeline(
 
 _SCORING_FORMULA = """
 [bold]Scoring model[/bold] (module 3 — every de novo predictor gets one P (Prediction score)):
-
-    P = w_r·R_s + w_h·H_s + w_b·B_c + w_o·O_s + w_c·C_s
-                                          (default 0.45/0.25/0.15/0.10/0.15)
-
+    P = w_r·R_s + w_h·H_s + w_c·C_s + w_b·B_c + w_o·O_s
+                (default w_r=0.45, w_h=0.25, w_c=0.15, w_b=0.15, w_o=0.10)
   R_s  RNA support: junction/exon coverage + expression (internals α/β/γ, see --rna-weights)
-  H_s  homolog support: full-length miniprot hits vs referee proteins and the
+  Homolog-protein sub-blocks (both derive from the same miniprot referee hits):
+  H_s  homolog support: full-length match rate vs referee proteins and the
        RNA-assembled Gold set (gold-set share = --hs-gold-weight)
+  C_s  structure: 1 − anomaly rate (chimeric / split heuristics from the
+       same homolog hit patterns)
   B_c  conservation: BUSCO complete recall in proteins mode (needs --busco-lineage)
   O_s  orthology consistency: OMArk Consistent fraction (needs --omark-db)
-  C_s  structure: 1 − anomaly rate (chimeric / split heuristics from homolog hit patterns)
 
 Sub-blocks without evidence are skipped and the remaining weights are
 renormalized (--weight-mode adaptive additionally scales the B_c / O_s
@@ -544,7 +544,7 @@ def merge(
     evm_w = map_weights(p_scores, mapping=weight_mapping, min_score=min_predictor_score)
     wtab = score_dir / "evm_weights.tsv"
     with open(wtab, "w") as fh:
-        fh.write("predictor\tP\tR_s\tH_s\tB_c\tO_s\tC_s\teffective_weights\tevm_weight\tnote\n")
+        fh.write("predictor\tP\tR_s\tH_s\tC_s\tB_c\tO_s\teffective_weights\tevm_weight\tnote\n")
         for name in preds:
             d = details[name]
             s = d["subscores"]
@@ -552,7 +552,7 @@ def merge(
             eff = ";".join(f"{k}={v:.3f}" for k, v in
                            (d.get("effective_weights") or {}).items() if v > 0)
             fh.write(f"{name}\t{f(d['P'])}\t{f(s['R_s'])}\t{f(s['H_s'])}\t"
-                     f"{f(s['B_c'])}\t{f(s.get('O_s'))}\t{f(s['C_s'])}\t"
+                     f"{f(s['C_s'])}\t{f(s['B_c'])}\t{f(s.get('O_s'))}\t"
                      f"{eff or 'NA'}\t"
                      f"{evm_w.get(name) or 'EXCLUDE'}\t"
                      f"{d.get('hard_reject', '')}\n")

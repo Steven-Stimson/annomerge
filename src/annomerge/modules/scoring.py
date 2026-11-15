@@ -1,7 +1,7 @@
 """Module 3: predictor global scoring.
 
-P = w_r * R_s + w_h * H_s'' + w_b * B_c + w_o * O_s + w_c * C_s
-                                           (defaults 0.45/0.25/0.15/0.10/0.15)
+P = w_r * R_s + w_h * H_s'' + w_c * C_s + w_b * B_c + w_o * O_s
+                                (defaults w_r=0.45, w_h=0.25, w_c=0.15, w_b=0.15, w_o=0.10)
 
 Sub-blocks:
   R_s = alpha * J_s* + beta * E_sp + gamma * M_e      (RNA support; 0.5/0.35/0.15)
@@ -10,9 +10,11 @@ Sub-blocks:
       M_e : single-exon bias correction vs RNA single-exon fraction
   H_s'': full-length bidirectional match rate of predictor proteins vs
       homolog referee set; enhanced by Gold set (--hs-gold-weight)
+  C_s : 1 - structural anomaly rate (chimeric / split heuristics via homolog hits)
+      (H_s and C_s are the homolog-protein sub-blocks, derived from the same
+      miniprot referee hits)
   B_c : BUSCO complete recall (proteins mode, local lineage, offline)
   O_s : OMArk Consistent fraction (needs --omark-db; skipped otherwise)
-  C_s : 1 - structural anomaly rate (chimeric / split heuristics via homolog hits)
 
 Degradation: missing evidence -> NA + weight renormalization (w_i/(1-w_missing));
 fewer than two usable sub-blocks -> refuse to score.
