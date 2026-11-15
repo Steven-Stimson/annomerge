@@ -594,9 +594,10 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
     detail["P"] = w
     detail["subscores"] = sub
     detail["effective_weights"] = eff
-    if sub.get("C_s") is not None and detail.get("r_anomaly") is not None \
-            and detail["r_anomaly"] > cfg["max_anomaly_rate"]:
-        detail["hard_reject"] = f"anomaly rate {detail['r_anomaly']:.3f} > {cfg['max_anomaly_rate']}"
+    # structural anomalies (r_anomaly / n_chimeric / n_split) are kept as
+    # informational metrics only: EVM entry is gated solely by P via
+    # map_weights(min_score); the <2-usable-sub-blocks guard below is the
+    # only hard reject (a score cannot be computed at all then)
     if w is None:
         detail["hard_reject"] = "fewer than 2 usable sub-blocks"
 

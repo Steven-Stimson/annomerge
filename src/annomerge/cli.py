@@ -187,9 +187,10 @@ _SCORING_FORMULA = """
   C_s  structure: 1 − anomaly rate (chimeric / split heuristics from homolog hit patterns)
 
 Sub-blocks without evidence are skipped and the remaining weights are
-renormalized. A predictor is hard-rejected (EXCLUDE, never enters EVM) when
-its anomaly rate exceeds --max-anomaly-rate or fewer than 2 sub-blocks are
-usable. P is then mapped to integer EVM weights (--weight-mapping).
+renormalized. A predictor enters EVM only when its P reaches
+--min-predictor-score (and a P cannot be computed at all with fewer than
+2 usable sub-blocks). P is then mapped to integer EVM weights
+(--weight-mapping).
 """
 
 _MERGE_HELP = """[bold]merge[/bold]: score de novo predictors, calibrate EVM
@@ -340,11 +341,6 @@ def merge(
         0.5, "--hs-gold-weight",
         help="Share of Gold-set hits inside H_s (0-1); the remainder comes from "
              "referee-protein hits.",
-        rich_help_panel="Scoring"),
-    max_anomaly_rate: float = typer.Option(
-        0.08, "--max-anomaly-rate",
-        help="Hard-reject threshold: predictors with a structural anomaly rate above "
-             "this are EXCLUDED from EVM (raise for distant-only homolog evidence).",
         rich_help_panel="Scoring"),
     min_predictor_score: float = typer.Option(
         0.35, "--min-predictor-score",
@@ -521,7 +517,7 @@ def merge(
                w_structure=w_structure, w_omark=w_omark,
                omark_db=omark_db,
                fulllength_cov=fulllength_cov,
-               hs_gold_weight=hs_gold_weight, max_anomaly_rate=max_anomaly_rate,
+               hs_gold_weight=hs_gold_weight,
                ablate=(ablate.split(",") if ablate else []))
     preds = parse_predictors(predictors)
     score_dir = ensure_dir(out / "05.score")
