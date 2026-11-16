@@ -157,12 +157,12 @@ class BedCovRunner:
             bed_path = tf.name
         cmd = ["samtools", "depth", "-aa", "-b", bed_path,
                *[str(b) for b in self.bams]]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL, bufsize=1 << 20)
-        Path(bed_path).unlink(missing_ok=True)
-        if proc.returncode != 0:
-            log.warning("samtools depth failed (rc=%d)", proc.returncode)
-            return
+        # Stream the per-base depth output line by line: buffering the whole
+        # stdout via subprocess.run(PIPE) (100M+ lines on large genomes)
+        # triples the footprint (bytes + decoded str + splitlines list) and
+        # OOM-kills small containers.
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, bufsize=1 << 20)
         # attribute each reported base to the interval(s) covering it.
         # NOTE: keep duplicate intervals (a single-exon transcript's CDS
         # segment equals its locus span) — one base may serve several tags.
@@ -173,27 +173,45 @@ class BedCovRunner:
             srt = sorted(ivs)  # duplicates kept on purpose
             starts[seqid] = [s for s, _ in srt]
             iv_map[seqid] = srt
-        self.results = self._attribute(proc.stdout, starts, iv_map)
+        results = self._attribute(proc.stdout, starts, iv_map)
+        rc = proc.wait()
+        Path(bed_path).unlink(missing_ok=True)
+        if rc != 0:
+            log.warning("samtools depth failed (rc=%d)", rc)
+            return
+        self.results = results
 
-    def _attribute(self, stdout, starts, iv_map):
+    def _attribute(self, stream, starts, iv_map):
         from bisect import bisect_right
         tag_of: dict[tuple, list] = {}
         for seqid, s, e, t in self.regions:
             tag_of.setdefault((seqid, s, e), []).append(t)
         acc: dict[str, list] = {}
-        for line in stdout.decode().splitlines():
-            f = line.split("\t")
+        nbam = max(1, len(self.bams))
+        # samtools prints positions grouped by seqid — cache the decoded key
+        # and the lookup results instead of decoding every line.
+        last_raw = None
+        seqid = None
+        st = ivs = None
+        for line in stream:
+            f = line.split(b"\t")
             if len(f) < 3:
                 continue
-            seqid, pos, d = f[0], int(f[1]), int(f[2])
-            st = starts.get(seqid)
+            if f[0] != last_raw:
+                last_raw = f[0]
+                seqid = last_raw.decode()
+                st = starts.get(seqid)
+                ivs = iv_map.get(seqid)
             if st is None:
                 continue
+            pos = int(f[1])
+            # depth = mean across BAMs (previously only the first column was
+            # used, silently ignoring the remaining samples)
+            d = sum(int(x) for x in f[2:2 + nbam]) / nbam
             i = bisect_right(st, pos) - 1
             if i < 0:
                 continue
             # add to every interval containing pos (sorted, may overlap)
-            ivs = iv_map[seqid]
             j = i
             while j < len(ivs) and ivs[j][0] <= pos:
                 s, e = ivs[j]
