@@ -127,8 +127,18 @@ def _resolve_exe(name: str) -> str | None:
     return None
 
 
-def run_omark(faa: Path, db: Path, out_dir: Path, threads: int) -> dict:
-    """Run (or reuse cached) OMArk; returns report-ready context dict."""
+def run_omark(faa: Path, db: Path, out_dir: Path, threads: int,
+              isoform_file: Path | None = None,
+              extra_opts: str | None = None) -> dict:
+    """Run (or reuse cached) OMArk; returns report-ready context dict.
+
+    isoform_file: omark -i (';'-separated protein ids, one line per gene)
+    for collapsing alternative isoforms to one representative per gene.
+    extra_opts: extra CLI flags forwarded to the omark assessment step
+    (e.g. "--taxid 33090 --taxonomic_rank kingdom"); pipeline-managed flags
+    (-f/-d/-o/-i) must NOT be passed here (rejected by the CLI layer).
+    A cached *.sum is reused only when the recorded parameters match the
+    current ones — changing isoform_file/extra_opts invalidates the cache."""
     db, out_dir = Path(db), Path(out_dir)
     if not db.exists():
         return {"ok": False,
@@ -142,6 +152,21 @@ def run_omark(faa: Path, db: Path, out_dir: Path, threads: int) -> dict:
     bdir = ensure_dir(out_dir)
     # omark 0.3.x 的汇总文件是 <prefix>.sum（不是 *.omark）
     summaries = list(bdir.glob("*.sum"))
+    args_rec = bdir / "omark.args.txt"
+    cur_args = f"isoform_file={isoform_file}\nextra_opts={extra_opts}\n"
+    if summaries:
+        if args_rec.exists():
+            if args_rec.read_text() != cur_args:
+                # parameters changed since the cached run: rerun
+                for s in summaries:
+                    s.unlink()
+                summaries = []
+        elif isoform_file or extra_opts:
+            # legacy cache (pre-parameter-tracking): cannot tell how the
+            # .sum was produced, so rerun with the new parameters
+            for s in summaries:
+                s.unlink()
+            summaries = []
     if not summaries:
         tsv = bdir / "omamer_hits.tsv"
         if not tsv.exists():
@@ -151,10 +176,15 @@ def run_omark(faa: Path, db: Path, out_dir: Path, threads: int) -> dict:
                  "-t", str(threads)],
                 desc="omamer search (OMArk)")
         # omark 0.3.x CLI: -o 是输出目录(非文件前缀), 无线程参数(-t 是 TAXID)
-        run([omark_exe, "-f", str(tsv), "-d", str(db),
-             "-o", str(bdir)],
-            desc="omark assessment")
+        cmd = [omark_exe, "-f", str(tsv), "-d", str(db), "-o", str(bdir)]
+        if isoform_file:
+            cmd += ["-i", str(isoform_file)]
+        if extra_opts:
+            import shlex
+            cmd += shlex.split(extra_opts)
+        run(cmd, desc="omark assessment")
         summaries = list(bdir.glob("*.sum"))
+        args_rec.write_text(cur_args)
     if not summaries:
         return {"ok": False, "error": "no OMArk summary produced"}
     version = ""

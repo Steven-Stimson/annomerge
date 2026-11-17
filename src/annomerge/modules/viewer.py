@@ -546,16 +546,77 @@ def coverage_bedgraph(bam: Path, out_bedgraph: Path, threads: int) -> Path | Non
     return out_bedgraph if out_bedgraph.exists() else None
 
 
-def sample_coverage(bams: list, data_dir: Path, threads: int) -> dict:
+def sample_coverage(bams: list, data_dir: Path, threads: int,
+                    mode: int = 2) -> dict:
     """Per-sample + merged 50-bp-bin coverage bedgraphs.
-
     One bedgraph per BAM (coverage_<sample>.bedgraph) plus, for >=2 BAMs, a
     per-bin summed coverage_all.bedgraph. Returns coverage metadata
     {"merged": {file, max, mean, n_samples, name?}, "samples": [{name, file,
     max, mean}]} or {} when no BAM produced a bedgraph. Track y-axes are left
     to igv per-track autoscale; max/mean are recorded here for the track
     labels so different sequencing depths stay comparable.
-    """
+
+    mode (--show-rna-coverage): 0 = no RNA coverage track at all ({} returned);
+    1 = merged track only — per-sample bedgraphs are streamed into the merged
+    sum and deleted, so the browser ships ONE coverage track (much smaller
+    on many-sample runs); 2 = merged + every per-sample track (legacy)."""
+    if mode == 0 or not bams:
+        return {}
+    mbg = data_dir / "coverage_all.bedgraph"
+    if mode == 1:
+        # merged-only: reuse the finished merged file when present; otherwise
+        # stream each BAM's 50-bp bedgraph straight into the sum (no
+        # per-sample files are kept, saving both disk and browser size).
+        if mbg.exists():
+            mx = tot = 0.0
+            n = 0
+            for line in open(mbg):
+                f = line.rstrip("\n").split("\t")
+                if len(f) < 4:
+                    continue
+                v = float(f[3])
+                mx = max(mx, v)
+                tot += v
+                n += 1
+            return {"merged": {"file": mbg.name, "max": round(mx, 1),
+                               "mean": round(tot / n, 1) if n else 0.0,
+                               "n_samples": len(bams)},
+                    "samples": []}
+        merged1: dict = {}
+        n_ok = 0
+        for bam in bams:
+            bam = Path(bam)
+            if not bam.exists():
+                continue
+            tmp_bg = data_dir / f".tmp_cov_{bam.stem}.bedgraph"
+            bg = coverage_bedgraph(bam, tmp_bg, threads)
+            if not bg:
+                log.warning("viewer: coverage failed for %s; skipped", bam)
+                continue
+            n_ok += 1
+            for line in open(bg):
+                f = line.rstrip("\n").split("\t")
+                if len(f) < 4:
+                    continue
+                rec = merged1.setdefault((f[0], int(f[1])), [int(f[2]), 0.0])
+                rec[1] += float(f[3])
+            bg.unlink(missing_ok=True)
+        if not n_ok:
+            return {}
+        mx = tot = 0.0
+        n = 0
+        with open(mbg, "w") as out:
+            for (ref, s), (e, dsum) in sorted(merged1.items()):
+                out.write(f"{ref}\t{s}\t{e}\t{dsum:.1f}\n")
+                mx = max(mx, dsum)
+                tot += dsum
+                n += 1
+        log.info("viewer coverage: merged-only, %d sample(s) summed, "
+                 "max %.0fx mean %.1fx", n_ok, mx, tot / n if n else 0.0)
+        return {"merged": {"file": mbg.name, "max": round(mx, 1),
+                           "mean": round(tot / n, 1) if n else 0.0,
+                           "n_samples": n_ok},
+                "samples": []}
     samples = []
     merged: dict = {}          # (ref, start) -> [end, depth_sum]
     used_names: set = set()
@@ -910,11 +971,15 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
 # ------------------------------------------------------------------ driver
 def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
                final_gff3: Path, final_d: Path, integ_d: Path,
-               threads: int, full: bool = False) -> dict:
+               threads: int, full: bool = False,
+               show_rna_coverage: int = 1) -> dict:
     """Assemble data/ and the offline single-file evidence browser.
 
     full=False (default): lite browser, genome sequence not embedded.
     full=True: also embed the FASTA so igv shows base-level sequence.
+    show_rna_coverage (--show-rna-coverage): 0 = no RNA coverage track,
+    1 = merged track only (smallest browser, default), 2 = merged + every
+    per-sample track. Forwarded to sample_coverage(mode=...).
     """
     vdir = ensure_dir(Path(out) / "09.result" / "viewer")
     data = ensure_dir(vdir / "data")
@@ -957,9 +1022,11 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
     # design (user request): junctions remain in 02.rnaseq for the pipeline,
     # but are no longer copied into the viewer data/ or embedded.
 
-    # coverage bedgraphs: one per BAM + a merged track over ALL samples;
-    # must run BEFORE build_tracks_json so its metadata lands in tracks.json
-    cov = sample_coverage(rna.get("bams") or [], data, threads)
+    # coverage bedgraphs: gated by show_rna_coverage (0=none / 1=merged only /
+    # 2=merged+per-sample); must run BEFORE build_tracks_json so its metadata
+    # lands in tracks.json
+    cov = sample_coverage(rna.get("bams") or [], data, threads,
+                          mode=show_rna_coverage)
 
     # 3) tracks.json first: it copies denovo_<name>.gff3 into data/, which
     #    build_genes_json needs on disk to compute de novo evidence coverage

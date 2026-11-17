@@ -179,6 +179,12 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     if pwm_gate is None:
         pwm_gate = DEFAULT_GATE
     d = ensure_dir(Path(out_dir))
+    out_gff3 = d / "augment.gff3"
+    # Fast path: the final GFF3 already exists — all phases below are pure
+    # recomputation (hours on large genomes), so return immediately.
+    if out_gff3.exists():
+        log.info("augment: %s exists — skipping all phases", out_gff3)
+        return {"augment_gff3": out_gff3, "dir": d, "stats": {}}
     stats: Counter = Counter()
     _, evm_txs, evm_order = _parse_gff3(Path(evm_gff3))
     groups = _group_goldset(goldset_gff)
@@ -286,18 +292,38 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
 
     # ============ Phase 4: L1 isoform adoption (complete core index)
     gene_donor_tpm_max: dict = {}     # gid -> max TPM over all donors evaluated
+    # Donor span index: (seqid, strand) -> [(start, end, seq, key)] sorted by
+    # start. The old code scanned ALL goldset groups for EVERY L1 gene
+    # (n_genes x n_donors span tests — hours on large genomes); the index
+    # reduces each gene to its truly overlapping handful. ``seq`` preserves
+    # the groups insertion order so candidate enumeration below visits keys
+    # in exactly the same order as the old full scan (byte-identical output).
+    from bisect import bisect_right as _bisect_right
+    donor_span: dict = {}
+    donor_idx: dict = {}
+    for _seq, (_k, _g) in enumerate(groups.items()):
+        _ds = (min(x.start for x in _g["exons"]),
+               max(x.end for x in _g["exons"]))
+        donor_span[_k] = _ds
+        donor_idx.setdefault((_g["seqid"], _g["strand"]), []).append(
+            (_ds[0], _ds[1], _seq, _k))
+    for _v in donor_idx.values():
+        _v.sort()
+    donor_starts = {k: [iv[0] for iv in v] for k, v in donor_idx.items()}
     for gid, gene in l1_genes.items():
         anc = gene.isoforms[0]
         cs, ce = _cds_span(anc)
         ai = _cds_introns(anc)
         utr_cands = []                     # (key, group, dspan) awaiting jitter merge
         gene_donor_keys: list = []
-        for key, g in groups.items():
-            if g["strand"] != anc.mrna.strand or g["seqid"] != anc.mrna.seqid:
-                continue
-            dspan = (min(x.start for x in g["exons"]), max(x.end for x in g["exons"]))
-            if dspan[0] > ce or dspan[1] < cs:      # span disjoint
-                continue
+        _ik = (anc.mrna.seqid, anc.mrna.strand)
+        _bucket = donor_idx.get(_ik, [])
+        _cand = [iv for iv in _bucket[:_bisect_right(donor_starts.get(_ik, []), ce)]
+                 if iv[1] >= cs]
+        _cand.sort(key=lambda iv: iv[2])   # restore original groups order
+        for _, _, _, key in _cand:
+            g = groups[key]
+            dspan = donor_span[key]
             gene_donor_keys.append(key)
             din = _chain_introns(g["exons"])
             if _donor_covers(din, dspan, ai, (cs, ce)):
@@ -637,7 +663,47 @@ def _merge_jitter(cands: list, tpms: dict, thr: int) -> tuple[list, int]:
 
 def _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, cores):
     """For UTR-less transcripts extend exons from tier1 StringTie then tier2
-    de novo donors (internal introns must match CDS exactly)."""
+    de novo donors (internal introns must match CDS exactly).
+
+    Performance: both donor pools are pre-indexed by (seqid, strand) with
+    spans sorted for bisect, and tier2 predictor GFFs are parsed ONCE here
+    (the old code re-parsed every predictor GFF for every unextended
+    transcript — the dominant cost on large genomes). Span pre-filtering
+    (ds<=cs and de>=ce) is exactly the first check of _donor_covers, and
+    candidate order is restored to the original scan order, so results are
+    byte-identical to the naive implementation."""
+    from bisect import bisect_right as _br
+    # ---- tier1 index: (seqid, strand) -> [(start, end, seq, chain, din)]
+    # '.'-stranded donors are queried for both transcription directions.
+    st_idx: dict = {}
+    for _seq, (tid, (sq, st, chain)) in enumerate(st_donors.items()):
+        span = (min(s for s, _ in chain), max(e for _, e in chain))
+        din = tuple(sorted((chain[i][1] + 1, chain[i + 1][0] - 1)
+                           for i in range(len(chain) - 1)))
+        st_idx.setdefault((sq, st), []).append((span[0], span[1], _seq, chain, din))
+    for v in st_idx.values():
+        v.sort()
+    st_starts = {k: [iv[0] for iv in v] for k, v in st_idx.items()}
+    # ---- tier2 index: parse every predictor GFF ONCE
+    # (seqid, strand) -> [(start, end, pred_rank, seq, name, din, chain)]
+    dn_idx: dict = {}
+    for _rank, (name, gff) in enumerate((preds or {}).items()):
+        _, txs, order = _parse_gff3(Path(gff))
+        for _seq, tid in enumerate(order):
+            dtx = txs[tid]
+            foot = dtx.exons if dtx.exons else dtx.cds
+            if not foot:
+                continue
+            span = (min(f.start for f in foot), max(f.end for f in foot))
+            din = _chain_introns(foot)
+            chain = [(f.start, f.end)
+                     for f in sorted(foot, key=lambda f: f.start)]
+            dn_idx.setdefault((dtx.mrna.seqid, dtx.mrna.strand), []).append(
+                (span[0], span[1], _rank, _seq, name, din, chain))
+    for v in dn_idx.values():
+        v.sort()
+    dn_starts = {k: [iv[0] for iv in v] for k, v in dn_idx.items()}
+
     for gene in genes:
         for tx in gene.isoforms:
             five, three = _utr_parts(tx)
@@ -647,12 +713,15 @@ def _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, c
             ai = _cds_introns(tx)
             best = None
             # tier1: StringTie chains
-            for tid, (sq, st, chain) in st_donors.items():
-                if sq != tx.mrna.seqid or (st not in (".", tx.mrna.strand)):
-                    continue
+            _cand1 = []
+            for _sk in ((tx.mrna.seqid, tx.mrna.strand), (tx.mrna.seqid, ".")):
+                _bucket = st_idx.get(_sk, [])
+                _cand1.extend(
+                    iv for iv in _bucket[:_br(st_starts.get(_sk, []), cs)]
+                    if iv[1] >= ce)
+            _cand1.sort(key=lambda iv: iv[2])   # original st_donors order
+            for _, _, _, chain, din in _cand1:
                 span = (min(s for s, _ in chain), max(e for _, e in chain))
-                din = tuple(sorted((chain[i][1] + 1, chain[i + 1][0] - 1)
-                                   for i in range(len(chain) - 1)))
                 if not _donor_covers(din, span, ai, (cs, ce)):
                     continue
                 ext = (cs - span[0]) + (span[1] - ce)
@@ -661,23 +730,18 @@ def _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, c
             # tier2: de novo chains
             if best is None:
                 cand = []
-                for name, gff in preds.items():
-                    _, txs, order = _parse_gff3(Path(gff))
-                    for tid in order:
-                        dtx = txs[tid]
-                        if dtx.mrna.seqid != tx.mrna.seqid or dtx.mrna.strand != tx.mrna.strand:
-                            continue
-                        foot = dtx.exons if dtx.exons else dtx.cds
-                        if not foot:
-                            continue
-                        span = (min(f.start for f in foot), max(f.end for f in foot))
-                        din = _chain_introns(foot)
-                        if not _donor_covers(din, span, ai, (cs, ce)):
-                            continue
-                        ext = (cs - span[0]) + (span[1] - ce)
-                        sc = (scores or {}).get(name, (0.0, 0.0))
-                        cand.append((ext, sc, name,
-                                     [(f.start, f.end) for f in sorted(foot, key=lambda f: f.start)]))
+                _dk = (tx.mrna.seqid, tx.mrna.strand)
+                _bucket = dn_idx.get(_dk, [])
+                _cand2 = [iv for iv in _bucket[:_br(dn_starts.get(_dk, []), cs)]
+                          if iv[1] >= ce]
+                _cand2.sort(key=lambda iv: (iv[2], iv[3]))  # preds, then GFF order
+                for _s, _e, _, _, name, din, chain in _cand2:
+                    span = (_s, _e)
+                    if not _donor_covers(din, span, ai, (cs, ce)):
+                        continue
+                    ext = (cs - span[0]) + (span[1] - ce)
+                    sc = (scores or {}).get(name, (0.0, 0.0))
+                    cand.append((ext, sc, name, chain))
                 if cand:
                     cand.sort(key=lambda c: (-c[1][0], -c[1][1], -c[0]))
                     best = (cand[0][0], f"denovo:{cand[0][2]}", cand[0][3])

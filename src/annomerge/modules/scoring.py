@@ -1,18 +1,22 @@
 """Module 3: predictor global scoring.
 
-P = w_r * R_s + w_h * H_s'' + w_b * B_c + w_o * O_s
-                          (defaults w_r=0.45, w_h=0.40, w_b=0.15, w_o=0.10)
+P = w_r * R_s + w_h * H_s'' + w_b * B_s + w_o * O_s
+                          (defaults w_r=0.45, w_h=0.25, w_b=0.10, w_o=0.20)
 
-Sub-blocks:
-  R_s = alpha * J_s* + beta * E_sp + gamma * M_e      (RNA support; 0.5/0.35/0.15)
+Each sub-block maps to exactly ONE evidence source (no double counting):
+  R_s: the RNA evidence bundle — (1-d)*(alpha*J_s* + beta*E_sp + gamma*M_e)
+       + d*GoldMatch, with d = --rna-gold-weight (default 0.25)
       J_s*: junction support rate (multi-intron transcripts only)
       E_sp: exon precision, gffcompare vs StringTie transcripts
       M_e : single-exon bias correction vs RNA single-exon fraction
+      GoldMatch: full-length protein match rate vs the RNA-assembled gold set
   H_s'': structure-aware homolog support — fraction of predicted proteins that
       are BOTH full-length bidirectional matches vs the homolog referee set
       AND structurally clean (no chimeric/split anomaly from the same
-      miniprot referee hits); enhanced by Gold set (--hs-gold-weight)
-  B_c : BUSCO complete recall (proteins mode, local lineage, offline)
+      miniprot referee hits). Pure homolog evidence; the RNA-derived gold set
+      is mixed in ONLY as a rescue when the referee set has fewer than
+      --hs-referee-min proteins (near-reference too distant).
+  B_s : BUSCO complete recall (proteins mode, local lineage, offline)
   O_s : OMArk Consistent fraction (needs --omark-db; skipped otherwise)
 
 Degradation: missing evidence -> NA + weight renormalization (w_i/(1-w_missing));
@@ -167,26 +171,34 @@ def single_exon_fraction(txs: dict[str, Transcript]) -> float:
 
 
 def compute_rs(pred_gff: Path, junctions_bed: Path, ref_gtf: Path,
-               out_dir: Path, alpha: float, beta: float, gamma: float) -> dict:
+               out_dir: Path, alpha: float, beta: float, gamma: float,
+               gold_match: float | None = None,
+               gold_weight: float = 0.0) -> dict:
+    """R_s: the RNA evidence bundle. Js/Esp/Me are transcript-level RNA
+    agreement; GoldMatch (full-length protein match vs the RNA-assembled
+    gold set) is the protein-level confirmation of the same RNA evidence —
+    it belongs here (not in H_s) so every scoring dimension maps to one
+    independent evidence source. gold_weight=0 (or gold_match=None) keeps
+    the legacy Js/Esp/Me-only behaviour."""
     txs = parse_gff(pred_gff)
     junc = load_junctions(junctions_bed)
     js, js_detail = junction_support(txs, junc)
     esp, stats_path = exon_precision(pred_gff, ref_gtf, out_dir)
-
     fse_pred = single_exon_fraction(txs)
     fse_rna = single_exon_fraction(parse_gff(ref_gtf))
     me = None
     if fse_rna > 0:
         me = max(0.0, 1.0 - abs(fse_pred - fse_rna) / fse_rna)
-
     parts = {"Js": (js, alpha), "Esp": (esp, beta), "Me": (me, gamma)}
-    avail = [(v, w) for v, w in parts.values() if v is not None]
+    if gold_match is not None and gold_weight > 0:
+        parts["GoldMatch"] = (gold_match, gold_weight)
+    avail = [(v, w) for v, w in parts.values() if v is not None and w > 0]
     rs = None
     if avail:
         wsum = sum(w for _, w in avail)
         rs = sum(v * w for v, w in avail) / wsum
     return {
-        "R_s": rs, "Js": js, "Esp": esp, "Me": me,
+        "R_s": rs, "Js": js, "Esp": esp, "Me": me, "GoldMatch": gold_match,
         "fse_pred": round(fse_pred, 4), "fse_rna": round(fse_rna, 4),
         "Js_detail": {k: v for k, v in js_detail.items() if k != "per_tx"},
         "gffcompare_stats": str(stats_path),
@@ -275,11 +287,14 @@ def full_length_match_rate(blast_tsv: Path, min_cov: float = 0.9,
 
 def compute_hs(pred_faa: Path, referee_faa: Path, gold_faa: Path | None,
                out_dir: Path, threads: int, full_cov: float,
-               gold_weight: float = 0.5,
                subject_weights: dict | None = None) -> dict:
-    """H_s: full-length match rate vs referee set (relatedness-weighted when
-    subject_weights given: support from closer homolog sets counts more).
-    The gold-set component is never weighted (same-genome proteins).
+    """Full-length match rates vs the referee set AND vs the RNA-assembled
+    gold set, returned separately (Hs_homolog / Hs_gold). The two rates are
+    NOT blended here anymore: goldset is RNA-derived evidence, so the caller
+    (score_one_predictor) routes Hs_gold to the R_s bundle, or back into H_s
+    only as a rescue when the referee set is too small to be informative
+    (--hs-referee-min) — never both, to avoid double-counting.
+
     _matched/_qweight expose the matched ids + per-protein weight so the
     caller can compute the structure-aware joint rate (matched AND clean)."""
     hs_dir = ensure_dir(out_dir)
@@ -301,18 +316,14 @@ def compute_hs(pred_faa: Path, referee_faa: Path, gold_faa: Path | None,
         out["Hs_gold"] = hs_gold
         out["n_fullmatch_gold"] = len(matched_g)
 
-    if hs_gold is not None and hs_hom is not None:
-        out["Hs"] = (1 - gold_weight) * hs_hom + gold_weight * hs_gold
-    else:
-        out["Hs"] = hs_hom if hs_hom is not None else hs_gold
     out["_hits_cache"] = tsv  # reused by the structural-anomaly scan
     return out
 
 
-# ---------------------------------------------------------------- B_c
+# ---------------------------------------------------------------- B_s
 
 def compute_bc(pred_faa: Path, busco_path: Path, out_dir: Path, threads: int) -> dict:
-    """B_c: BUSCO proteins-mode complete recall, local lineage, offline."""
+    """B_s: BUSCO proteins-mode complete recall, local lineage, offline."""
     bdir = ensure_dir(out_dir)
     summary_candidates = list(bdir.glob("busco_out/short_summary*.txt"))
     if not summary_candidates:
@@ -325,7 +336,7 @@ def compute_bc(pred_faa: Path, busco_path: Path, out_dir: Path, threads: int) ->
     txt = summary_candidates[0].read_text()
     m = re.search(r"C:([\d.]+)%", summary_candidates[0].read_text())
     bc = float(m.group(1)) / 100.0 if m else None
-    out = {"B_c": bc, "busco_summary": str(summary_candidates[0])}
+    out = {"B_s": bc, "busco_summary": str(summary_candidates[0])}
     # informative coverage: fraction of predicted proteins assigned to any
     # BUSCO group (non-Missing rows of full_table.tsv)
     tables = sorted(bdir.glob("busco_out/run_*/full_table.tsv"))
@@ -340,17 +351,63 @@ def compute_bc(pred_faa: Path, busco_path: Path, out_dir: Path, threads: int) ->
                     assessed.add(f[2])
         n_pred = sum(1 for l in open(pred_faa) if l.startswith(">"))
         out["n_busco_assessed"] = len(assessed)
-        out["B_c_informative"] = len(assessed) / n_pred if n_pred else None
+        out["B_s_informative"] = len(assessed) / n_pred if n_pred else None
     return out
+def build_isoform_file(gff: Path, out_path: Path) -> Path | None:
+    """Build the omark -i isoform file from a predictor GFF:
+    one line per gene, ';'-separated ids of ALL its isoform proteins
+    (gffread -y protein ids == transcript ids). omark then picks the
+    best-scoring isoform per gene instead of counting isoforms as
+    duplicates. Returns None when no gene/mRNA structure is found."""
+    if lazy([out_path], desc="isoform file"):
+        return out_path
+    genes: dict[str, list] = {}
+    with open(gff) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 9 or f[2] not in ("mRNA", "transcript"):
+                continue
+            attrs = f[8]
+            m_id = re.search(r"ID=([^;]+)", attrs)
+            if m_id:
+                tid = m_id.group(1)
+                m_par = re.search(r"Parent=([^;,]+)", attrs)
+                gid = m_par.group(1) if m_par else tid
+            else:
+                m_tid = re.search(r'transcript_id "([^"]+)"', attrs)
+                m_gid = re.search(r'gene_id "([^"]+)"', attrs)
+                if not m_tid:
+                    continue
+                tid = m_tid.group(1)
+                gid = m_gid.group(1) if m_gid else tid
+            tids = genes.setdefault(gid, [])
+            if tid not in tids:
+                tids.append(tid)
+    if not genes:
+        return None
+    ensure_dir(out_path.parent)
+    with open(out_path, "w") as out:
+        for gid, tids in genes.items():
+            out.write(";".join(tids) + "\n")
+    return out_path
+
+
 # ---------------------------------------------------------------- O_s
-def compute_os(pred_faa: Path, omark_db: Path, out_dir: Path, threads: int) -> dict:
+def compute_os(pred_faa: Path, omark_db: Path, out_dir: Path, threads: int,
+               isoform_file: Path | None = None,
+               extra_opts: str | None = None) -> dict:
     """O_s: OMArk Consistent fraction (A: line of the .sum), 0..1.
 
     Runs omamer search + omark per predictor protein set; cached under
-    out_dir (a *.sum file reuses the previous result).
+    out_dir (a *.sum file reuses the previous result; changing
+    isoform_file/extra_opts invalidates the cache).
     """
     from .omark import run_omark
-    ctx = run_omark(Path(pred_faa), Path(omark_db), ensure_dir(out_dir), threads)
+    ctx = run_omark(Path(pred_faa), Path(omark_db), ensure_dir(out_dir),
+                    threads, isoform_file=isoform_file,
+                    extra_opts=extra_opts)
     if not ctx.get("ok"):
         raise RuntimeError(f"OMArk failed for {pred_faa}: {ctx.get('error')}")
     pct = ctx.get("consistent_pct")
@@ -495,10 +552,13 @@ def aggregate(subscores: dict[str, float | None],
     return sum(v * eff[k] for k, (v, _) in avail.items()), eff
 
 
-def map_weights(scores: dict[str, float | None], mapping: str = "linear",
+def map_weights(scores: dict[str, float | None], mapping: str = "auto",
                 min_score: float = 0.35) -> dict[str, int | None]:
     """Map P (prediction score) to EVM prediction weights 1..5.
     >=2 predictors: relative scaling (linear: min-max; rank: by rank order).
+    auto (default): rank when >=3 qualified predictors, linear otherwise —
+    rank spreads ANY number of inputs across the full 1..5 weight space,
+    so adding predictors never compresses everyone into the same bucket.
     Single predictor: absolute mapping round(1 + 4*W). Below min_score -> None (excluded).
     """
     valid = {k: v for k, v in scores.items() if v is not None}
@@ -515,6 +575,8 @@ def map_weights(scores: dict[str, float | None], mapping: str = "linear",
         for k, v in good.items():
             out[k] = max(1, min(5, round(1 + 4 * v)))
         return out
+    if mapping == "auto":
+        mapping = "rank" if len(good) >= 3 else "linear"
     vals = sorted(good.values())
     if mapping == "rank":
         ranks = {k: sorted(vals).index(v) for k, v in good.items()}
@@ -566,28 +628,25 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
     if subject_weights:
         detail["H_s_weighted"] = True
 
-    # ---- R_s
-    if "rna" in ablate or not evidence.get("rna"):
-        sub["R_s"] = None
-        detail["R_s_note"] = "ablated" if "rna" in ablate else "no RNA evidence"
-    else:
-        r = compute_rs(gff, evidence["rna"]["junctions_bed"],
-                       evidence["rna"]["stringtie_gtf"], pdir,
-                       cfg["rna_alpha"], cfg["rna_beta"], cfg["rna_gamma"])
-        detail.update(r)
-        sub["R_s"] = r["R_s"]
-
-    # ---- H_s'' (structure-aware: full-length AND anomaly-free)
+    # ---- H_s'' (structure-aware: full-length AND anomaly-free; pure
+    # homolog-protein evidence. The gold set is RNA-derived, so its match
+    # rate is routed to the R_s bundle — EXCEPT when the referee set is too
+    # small to be informative, in which case it rescues H_s instead.
+    # Never both: goldset is counted in exactly one dimension.)
+    goldmatch_for_rs = None
     if "homolog" in ablate:
         sub["H_s"] = None
         detail["H_s_note"] = "ablated"
     else:
         referee_faa = extract_referee_faa(vi.homologs, evidence["homolog"]["referee_ids"],
                                           out_root / "_shared" / "referee.faa")
+        n_referee = sum(1 for ln in open(referee_faa) if ln.startswith(">"))
+        ref_min = cfg.get("hs_referee_min", 1000)
+        rescue = n_referee < ref_min
+        detail["n_referee"] = n_referee
         gold_faa = evidence.get("goldset", {}).get("goldset_faa") if evidence.get("goldset") else None
         h = compute_hs(pred_faa, referee_faa, gold_faa, pdir / "hs", threads,
-                       cfg["fulllength_cov"], cfg["hs_gold_weight"],
-                       subject_weights=subject_weights)
+                       cfg["fulllength_cov"], subject_weights=subject_weights)
         detail.update({k: v for k, v in h.items() if not k.startswith("_")})
         detail["_hits_cache"] = h["_hits_cache"]
         # joint criterion: from the full-length matched proteins, drop the
@@ -595,7 +654,7 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
         # (relatedness-weighted) match rate on the remaining clean set
         if "structure" in ablate:
             detail["H_s_note"] = "structure screen ablated: plain full-length rate"
-            sub["H_s"] = h["Hs"]
+            hs_hom_joint = h["Hs_homolog"]
         else:
             loci = load_referee_loci(evidence["homolog"]["alignments"])
             c = compute_cs(pred_faa, h["_hits_cache"], loci,
@@ -612,21 +671,44 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
                 hs_hom_joint = sum(h["_qweight"].get(q, 1.0) for q in clean) / n_pred
             detail["Hs_homolog_joint"] = hs_hom_joint
             detail["n_fullmatch_clean"] = len(clean)
-            hs_gold = h.get("Hs_gold")
+        hs_gold = h.get("Hs_gold")
+        if rescue and hs_gold is not None:
             gw = cfg["hs_gold_weight"]
-            if hs_gold is not None and hs_hom_joint is not None:
+            if hs_hom_joint is not None:
                 sub["H_s"] = (1 - gw) * hs_hom_joint + gw * hs_gold
             else:
-                sub["H_s"] = hs_hom_joint if hs_hom_joint is not None else hs_gold
+                sub["H_s"] = hs_gold
+            detail["H_s_note"] = (f"goldset rescue: referee set too small "
+                                  f"({n_referee} < {ref_min} proteins)")
+            detail["goldset_routed_to"] = "H_s"
+        else:
+            sub["H_s"] = hs_hom_joint
+            if hs_gold is not None:
+                goldmatch_for_rs = hs_gold
+                detail["goldset_routed_to"] = "R_s"
 
-    # ---- B_c
+    # ---- R_s (RNA evidence bundle: junction support + exon precision +
+    # single-exon bias + gold-set protein match, all RNA-derived)
+    if "rna" in ablate or not evidence.get("rna"):
+        sub["R_s"] = None
+        detail["R_s_note"] = "ablated" if "rna" in ablate else "no RNA evidence"
+    else:
+        r = compute_rs(gff, evidence["rna"]["junctions_bed"],
+                       evidence["rna"]["stringtie_gtf"], pdir,
+                       cfg["rna_alpha"], cfg["rna_beta"], cfg["rna_gamma"],
+                       gold_match=goldmatch_for_rs,
+                       gold_weight=cfg.get("rna_gold_weight", 0.25))
+        detail.update(r)
+        sub["R_s"] = r["R_s"]
+
+    # ---- B_s
     if "conserve" in ablate or not vi.busco:
-        sub["B_c"] = None
-        detail["B_c_note"] = "ablated" if "conserve" in ablate else "no conservation set"
+        sub["B_s"] = None
+        detail["B_s_note"] = "ablated" if "conserve" in ablate else "no conservation set"
     else:
         b = compute_bc(pred_faa, vi.busco, pdir / "busco", threads)
         detail.update(b)
-        sub["B_c"] = b["B_c"]
+        sub["B_s"] = b["B_s"]
 
     # ---- O_s
     if "omark" in ablate or not cfg.get("omark_db"):
@@ -634,7 +716,10 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
         detail["O_s_note"] = "ablated" if "omark" in ablate else "no --omark-db"
     else:
         try:
-            o = compute_os(pred_faa, Path(cfg["omark_db"]), pdir / "omark", threads)
+            iso_file = build_isoform_file(gff, pdir / "isoforms.txt")
+            o = compute_os(pred_faa, Path(cfg["omark_db"]), pdir / "omark",
+                           threads, isoform_file=iso_file,
+                           extra_opts=cfg.get("omark_options"))
             detail.update(o)
             sub["O_s"] = o["O_s"]
         except Exception as e:
@@ -643,14 +728,14 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
             detail["O_s_note"] = f"omark failed: {e}"
 
     weights = {"R_s": cfg["w_rna"], "H_s": cfg["w_homolog"],
-               "B_c": cfg["w_conserve"], "O_s": cfg.get("w_omark", 0.0)}
+               "B_s": cfg["w_conserve"], "O_s": cfg.get("w_omark", 0.0)}
     coverage = None
     if cfg.get("weight_mode") == "adaptive":
         # adaptive: scale each database-driven sub-block by its informative
         # coverage (fraction of proteins with a usable verdict); R_s/H_s
         # are global rate metrics over the whole prediction -> 1.0
         coverage = {"R_s": 1.0, "H_s": 1.0,
-                    "B_c": detail.get("B_c_informative") or 0.0,
+                    "B_s": detail.get("B_s_informative") or 0.0,
                     "O_s": detail.get("O_s_informative") or 0.0}
         detail["informative_coverage"] = coverage
     w, eff = aggregate(sub, weights, coverage)

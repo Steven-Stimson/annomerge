@@ -127,6 +127,27 @@ def _norm_mnp(spec: str) -> str:
     return "" if spec.strip().lower() in ("0", "none", "off") else spec
 
 
+def _check_omark_options(spec: str | None) -> str | None:
+    """Reject pipeline-managed omark flags; everything else is forwarded."""
+    if not spec:
+        return None
+    import shlex
+    protected = {"-f", "--file", "-d", "--database", "-o", "--outputFolder",
+                 "-i", "--isoform_file"}
+    try:
+        toks = shlex.split(spec)
+    except ValueError as e:
+        typer.secho(f"--omark-options: {e}", fg="red", err=True)
+        raise typer.Exit(2)
+    for t in toks:
+        if t in protected:
+            typer.secho(f"--omark-options: {t} is pipeline-managed and "
+                        f"rejected (isoform collapsing is auto-generated)",
+                        fg="red", err=True)
+            raise typer.Exit(2)
+    return spec
+
+
 def _run_evidence_pipeline(
     out: Path, genome: str, homologs: str, rna: Optional[List[str]],
     busco: Optional[str], threads: int,
@@ -175,18 +196,22 @@ def _run_evidence_pipeline(
 
 _SCORING_FORMULA = """
 [bold]Scoring model[/bold] (module 3 — every de novo predictor gets one P (Prediction score)):
-    P = w_r·R_s + w_h·H_s + w_b·B_c + w_o·O_s
-                          (default w_r=0.45, w_h=0.40, w_b=0.15, w_o=0.10)
-  R_s  RNA support: junction/exon coverage + expression (internals α/β/γ, see --rna-weights)
+    P = w_r·R_s + w_h·H_s + w_b·B_s + w_o·O_s
+                          (default w_r=0.45, w_h=0.25, w_b=0.10, w_o=0.20)
+Each sub-block maps to exactly ONE evidence source (no double counting):
+  R_s  RNA support bundle: junction support + exon precision + single-exon bias
+       (internals α/β/γ, see --rna-weights) + GoldMatch (full-length protein
+       match vs the RNA-assembled gold set; share --rna-gold-weight)
   H_s  homolog support (structure-aware): fraction of predicted proteins that are
        BOTH full-length matches vs referee proteins AND structurally clean
-       (no chimeric/split anomaly from the same miniprot hits); blended with the
-       RNA-assembled Gold set (gold-set share = --hs-gold-weight)
-  B_c  conservation: BUSCO complete recall in proteins mode (needs --busco-lineage)
+       (no chimeric/split anomaly from the same miniprot hits). Pure homolog
+       evidence; the RNA-derived gold set is mixed in ONLY as a rescue when the
+       referee set is smaller than --hs-referee-min proteins.
+  B_s  conservation: BUSCO complete recall in proteins mode (needs --busco-lineage)
   O_s  orthology consistency: OMArk Consistent fraction (needs --omark-db)
 
 Sub-blocks without evidence are skipped and the remaining weights are
-renormalized (--weight-mode adaptive additionally scales the B_c / O_s
+renormalized (--weight-mode adaptive additionally scales the B_s / O_s
 weights by their informative coverage — the fraction of proteins the
 database actually gave a verdict on). A predictor enters EVM only when its
 P reaches --min-predictor-score (and a P cannot be computed at all with
@@ -295,12 +320,20 @@ def merge(
         rich_help_panel="Input files"),
     busco: Optional[str] = typer.Option(
         None, "--busco-lineage",
-        help="Local BUSCO odb lineage directory (offline completeness QC; feeds B_c).",
+        help="Local BUSCO odb lineage directory (offline completeness QC; feeds B_s).",
         rich_help_panel="Input files"),
     omark_db: Optional[str] = typer.Option(
         None, "--omark-db",
         help="OMAmer database (.h5) for OMArk orthology QC (runs after BUSCO).",
         rich_help_panel="Input files"),
+    omark_options: Optional[str] = typer.Option(
+        None, "--omark-options",
+        help="Extra flags forwarded to the omark assessment step, e.g. "
+             "\"-e --taxid 33090 --taxonomic_rank kingdom\" or "
+             "\"-e /path/to/taxa.sqlite\". Protected (pipeline-managed): "
+             "-f, -d, -o, -i/--isoform_file (isoform collapsing is generated "
+             "automatically from each predictor GFF).",
+        rich_help_panel="Advanced"),
     threads: int = typer.Option(
         8, "--threads", "-t", help="Threads (also sets the EVM genome-split granularity).",
         rich_help_panel="Input files"),
@@ -313,22 +346,29 @@ def merge(
         help="W_r: weight of the R_s (RNA support) sub-block.",
         rich_help_panel="Scoring"),
     w_homolog: float = typer.Option(
-        0.40, "--w-homolog", help="W_h: weight of the H_s (structure-aware homolog "
+        0.25, "--w-homolog", help="W_h: weight of the H_s (structure-aware homolog "
              "support: full-length AND anomaly-free) sub-block.",
         rich_help_panel="Scoring"),
     w_conserve: float = typer.Option(
-        0.15, "--w-conserve",
-        help="W_b: weight of the B_c (BUSCO complete recall) sub-block; skipped "
+        0.10, "--w-conserve",
+        help="W_b: weight of the B_s (BUSCO complete recall) sub-block; skipped "
              "without --busco-lineage.",
         rich_help_panel="Scoring"),
     w_omark: float = typer.Option(
-        0.10, "--w-omark",
+        0.20, "--w-omark",
         help="W_o: weight of the O_s (OMArk consistent fraction) sub-block; "
              "skipped without --omark-db.",
         rich_help_panel="Scoring"),
     rna_weights: str = typer.Option(
         "0.5,0.35,0.15", "--rna-weights",
         help="R_s internals 'alpha,beta,gamma' (junction support, exon coverage, TPM).",
+        rich_help_panel="Scoring"),
+    rna_gold_weight: float = typer.Option(
+        0.25, "--rna-gold-weight",
+        help="Share of the gold-set protein match (GoldMatch) inside the R_s "
+             "RNA bundle (0-1); the remainder comes from the transcript-level "
+             "--rna-weights components. The gold set is RNA-derived, so it "
+             "lives in R_s (not H_s) — except in referee-rescue mode.",
         rich_help_panel="Scoring"),
     fulllength_cov: float = typer.Option(
         0.9, "--fulllength-cov",
@@ -337,21 +377,32 @@ def merge(
         rich_help_panel="Scoring"),
     hs_gold_weight: float = typer.Option(
         0.5, "--hs-gold-weight",
-        help="Share of Gold-set hits inside H_s (0-1); the remainder comes from "
-             "referee-protein hits.",
+        help="Rescue mode only (referee set smaller than --hs-referee-min): "
+             "share of Gold-set hits inside H_s (0-1); the remainder comes from "
+             "referee-protein hits. In normal mode the gold set is routed to "
+             "R_s instead (see --rna-gold-weight).",
+        rich_help_panel="Scoring"),
+    hs_referee_min: int = typer.Option(
+        1000, "--hs-referee-min",
+        help="Minimum referee-set size (proteins) for H_s to rely on the "
+             "homolog referee alone. Below this the RNA-derived gold set "
+             "rescues H_s (mixed via --hs-gold-weight) instead of feeding R_s.",
         rich_help_panel="Scoring"),
     min_predictor_score: float = typer.Option(
         0.35, "--min-predictor-score",
         help="Minimum P (prediction score) for a predictor to enter EVM integration.",
         rich_help_panel="Scoring"),
     weight_mapping: str = typer.Option(
-        "linear", "--weight-mapping",
-        help="P -> EVM integer weight mapping: [cyan]linear[/cyan] or [cyan]rank[/cyan].",
+        "auto", "--weight-mapping",
+        help="P -> EVM integer weight mapping: [cyan]auto[/cyan] (rank when "
+             ">=3 predictors so any number of inputs is spread across the "
+             "1..5 weight space, else linear), [cyan]linear[/cyan] or "
+             "[cyan]rank[/cyan].",
         rich_help_panel="Scoring"),
     weight_mode: str = typer.Option(
         "fixed", "--weight-mode",
         help="P aggregation mode: [cyan]fixed[/cyan] (default, classic) or "
-             "[cyan]adaptive[/cyan] (scale the B_c / O_s sub-block weights by "
+             "[cyan]adaptive[/cyan] (scale the B_s / O_s sub-block weights by "
              "their informative coverage — the fraction of proteins the "
              "database actually gave a verdict on).",
         rich_help_panel="Scoring"),
@@ -434,6 +485,14 @@ def merge(
              "base-level track, much larger), [cyan]lite[/cyan] (default: coordinates "
              "only), [cyan]no[/cyan] (skip).",
         rich_help_panel="Assessment & report"),
+    show_rna_coverage: int = typer.Option(
+        1, "--show-rna-coverage",
+        help="RNA coverage tracks embedded in the evidence browser: "
+             "[cyan]0[/cyan] = none (smallest browser), [cyan]1[/cyan] = merged "
+             "track over all samples only (default, a single track), "
+             "[cyan]2[/cyan] = merged + one track per sample (largest; per-sample "
+             "depth resolution).",
+        rich_help_panel="Assessment & report"),
     weight_only: bool = typer.Option(
         False, "--weight-only", help="Stop after the EVM weight table.",
         rich_help_panel="Assessment & report"),
@@ -489,6 +548,7 @@ def merge(
         typer.secho(f"unknown --weight-mode {weight_mode!r} (fixed|adaptive)", fg="red", err=True)
         raise typer.Exit(2)
     evm_opts = _parse_evm_options(evm_options)
+    omark_options = _check_omark_options(omark_options)
     try:
         hisat2_opts = parse_extra_opts(
             hisat2_options, ("-x", "-p", "-S", "-1", "-2", "-U", "--dta"), "hisat2")
@@ -526,8 +586,11 @@ def merge(
                w_rna=w_rna, w_homolog=w_homolog, w_conserve=w_conserve,
                w_omark=w_omark,
                omark_db=omark_db,
+               omark_options=omark_options,
                fulllength_cov=fulllength_cov,
                hs_gold_weight=hs_gold_weight,
+               rna_gold_weight=rna_gold_weight,
+               hs_referee_min=hs_referee_min,
                weight_mode=weight_mode,
                ablate=(ablate.split(",") if ablate else []))
     preds = parse_predictors(predictors)
@@ -541,7 +604,7 @@ def merge(
     evm_w = map_weights(p_scores, mapping=weight_mapping, min_score=min_predictor_score)
     wtab = score_dir / "evm_weights.tsv"
     with open(wtab, "w") as fh:
-        fh.write("predictor\tP\tR_s\tH_s\tB_c\tO_s\teffective_weights\tevm_weight\tnote\n")
+        fh.write("predictor\tP\tR_s\tH_s\tB_s\tO_s\teffective_weights\tevm_weight\tnote\n")
         for name in preds:
             d = details[name]
             s = d["subscores"]
@@ -549,7 +612,7 @@ def merge(
             eff = ";".join(f"{k}={v:.3f}" for k, v in
                            (d.get("effective_weights") or {}).items() if v > 0)
             fh.write(f"{name}\t{f(d['P'])}\t{f(s['R_s'])}\t{f(s['H_s'])}\t"
-                     f"{f(s['B_c'])}\t{f(s.get('O_s'))}\t"
+                     f"{f(s['B_s'])}\t{f(s.get('O_s'))}\t"
                      f"{eff or 'NA'}\t"
                      f"{evm_w.get(name) or 'EXCLUDE'}\t"
                      f"{d.get('hard_reject', '')}\n")
@@ -675,6 +738,7 @@ def merge(
         out, final_gff3, vi.genome, final_d,
         busco_lineage=vi.busco, threads=threads,
         omark_db=Path(omark_db) if omark_db else None,
+        omark_options=omark_options,
         rna_junctions=rna_res.get("junctions_bed"),
         stringtie_gtf=stringtie_gtf,
         homologs_faa=vi.homologs,
@@ -699,7 +763,8 @@ def merge(
         from .modules.viewer import run_viewer
         vw_res = run_viewer(out, vi, results, preds, details,
                             final_gff3, final_d, integ_d, threads,
-                            full=(vw == "full"))
+                            full=(vw == "full"),
+                            show_rna_coverage=show_rna_coverage)
         typer.secho(f"evidence browser: {vw_res['html']}", fg="green")
     # publish layer removed: the module dirs themselves are the numbered
     # deliverables (01.validate ... 09.result)
@@ -878,6 +943,12 @@ def evaluate(
     omark_db: Optional[str] = typer.Option(
         None, "--omark-db", help="OMAmer database (.h5) for OMArk orthology QC.",
         rich_help_panel="Input files"),
+    omark_options: Optional[str] = typer.Option(
+        None, "--omark-options",
+        help="Extra flags forwarded to the omark assessment step, e.g. "
+             "\"-e --taxid 33090 --taxonomic_rank kingdom\". Protected: "
+             "-f, -d, -o, -i/--isoform_file. " + _ADV_CAUTION,
+        rich_help_panel="Advanced"),
     mnp_filter: str = typer.Option(
         "UnStop,UnShift", "--mnp-filter", help=_MNP_HELP,
         rich_help_panel="Scoring"),
@@ -894,6 +965,13 @@ def evaluate(
         "lite", "--viewer",
         help="Evidence browser build: [cyan]full[/cyan] / [cyan]lite[/cyan] "
              "(default) / [cyan]no[/cyan].",
+        rich_help_panel="Assessment & report"),
+    show_rna_coverage: int = typer.Option(
+        1, "--show-rna-coverage",
+        help="RNA coverage tracks embedded in the evidence browser: "
+             "[cyan]0[/cyan] = none, [cyan]1[/cyan] = merged track over all "
+             "samples only (default, a single track), [cyan]2[/cyan] = merged + "
+             "one track per sample.",
         rich_help_panel="Assessment & report"),
     hisat2_options: Optional[str] = typer.Option(
         None, "--hisat2-options",
@@ -930,6 +1008,7 @@ def evaluate(
     if vw not in ("full", "lite", "no"):
         typer.secho(f"unknown --viewer {viewer!r} (full|lite|no)", fg="red", err=True)
         raise typer.Exit(2)
+    omark_options = _check_omark_options(omark_options)
     try:
         hisat2_opts = parse_extra_opts(
             hisat2_options, ("-x", "-p", "-S", "-1", "-2", "-U", "--dta"), "hisat2")
@@ -1007,6 +1086,7 @@ def evaluate(
         out, final_gff3, vi.genome, eval_d,
         busco_lineage=vi.busco, threads=threads,
         omark_db=Path(omark_db) if omark_db else None,
+        omark_options=omark_options,
         rna_junctions=rna_res.get("junctions_bed"),
         stringtie_gtf=rna_res.get("stringtie_gtf"),
         homologs_faa=vi.homologs,
@@ -1027,7 +1107,8 @@ def evaluate(
         from .modules.viewer import run_viewer
         vw_res = run_viewer(out, vi, results, vi.predictors or {}, {},
                             final_gff3, eval_d, eval_d, threads,
-                            full=(vw == "full"))
+                            full=(vw == "full"),
+                            show_rna_coverage=show_rna_coverage)
         typer.secho(f"evidence browser: {vw_res['html']}", fg="green")
     typer.secho(f"deliverables: {out}/01.validate ... 09.result", fg="green")
 

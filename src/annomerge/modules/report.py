@@ -161,14 +161,17 @@ def busco_proteins(faa: Path, lineage: Path, out_dir: Path,
 
 
 # ------------------------------------------------------------------ OMArk
-def omark_proteins(faa: Path, db: Path, out_dir: Path, threads: int) -> dict:
+def omark_proteins(faa: Path, db: Path, out_dir: Path, threads: int,
+                   extra_opts: str | None = None) -> dict:
     """OMArk quality assessment (needs an OMAmer database, --omark-db).
 
     Degrades gracefully: {"ok": False, "error": ...} when the DB or the
     omark/omamer installation is missing — the report then shows a skip note.
+    extra_opts: forwarded to the omark assessment step (--omark-options).
     """
     from .omark import run_omark
-    return run_omark(Path(faa), Path(db), Path(out_dir), threads)
+    return run_omark(Path(faa), Path(db), Path(out_dir), threads,
+                     extra_opts=extra_opts)
 
 
 # ------------------------------------------------------------- evidence
@@ -724,7 +727,7 @@ def final_annotation_score(out: Path, final_gff3: Path, genome_fa: Path,
                            rna_junctions=None, stringtie_gtf=None,
                            homologs_faa=None, referee_ids=None) -> dict | None:
     """Score the FINAL annotation with the same P formula as the predictors
-    (fixed default weights). B_c / O_s reuse the BUSCO / OMArk results already
+    (fixed default weights). B_s / O_s reuse the BUSCO / OMArk results already
     computed for this report; R_s / H_s are computed on the final GFF3
     and cached under 08.assessment/final_scoring."""
     from .scoring import (compute_rs, compute_hs, compute_cs, aggregate,
@@ -736,8 +739,20 @@ def final_annotation_score(out: Path, final_gff3: Path, genome_fa: Path,
         pred_faa = extract_proteins(Path(genome_fa), Path(final_gff3),
                                     work / "proteins.faa")
         if rna_junctions and stringtie_gtf and Path(str(rna_junctions)).exists():
+            # goldset protein match joins the R_s bundle here too (same
+            # routing as predictor-level scoring: goldset is RNA-derived)
+            gold_match = None
+            gold_faa = Path(out) / "04.goldset" / "goldset.faa"
+            if gold_faa.exists():
+                from .scoring import _diamond_blastp, full_length_match_rate
+                hs_dir = ensure_dir(work / "hs")
+                tsv_g = _diamond_blastp(pred_faa, gold_faa,
+                                        hs_dir / "pred_vs_goldset.tsv",
+                                        threads, hs_dir)
+                gold_match, _, _, _ = full_length_match_rate(tsv_g, 0.9)
             r = compute_rs(Path(final_gff3), Path(str(rna_junctions)),
-                           Path(str(stringtie_gtf)), work, 0.5, 0.35, 0.15)
+                           Path(str(stringtie_gtf)), work, 0.5, 0.35, 0.15,
+                           gold_match=gold_match, gold_weight=0.25)
             sub["R_s"] = r["R_s"]
         else:
             sub["R_s"] = None
@@ -759,17 +774,17 @@ def final_annotation_score(out: Path, final_gff3: Path, genome_fa: Path,
                 sub["H_s"] = (sum(h["_qweight"].get(q, 1.0) for q in clean) / n_pred
                               if n_pred else None)
             else:
-                sub["H_s"] = h["Hs"]
+                sub["H_s"] = h["Hs_homolog"]
         else:
             sub["H_s"] = None
         busco = ctx.get("busco") or {}
-        sub["B_c"] = (busco["complete_pct"] / 100.0) \
+        sub["B_s"] = (busco["complete_pct"] / 100.0) \
             if busco.get("ok") and busco.get("complete_pct") is not None else None
         omark = ctx.get("omark") or {}
         sub["O_s"] = (float(omark["consistent_pct"]) / 100.0) \
             if omark.get("ok") and omark.get("consistent_pct") is not None else None
-        w, eff = aggregate(sub, {"R_s": 0.45, "H_s": 0.40, "B_c": 0.15,
-                                 "O_s": 0.10})
+        w, eff = aggregate(sub, {"R_s": 0.45, "H_s": 0.25, "B_s": 0.10,
+                                 "O_s": 0.20})
         log.info("final annotation P=%s subscores=%s",
                  f"{w:.4f}" if w is not None else "NA",
                  {k: (f"{v:.3f}" if isinstance(v, float) else "NA")
@@ -990,6 +1005,7 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
                threads: int,
                run_meta: dict | None = None,
                omark_db: Path | None = None,
+               omark_options: str | None = None,
                rna_junctions=None, stringtie_gtf=None,
                homologs_faa=None, referee_ids=None) -> dict:
     """Collect every report input; writes 09.result/report.html + stats.json
@@ -1008,7 +1024,8 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
     else:
         ctx["busco"] = {"ok": False, "error": "no BUSCO lineage given"}
     if omark_db and Path(omark_db).exists():
-        ctx["omark"] = omark_proteins(faa, omark_db, assess / "omark", threads)
+        ctx["omark"] = omark_proteins(faa, omark_db, assess / "omark",
+                                      threads, extra_opts=omark_options)
     else:
         # no usable OMAmer database (not given or file missing): leave the
         # OMArk section out entirely — no placeholder, no skip note
