@@ -35,16 +35,19 @@
   .flt-row select { padding: 3px 6px; border: 1px solid #ccc; border-radius: 4px;
                     font-size: 12px; background: #fff; }
   #list-info { padding: 0 12px 6px; font-size: 11px; color: #888; }
-  #gene-table { flex: 1 1 auto; overflow-y: auto; font-size: 12px; }
-  #gene-table table { width: 100%; border-collapse: collapse; }
+  #gene-table { flex: 1 1 auto; overflow: auto; font-size: 12px; }
+  /* table may grow past the panel width (cells are nowrap) -> horizontal
+     scrollbar on #gene-table; at least panel width when content is narrow */
+  #gene-table table { width: max-content; min-width: 100%; border-collapse: collapse; }
   #gene-table th { position: sticky; top: 0; background: #f5f5f5; padding: 6px 8px; text-align: left;
                    border-bottom: 1px solid #ddd; font-weight: 600; }
   #gene-table th select.col-flt { font-size: 11px; font-weight: 400; padding: 1px 2px;
                                   margin-left: 2px; border: 1px solid #ccc; border-radius: 3px;
                                   background: #fff; max-width: 92px; }
-  /* Flags multi-select filter (header dropdown panel) */
-  .flag-flt-wrap { position: relative; display: inline-block; }
-  #flt-flag-btn { font-size: 11px; font-weight: 400; padding: 1px 6px; margin-left: 2px;
+  /* Flags multi-select filter (header dropdown panel); the control sits on
+     its own line under the "Flags" title, matching the other column filters */
+  .flag-flt-wrap { position: relative; display: block; margin-top: 2px; }
+  #flt-flag-btn { font-size: 11px; font-weight: 400; padding: 1px 6px; margin-left: 0;
                   border: 1px solid #ccc; border-radius: 3px; background: #fff;
                   cursor: pointer; max-width: 92px; }
   #flt-flag-btn.active { background: #1f4e79; color: #fff; border-color: #1f4e79; }
@@ -103,6 +106,13 @@
         background: #777; margin-right: 2px; }
   .gs-yes { color: #1a7f37; font-weight: 700; } .gs-no { color: #bbb; }
   .score-low { color: #c0392b; font-weight: 700; }
+  /* draggable split between the gene-list sidebar and the IGV panel */
+  #splitter { flex: 0 0 6px; cursor: col-resize; background: #e3e8ee;
+              transition: background .15s; }
+  #splitter:hover, #splitter.drag { background: #4C72B0; }
+  body.side-collapsed #splitter { display: none; }
+  body.split-drag { cursor: col-resize; user-select: none; }
+  body.split-drag #igv-div { pointer-events: none; }
   #igv-div { flex: 1 1 auto; min-width: 0; overflow-y: auto; }
   /* igv root (.igv-container) is height:auto and grows with total track height; scroll at this container */
   #igv-div .igv-container { height: auto; min-height: 100%; }
@@ -196,6 +206,7 @@
       <div id="gene-detail"><span class="dt-empty">Click a gene in the list above (or search) to see its structure and evidence support details.</span></div>
     </div>
   </div>
+  <div id="splitter" title="Drag to resize the gene list / IGV split"></div>
   <div id="igv-div"></div>
 </div>
 <div id="status">Loading igv.js and annotation data&hellip;</div>
@@ -565,8 +576,9 @@ function renderTable(keyword) {
       `<td class="${rnaCls}" title="RNA support: ${t.rna_basis}">${t.rna}</td>` +
       `<td class="${protCls}" title="Protein support: ${t.prot_basis}">${t.prot}</td>` +
       `<td class="${t.gold === "yes" ? "gs-yes" : "gs-no"}" title="GoldSet origin">${t.gold === "yes" ? "✓" : "·"}</td>` +
-      `<td class="${(t.flags && t.flags.length) ? "flag-yes" : ""}" title="Intrinsic flags">` +
-      `${(t.flags && t.flags.length) ? t.flags.map(f => FLAG_LABELS[f] || f).join(",") : "·"}</td>`;
+      `<td class="${(t.flags && t.flags.length) ? "flag-yes" : ""}" ` +
+      `title="${(t.flags && t.flags.length) ? ("Intrinsic flags (" + t.flags.length + "): " + t.flags.map(f => FLAG_LABELS[f] || f).join(", ")) : "no intrinsic flags"}">` +
+      `${(t.flags && t.flags.length) ? t.flags.length : "·"}</td>`;
     tr.addEventListener("click", () => jumpToGene(g.gene));
     frag.appendChild(tr);
   }
@@ -751,6 +763,40 @@ document.getElementById("side-toggle").addEventListener("click", () => {
   // notify igv to recompute viewport after panel width change
   setTimeout(() => window.dispatchEvent(new Event("resize")), 50);
 });
+// draggable split between the gene-list sidebar and the IGV panel: mousedown
+// on the splitter then drag horizontally; IGV re-lays out through a throttled
+// window-resize event while dragging (and once more on release).
+{
+  const splitter = document.getElementById("splitter");
+  const sidebar = document.getElementById("sidebar");
+  const main = document.getElementById("main");
+  let drag = null;
+  let raf = 0;
+  splitter.addEventListener("mousedown", (e) => {
+    drag = { x: e.clientX, w: sidebar.getBoundingClientRect().width };
+    document.body.classList.add("split-drag");
+    splitter.classList.add("drag");
+    e.preventDefault();
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!drag) return;
+    const total = main.getBoundingClientRect().width;
+    let w = drag.w + (e.clientX - drag.x);
+    w = Math.max(240, Math.min(total - 160, w));   // keep both panels usable
+    sidebar.style.flex = "0 0 " + Math.round(w) + "px";
+    if (!raf) raf = requestAnimationFrame(() => {
+      raf = 0;
+      window.dispatchEvent(new Event("resize"));
+    });
+  });
+  window.addEventListener("mouseup", () => {
+    if (!drag) return;
+    drag = null;
+    document.body.classList.remove("split-drag");
+    splitter.classList.remove("drag");
+    setTimeout(() => window.dispatchEvent(new Event("resize")), 50);
+  });
+}
 document.getElementById("tc-toggle").addEventListener("click", () => {
   document.getElementById("track-colors").classList.toggle("open");
 });
