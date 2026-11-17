@@ -270,6 +270,11 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
                 "prot_reached": prot_reached,
                 "cov": f"{_num(cov_frac):.3f}", "depth": _num(depth),
                 "gold": gold, "marks": ",".join(tx_marks),
+                # machine-readable intrinsic flags (only _FLAG_MAP keys, in
+                # stable sorted order) for the gene-list flag filter; `marks`
+                # above stays the human-readable label string.
+                "flags": (sorted({f for f in flags.split(",") if f in _FLAG_MAP})
+                          if flags != "." else []),
                 "cds": 0, "exon": 0,
             })
 

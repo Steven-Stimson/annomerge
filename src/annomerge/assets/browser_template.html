@@ -42,6 +42,23 @@
   #gene-table th select.col-flt { font-size: 11px; font-weight: 400; padding: 1px 2px;
                                   margin-left: 2px; border: 1px solid #ccc; border-radius: 3px;
                                   background: #fff; max-width: 92px; }
+  /* Flags multi-select filter (header dropdown panel) */
+  .flag-flt-wrap { position: relative; display: inline-block; }
+  #flt-flag-btn { font-size: 11px; font-weight: 400; padding: 1px 6px; margin-left: 2px;
+                  border: 1px solid #ccc; border-radius: 3px; background: #fff;
+                  cursor: pointer; max-width: 92px; }
+  #flt-flag-btn.active { background: #1f4e79; color: #fff; border-color: #1f4e79; }
+  .flag-panel { display: none; position: absolute; top: calc(100% + 2px); right: 0; z-index: 80;
+                background: #fff; border: 1px solid #bbb; border-radius: 6px;
+                box-shadow: 0 4px 16px rgba(0,0,0,.18); padding: 8px 10px; min-width: 190px;
+                font-weight: 400; text-align: left; }
+  .flag-panel.open { display: block; }
+  .flag-panel label { display: flex; align-items: center; gap: 6px; padding: 2px 0;
+                      font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .flag-panel .fp-actions { margin-top: 6px; padding-top: 5px; border-top: 1px solid #eee;
+                            text-align: right; }
+  .flag-panel .fp-actions a { font-size: 11px; color: #4C72B0; cursor: pointer; }
+  #gene-table td.flag-yes { color: #b8860b; }
   #gene-table td { padding: 4px 8px; border-bottom: 1px solid #f0f0f0; cursor: pointer; white-space: nowrap; }
   #gene-table tr:hover td { background: #eaf2fa; }
   #gene-table tr.current td { background: #d6e6f5; }
@@ -165,7 +182,11 @@
               <option value="">all</option>
               <option value="yes">✓</option>
               <option value="no">no</option>
-            </select></th></tr></thead>
+            </select></th>
+            <th title="Intrinsic flags">Flags <span class="flag-flt-wrap">
+              <button type="button" id="flt-flag-btn" title="Filter by intrinsic flags (multi-select; transcript must carry at least one selected flag)">all &#9662;</button>
+              <div id="flt-flag-panel" class="flag-panel"></div>
+            </span></th></tr></thead>
           <tbody id="gene-tbody"></tbody>
         </table>
       </div>
@@ -190,6 +211,14 @@ let fltChr = "";
 let fltRna = "";     // "" | hi (>=0.8) | mid (0.5-0.8) | lo (<0.5)
 let fltProt = "";
 let fltGold = "";    // "" | yes | no
+let fltFlags = new Set();   // selected intrinsic flags (multi-select; empty = no flag filter)
+// intrinsic flag value -> human label (mirrors viewer.py _FLAG_MAP)
+const FLAG_LABELS = {
+  single_exon: "single-exon",
+  noncanonical_splice: "noncanonical-splice",
+  neighbour_overlap: "neighbour-overlap",
+  short_orf: "short-ORF",
+};
 let sortMode = "gff";
 let sortDir = "asc";
 let chromOrder = new Map();   // chrom name -> index in fai
@@ -394,6 +423,7 @@ async function loadGenes() {
     opt.value = g.gene;
     dl.appendChild(opt);
   }
+  buildFlagFilter();
   renderTable("");
   const nTx = genes.reduce((n, g) => n + (g.isoforms || []).length, 0);
   document.getElementById("count-info").textContent =
@@ -417,6 +447,55 @@ function sortGenes(list) {
   const sorted = list.slice().sort(cmp);
   return sortDir === "desc" ? sorted.reverse() : sorted;
 }
+// build the Flags multi-select panel from the flags actually present in the
+// data (label order follows FLAG_LABELS; unknown flags appended as-is).
+function buildFlagFilter() {
+  const present = new Set();
+  for (const g of genes) for (const t of (g.isoforms || []))
+    for (const f of (t.flags || [])) present.add(f);
+  const order = Object.keys(FLAG_LABELS).filter(f => present.has(f));
+  for (const f of present) if (!(f in FLAG_LABELS)) order.push(f);
+  const panel = document.getElementById("flt-flag-panel");
+  panel.innerHTML = "";
+  if (!order.length) {
+    const d = document.createElement("div");
+    d.style.cssText = "font-size:12px;color:#888;padding:4px 2px;";
+    d.textContent = "no flags in data";
+    panel.appendChild(d);
+    return;
+  }
+  for (const f of order) {
+    const lab = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.value = f;
+    cb.addEventListener("change", () => {
+      if (cb.checked) fltFlags.add(f); else fltFlags.delete(f);
+      updateFlagBtn();
+      renderTable(document.getElementById("gene-search").value);
+    });
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(FLAG_LABELS[f] || f));
+    panel.appendChild(lab);
+  }
+  const act = document.createElement("div");
+  act.className = "fp-actions";
+  const clr = document.createElement("a");
+  clr.textContent = "clear";
+  clr.addEventListener("click", () => {
+    fltFlags.clear();
+    panel.querySelectorAll("input[type=checkbox]").forEach(c => { c.checked = false; });
+    updateFlagBtn();
+    renderTable(document.getElementById("gene-search").value);
+  });
+  act.appendChild(clr);
+  panel.appendChild(act);
+}
+function updateFlagBtn() {
+  const b = document.getElementById("flt-flag-btn");
+  const n = fltFlags.size;
+  b.textContent = n ? `${n} flag${n > 1 ? "s" : ""} ▾` : "all ▾";
+  b.classList.toggle("active", n > 0);
+}
 function renderTable(keyword) {
   const kw = keyword.trim().toLowerCase();
   const tbody = document.getElementById("gene-tbody");
@@ -437,6 +516,14 @@ function renderTable(keyword) {
       if (fltProt === "lo" && pv >= 0.5) continue;
       if (fltGold === "yes" && t.gold !== "yes") continue;
       if (fltGold === "no" && t.gold === "yes") continue;
+      // intrinsic-flag multi-select filter (AND-combined with the filters
+      // above; transcript must carry >= 1 of the selected flags)
+      if (fltFlags.size) {
+        const tf = t.flags || [];
+        let hit = false;
+        for (const f of tf) { if (fltFlags.has(f)) { hit = true; break; } }
+        if (!hit) continue;
+      }
       pool.push({ g, t });
     }
   }
@@ -477,7 +564,9 @@ function renderTable(keyword) {
       `<td><span class="badge b-${t.tier}">${t.tier}</span></td>` +
       `<td class="${rnaCls}" title="RNA support: ${t.rna_basis}">${t.rna}</td>` +
       `<td class="${protCls}" title="Protein support: ${t.prot_basis}">${t.prot}</td>` +
-      `<td class="${t.gold === "yes" ? "gs-yes" : "gs-no"}" title="GoldSet origin">${t.gold === "yes" ? "✓" : "·"}</td>`;
+      `<td class="${t.gold === "yes" ? "gs-yes" : "gs-no"}" title="GoldSet origin">${t.gold === "yes" ? "✓" : "·"}</td>` +
+      `<td class="${(t.flags && t.flags.length) ? "flag-yes" : ""}" title="Intrinsic flags">` +
+      `${(t.flags && t.flags.length) ? t.flags.map(f => FLAG_LABELS[f] || f).join(",") : "·"}</td>`;
     tr.addEventListener("click", () => jumpToGene(g.gene));
     frag.appendChild(tr);
   }
@@ -640,6 +729,19 @@ bindFilter("flt-tier", v => currentTier = v);
 bindFilter("flt-rna", v => fltRna = v);
 bindFilter("flt-prot", v => fltProt = v);
 bindFilter("flt-gold", v => fltGold = v);
+// Flags multi-select: toggle the panel on button click; close on outside click.
+// (selection state lives in fltFlags; it only re-filters via renderTable and
+// never touches sortMode/sortDir, so it cannot disturb the sorters.)
+{
+  const flagBtn = document.getElementById("flt-flag-btn");
+  const flagPanel = document.getElementById("flt-flag-panel");
+  flagBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    flagPanel.classList.toggle("open");
+  });
+  flagPanel.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => flagPanel.classList.remove("open"));
+}
 document.getElementById("side-toggle").addEventListener("click", () => {
   document.body.classList.toggle("side-collapsed");
   const collapsed = document.body.classList.contains("side-collapsed");

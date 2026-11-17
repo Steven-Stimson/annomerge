@@ -797,10 +797,24 @@ def final_annotation_score(out: Path, final_gff3: Path, genome_fa: Path,
 
 
 # --------------------------------------------------------------- tag table
+# intrinsic quality flags written onto the final GFF3 (mRNA ``Flags`` attr).
+# annotate_support stores the human-readable labels (confidence._TAG_FLAG_MAP
+# values, e.g. "single-exon"); the keys here use the SAME label form so the
+# overview shows a description instead of echoing the raw flag value.
+FLAG_DESCRIPTIONS = {
+    "single-exon": "single-exon transcript (no intron / no splice junction)",
+    "noncanonical-splice": "non-canonical splice junction (not GT-AG etc.)",
+    "neighbour-overlap": "CDS overlaps a neighbouring gene model",
+    "short-ORF": "unusually short ORF / CDS",
+}
+
+
 def tag_overview(final_gff3: Path) -> dict:
     """Count every support tag written onto the final GFF3 (transcript-level
     for Tier/RNA/protein/denovo/flags, gene-level for BUSCO/OMArk)."""
+    from .confidence import _TAG_FLAG_MAP  # machine value -> display label
     tiers, flags, denovo = Counter(), Counter(), Counter()
+    flags_gene: dict = {}
     rna_yes = prot_yes = busco_sup = omark_sup = n_tx = 0
     with open(final_gff3) as fh:
         for ln in fh:
@@ -812,6 +826,8 @@ def tag_overview(final_gff3: Path) -> dict:
             attrs = f[8]
             if f[2] == "mRNA":
                 n_tx += 1
+                mp = re.search(r"Parent=([^;]+)", attrs)
+                gid = (mp.group(1).split(",")[0] if mp else None)
                 m = re.search(r"Tier=([^;]+)", attrs)
                 if m:
                     tiers[m.group(1)] += 1
@@ -834,14 +850,23 @@ def tag_overview(final_gff3: Path) -> dict:
                 if m:
                     for fl in m.group(1).split(","):
                         fl = fl.strip()
-                        if fl and fl != ".":
-                            flags[fl] += 1
+                        # normalize to the stored display label (accepts both
+                        # machine values and labels) and skip the "none"
+                        # placeholder (transcript assessed, no flag raised)
+                        fl = _TAG_FLAG_MAP.get(fl, fl)
+                        if not fl or fl in (".", "none"):
+                            continue
+                        flags[fl] += 1
+                        if gid:
+                            flags_gene.setdefault(fl, set()).add(gid)
             elif f[2] == "gene":
                 busco_sup += "BUSCO_support=" in attrs
                 omark_sup += "OMArk_support=" in attrs
     return {"n_transcripts": n_tx, "tiers": dict(tiers),
             "rna_supported": rna_yes, "protein_supported": prot_yes,
             "denovo_supported": dict(denovo), "intrinsic_flags": dict(flags),
+            "intrinsic_flags_genes": {fl: len(s) for fl, s in flags_gene.items()},
+            "flag_descriptions": FLAG_DESCRIPTIONS,
             "busco_supported_genes": busco_sup, "omark_supported_genes": omark_sup}
 
 

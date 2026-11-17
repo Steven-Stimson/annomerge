@@ -229,8 +229,19 @@ predictors (fixed default weights):</p>
     {% endfor %}
   </tr>
 </table>
-<p class="muted">Effective weights used: {% for k, v in final_score.effective_weights.items() %}{{ k }}&nbsp;{{ "%.2f"|format(v) }}{% if not loop.last %}, {% endif %}{% endfor %}.
-Note: the final annotation inherits structures from the best-scored evidence,
+<p>Effective weights used to combine the sub-blocks:</p>
+<table>
+  <tr><th>Sub-block</th><th class="num">Effective weight</th><th>Evidence</th></tr>
+  {% set wdesc = {"R_s": "RNA evidence bundle (splice junctions / exon precision / GoldMatch)",
+                  "H_s": "homolog protein evidence (structure-aware)",
+                  "B_s": "BUSCO completeness",
+                  "O_s": "OMArk HOG consistency"} %}
+  {% for k, v in final_score.effective_weights.items() %}
+  <tr><td><code>{{ k }}</code></td><td class="num">{{ "%.2f"|format(v) }}</td>
+      <td>{{ wdesc.get(k, "") }}</td></tr>
+  {% endfor %}
+</table>
+<p class="muted">Note: the final annotation inherits structures from the best-scored evidence,
 so this score is a self-consistency check rather than independent proof of quality.</p>
 {% else %}
 <p class="note">Final annotation score not available.</p>
@@ -240,8 +251,8 @@ so this score is a self-consistency check rather than independent proof of quali
   <tr><td>Transcripts</td><td class="num">{{ gene_set.n_transcripts }}</td></tr>
   <tr><td>Coding transcripts</td><td class="num">{{ gene_set.n_coding_transcripts }}</td></tr>
   <tr><td>Strong-evidence transcripts</td><td class="num">{{ evidence.tiers.get("strong", 0) if evidence else 0 }}</td></tr>
-  <tr><td>OMArk-supported genes</td><td class="num">{{ tags.omark_supported_genes or 0 }}</td></tr>
-  <tr><td>BUSCO-supported genes</td><td class="num">{{ tags.busco_supported_genes or 0 }}</td></tr>
+  <tr><td>OMArk-supported genes</td><td class="num">{{ (orthodb.omark_supported if orthodb else 0) or 0 }}</td></tr>
+  <tr><td>BUSCO-supported genes</td><td class="num">{{ (orthodb.busco_supported if orthodb else 0) or 0 }}</td></tr>
 </table>
 
 <h3>3.1 Evidence Support (confidence tiers)</h3>
@@ -298,45 +309,30 @@ suggests possible contamination or over-annotation.</p>
 <p class="note">BUSCO not run: {{ busco.error }}</p>
 {% endif %}
 
-<h3>3.4 Tag overview</h3>
-<p>Support tags written onto the final GFF3 (Tier / RNA / protein / de novo /
-flags are transcript-level; BUSCO / OMArk are gene-level):</p>
+<h3>3.4 Flag overview</h3>
+{% if tags.intrinsic_flags %}
+<p>Intrinsic quality flags written onto the final GFF3 (<code>Flags</code>
+attribute, transcript level). A transcript may carry several flags; a gene is
+counted once per flag when any of its transcripts carries it. The same flags
+can be browsed interactively with the Flags filter in the evidence browser
+(viewer/).</p>
 <table>
-  <tr><th>Tag</th><th>Value</th><th class="num">Count</th><th class="num">Fraction</th></tr>
-  {% for t in ["strong", "moderate", "weak", "uncalibrated"] %}
-  {% if tags.tiers.get(t) %}
-  <tr><td><code>Tier</code></td><td class="tier-{{ t }}">{{ t }}</td>
-      <td class="num">{{ tags.tiers[t] }}</td>
-      <td class="num">{{ "%.1f"|format(100 * tags.tiers[t] / tags.n_transcripts) }}%</td></tr>
-  {% endif %}
-  {% endfor %}
-  <tr><td><code>RNA_support</code></td><td>&gt; 0</td>
-      <td class="num">{{ tags.rna_supported }}</td>
-      <td class="num">{{ "%.1f"|format(100 * tags.rna_supported / tags.n_transcripts) }}%</td></tr>
-  <tr><td><code>Protein_support</code></td><td>&gt; 0</td>
-      <td class="num">{{ tags.protein_supported }}</td>
-      <td class="num">{{ "%.1f"|format(100 * tags.protein_supported / tags.n_transcripts) }}%</td></tr>
-  {% for name, n in tags.denovo_supported.items() %}
-  <tr><td><code>denovo_support</code></td><td>{{ name }}</td>
-      <td class="num">{{ n }}</td>
-      <td class="num">{{ "%.1f"|format(100 * n / tags.n_transcripts) }}%</td></tr>
-  {% endfor %}
-  {% if tags.busco_supported_genes %}
-  <tr><td><code>BUSCO_support</code></td><td>gene level</td>
-      <td class="num">{{ tags.busco_supported_genes }}</td>
-      <td class="num">{{ "%.1f"|format(100 * tags.busco_supported_genes / gene_set.n_genes) }}%</td></tr>
-  {% endif %}
-  {% if tags.omark_supported_genes %}
-  <tr><td><code>OMArk_support</code></td><td>gene level</td>
-      <td class="num">{{ tags.omark_supported_genes }}</td>
-      <td class="num">{{ "%.1f"|format(100 * tags.omark_supported_genes / gene_set.n_genes) }}%</td></tr>
-  {% endif %}
-  {% for fl, n in tags.intrinsic_flags.items() %}
-  <tr><td><code>Flags</code></td><td>{{ fl }}</td>
-      <td class="num">{{ n }}</td>
-      <td class="num">{{ "%.1f"|format(100 * n / tags.n_transcripts) }}%</td></tr>
+  <tr><th>Flag</th><th>Description</th><th class="num">Transcripts</th>
+      <th class="num">% tx</th><th class="num">Genes</th><th class="num">% genes</th></tr>
+  {% for fl, n in tags.intrinsic_flags.items()|sort %}
+  <tr>
+    <td><code>{{ fl }}</code></td>
+    <td>{{ tags.flag_descriptions.get(fl, fl) }}</td>
+    <td class="num">{{ n }}</td>
+    <td class="num">{{ "%.1f"|format(100 * n / tags.n_transcripts) }}%</td>
+    <td class="num">{{ tags.intrinsic_flags_genes.get(fl, 0) }}</td>
+    <td class="num">{{ "%.1f"|format(100 * tags.intrinsic_flags_genes.get(fl, 0) / gene_set.n_genes) if gene_set.n_genes else "0.0" }}%</td>
+  </tr>
   {% endfor %}
 </table>
+{% else %}
+<p class="note">No intrinsic flags recorded on the final annotation.</p>
+{% endif %}
 
 <!-- ============================================================ 4. Dependencies & Citation -->
 <details open>
