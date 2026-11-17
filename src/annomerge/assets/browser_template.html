@@ -465,8 +465,10 @@ function sortGenes(list) {
   return sortDir === "desc" ? sorted.reverse() : sorted;
 }
 // build the Flags multi-select panel from the flags actually present in the
-// data (label order follows FLAG_LABELS; unknown flags appended as-is).
+// data (label order follows FLAG_LABELS; unknown flags appended as-is). A
+// pseudo-flag "__no_flags__" is offered first to select flag-less transcripts.
 function buildFlagFilter() {
+  const NOFLAG = "__no_flags__";   // pseudo-flag: transcripts carrying no intrinsic flag
   const present = new Set();
   for (const g of genes) for (const t of (g.isoforms || []))
     for (const f of (t.flags || [])) present.add(f);
@@ -474,25 +476,26 @@ function buildFlagFilter() {
   for (const f of present) if (!(f in FLAG_LABELS)) order.push(f);
   const panel = document.getElementById("flt-flag-panel");
   panel.innerHTML = "";
-  if (!order.length) {
-    const d = document.createElement("div");
-    d.style.cssText = "font-size:12px;color:#888;padding:4px 2px;";
-    d.textContent = "no flags in data";
-    panel.appendChild(d);
-    return;
-  }
-  for (const f of order) {
+  const addOpt = (value, text) => {
     const lab = document.createElement("label");
     const cb = document.createElement("input");
-    cb.type = "checkbox"; cb.value = f;
+    cb.type = "checkbox"; cb.value = value;
     cb.addEventListener("change", () => {
-      if (cb.checked) fltFlags.add(f); else fltFlags.delete(f);
+      if (cb.checked) fltFlags.add(value); else fltFlags.delete(value);
       updateFlagBtn();
       renderTable(document.getElementById("gene-search").value);
     });
     lab.appendChild(cb);
-    lab.appendChild(document.createTextNode(FLAG_LABELS[f] || f));
+    lab.appendChild(document.createTextNode(text));
     panel.appendChild(lab);
+  };
+  // "no flags" entry first: pick transcripts carrying no intrinsic flag
+  addOpt(NOFLAG, "no flags (∅)");
+  if (order.length) {
+    const sep = document.createElement("div");
+    sep.style.cssText = "border-top:1px solid #eee;margin:5px 0 2px;";
+    panel.appendChild(sep);
+    for (const f of order) addOpt(f, FLAG_LABELS[f] || f);
   }
   const act = document.createElement("div");
   act.className = "fp-actions";
@@ -512,6 +515,20 @@ function updateFlagBtn() {
   const n = fltFlags.size;
   b.textContent = n ? `${n} flag${n > 1 ? "s" : ""} ▾` : "all ▾";
   b.classList.toggle("active", n > 0);
+}
+// default layout: expand the gene list just wide enough to show every column
+// (no horizontal scrolling) up to 62% of the window; the user can still drag
+// the splitter to re-balance afterwards.
+function autoFitSidebar() {
+  const sidebar = document.getElementById("sidebar");
+  const table = document.querySelector("#gene-table table");
+  const main = document.getElementById("main");
+  if (!sidebar || !table || !main) return;
+  const total = main.getBoundingClientRect().width;
+  const want = table.scrollWidth + 26;   // table content width + sidebar padding/borders
+  const w = Math.max(Math.round(total / 3), Math.min(Math.round(total * 0.62), want));
+  sidebar.style.flex = "0 0 " + w + "px";
+  window.dispatchEvent(new Event("resize"));
 }
 function renderTable(keyword) {
   const kw = keyword.trim().toLowerCase();
@@ -534,11 +551,13 @@ function renderTable(keyword) {
       if (fltGold === "yes" && t.gold !== "yes") continue;
       if (fltGold === "no" && t.gold === "yes") continue;
       // intrinsic-flag multi-select filter (AND-combined with the filters
-      // above; transcript must carry >= 1 of the selected flags)
+      // above). A transcript passes when it carries >= 1 selected flag, or —
+      // when the special "no flags" entry is selected — when it carries none.
       if (fltFlags.size) {
         const tf = t.flags || [];
         let hit = false;
         for (const f of tf) { if (fltFlags.has(f)) { hit = true; break; } }
+        if (!hit && fltFlags.has("__no_flags__") && tf.length === 0) hit = true;
         if (!hit) continue;
       }
       pool.push({ g, t });
@@ -810,6 +829,7 @@ document.getElementById("tc-toggle").addEventListener("click", () => {
   try {
     await Promise.all([loadGenes(), loadChroms(), loadDenovoTracks()]);
     await initBrowser();
+    autoFitSidebar();   // default: gene list fully expanded to fit its columns
   } catch (err) {
     setStatus("Loading failed: " + err.message);
     console.error(err);
