@@ -113,9 +113,10 @@ class BedCovRunner:
     each base to its transcript via bisect in Python.
     """
 
-    def __init__(self, bams: list, min_depth: int = 5):
+    def __init__(self, bams: list, min_depth: int = 5, threads: int = 1):
         self.bams = bams
         self.min_depth = min_depth
+        self.threads = max(1, threads)
         self.regions: list[tuple[str, int, int, str]] = []  # 1-based, tag
         self.results: dict[str, tuple[float, float]] = {}
         self._ran = False
@@ -155,8 +156,10 @@ class BedCovRunner:
                 for s, e in ivs:
                     tf.write(f"{seqid}\t{s - 1}\t{e}\n")
             bed_path = tf.name
-        cmd = ["samtools", "depth", "-aa", "-b", bed_path,
-               *[str(b) for b in self.bams]]
+        # -@ threads lets htslib decompress the BAMs' bgzf blocks in parallel
+        # (a real win on large BAMs); the depth stream itself stays single-pass
+        cmd = ["samtools", "depth", "-aa", "-@", str(self.threads),
+               "-b", bed_path, *[str(b) for b in self.bams]]
         # Stream the per-base depth output line by line: buffering the whole
         # stdout via subprocess.run(PIPE) (100M+ lines on large genomes)
         # triples the footprint (bytes + decoded str + splitlines list) and
@@ -274,7 +277,8 @@ def confidence_annotation(gff_in: Path, genome_fa: Path, junctions_bed: Path | N
                           cov_support_min: float = 0.8,
                           prot_support_min: float = 0.5,
                           min_orf_aa: int = 50,
-                          protein_weights: dict | None = None) -> dict:
+                          protein_weights: dict | None = None,
+                          threads: int = 1) -> dict:
     """Annotate every coding transcript with evidence support and a tier.
 
     protein_weights: {protein_id: relatedness weight} — when given, the
@@ -314,7 +318,7 @@ def confidence_annotation(gff_in: Path, genome_fa: Path, junctions_bed: Path | N
                 overlap_tids.add(b.tid)
 
     has_cov = bool(bams) and shutil.which("samtools") is not None
-    cov = BedCovRunner(bams, min_depth) if has_cov else None
+    cov = BedCovRunner(bams, min_depth, threads) if has_cov else None
 
     rows: list[str] = []
     tier_count: Counter = Counter()

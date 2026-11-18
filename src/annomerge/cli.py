@@ -596,6 +596,33 @@ def merge(
     preds = parse_predictors(predictors)
     score_dir = ensure_dir(out / "05.score")
     details, p_scores = {}, {}
+    # prefetch OMArk for every predictor in parallel (each omamer gets an even
+    # share of --threads); the per-predictor compute_os in score_one_predictor
+    # then hits the warm *.sum cache instead of running serially. The final
+    # annotation's OMArk (report) still runs with the full --threads.
+    if cfg.get("omark_db") and "omark" not in set(cfg.get("ablate", [])):
+        from concurrent.futures import ThreadPoolExecutor
+        from .modules.scoring import (extract_proteins, build_isoform_file,
+                                      compute_os)
+        import logging as _logging
+        _log = _logging.getLogger("annomerge")
+        _jobs = list(preds.items())
+        _share = max(1, threads // max(1, len(_jobs)))
+
+        def _prefetch_omark(item):
+            _name, _gff = item
+            _pdir = ensure_dir(score_dir / _name)
+            _pf = extract_proteins(vi.genome, _gff, _pdir / "proteins.faa")
+            _iso = build_isoform_file(_gff, _pdir / "isoforms.txt")
+            try:
+                compute_os(_pf, Path(cfg["omark_db"]), _pdir / "omark", _share,
+                           isoform_file=_iso,
+                           extra_opts=cfg.get("omark_options"))
+            except Exception as _e:   # warm-cache best effort; scorer re-checks
+                _log.warning("omark prefetch [%s]: %s", _name, _e)
+
+        with ThreadPoolExecutor(max_workers=len(_jobs)) as _pool:
+            list(_pool.map(_prefetch_omark, _jobs))
     for name, gff in preds.items():
         d = score_one_predictor(name, gff, vi, score_dir, threads, results, cfg)
         details[name] = d
@@ -667,7 +694,8 @@ def merge(
     from .modules.sanity import sanity_filter
     sanity_stats = sanity_filter(
         integ_gff3, vi.genome,
-        integ_d / "evm.sanity.gff3", integ_d / "sanity_filter.tsv")
+        integ_d / "evm.sanity.gff3", integ_d / "sanity_filter.tsv",
+        threads=threads)
     typer.secho(f"sanity filter: {sanity_stats or 'skipped (exists)'}", fg="green")
     # module 5c-1: ID normalisation (<seqid>.g<n>.t<m>; Name= keeps old ID)
     from .modules.renamer import normalize_ids
@@ -698,7 +726,8 @@ def merge(
         typer.secho(f"augment output: {aug['augment_gff3']}", fg="green")
         aug_sanity = sanity_filter(
             aug["augment_gff3"], vi.genome,
-            aug["dir"] / "augment.sanity.gff3", aug["dir"] / "sanity_filter.tsv")
+            aug["dir"] / "augment.sanity.gff3", aug["dir"] / "sanity_filter.tsv",
+            threads=threads)
         typer.secho(f"augment sanity filter: {aug_sanity or 'skipped (exists)'}", fg="green")
         # module 5c-2: ID normalisation of the final annotation
         typer.secho(f"ID normalize (final): {normalize_ids(aug['dir'] / 'augment.sanity.gff3')}", fg="green")
@@ -720,7 +749,7 @@ def merge(
         else integ_d / "goldset.genome.gff3",
         final_d / "sanity_filter.tsv",
         assess_d / "confidence.tsv",
-        protein_weights=protein_weights)
+        protein_weights=protein_weights, threads=threads)
     typer.secho(f"confidence tiers: {conf_stats or 'skipped (exists)'}", fg="green")
     # module 6b: tag the final GFF3 with the evidence verdict (Tier /
     # RNA_support / Protein_support / denovo_support / Flags on every gene
@@ -1072,7 +1101,7 @@ def evaluate(
         eval_d / "goldset.genome.gff3",
         None,
         assess_d / "confidence.tsv",
-        protein_weights=protein_weights)
+        protein_weights=protein_weights, threads=threads)
     typer.secho(f"confidence tiers: {conf_stats or 'skipped (exists)'}", fg="green")
     # module 6b: Tier / RNA_support / Protein_support / denovo_support /
     # Flags on every gene and mRNA + CDS numbering (same as merge)

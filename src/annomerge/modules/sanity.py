@@ -47,6 +47,10 @@ CODON_TABLE = {
 }
 STOP_CODONS = {"TAA", "TAG", "TGA"}
 
+# module-level genome dict shared with fork-ed pool workers (copy-on-write);
+# set by sanity_filter before the pool starts, read by _process_one.
+_GENOME: dict | None = None
+
 
 @dataclass
 class Feat:
@@ -233,56 +237,92 @@ def _repair_cds_outside_exon(tx: Tx) -> bool:
     return True
 
 
+def _process_one(tx: Tx):
+    """Worker: per-transcript sanity checks (structure / translate / stop
+    scan). Returns (tid, actions, is_removed, tx, is_extended); the tx may
+    have its exons repaired in place (the caller applies it). Reads the
+    module-global _GENOME (shared copy-on-write via fork)."""
+    tid = tx.tid
+    acts: list[tuple[str, str, str, str]] = []
+    prob = _structure_problem(tx)
+    if prob == "cds_outside_exon" and _repair_cds_outside_exon(tx):
+        acts.append((tx.gid, tid, "repaired", "cds_outside_exon"))
+        prob = _structure_problem(tx)   # re-check after repair
+    if prob:
+        return (tid, acts + [(tx.gid, tid, "removed", prob)], True, tx, False)
+    prot = _translate_cds(_GENOME, tx)
+    # internal stop: any stop before the last codon
+    if "*" in prot[:-1]:
+        return (tid, acts + [(tx.gid, tid, "removed", "internal_stop")],
+                True, tx, False)
+    is_extended = False
+    if prot and prot[-1] == "*":
+        pass   # proper terminal stop: nothing to do
+    else:
+        # 3'-most CDS segment can be extended by 3 bp when the next 3 bases
+        # are a stop codon (detected here; applied by the caller in order)
+        last = tx.cds_tx_order()[-1]
+        seq = _GENOME.get(tx.mrna.seqid, "")
+        if tx.mrna.strand == "+":
+            nxt = seq[last.end:last.end + 3].upper()   # bases end+1..end+3
+        else:
+            nxt = seq[max(last.start - 4, 0):last.start - 1].upper()
+            nxt = nxt.translate(str.maketrans("ACGTN", "TGCAN"))[::-1]
+        if len(nxt) == 3 and nxt in STOP_CODONS:
+            is_extended = True
+            acts.append((tx.gid, tid, "extended", "extended_stop"))
+        else:
+            acts.append((tx.gid, tid, "kept", "no_stop"))
+    # note non-ATG start (first codon in transcription order)
+    if prot and not prot.startswith("M"):
+        acts.append((tx.gid, tid, "kept", "non_atg_start"))
+    return (tid, acts, False, tx, is_extended)
+
+
 def sanity_filter(gff_in: Path, genome_fa: Path, gff_out: Path,
-                  report_tsv: Path, keep_only: bool = False) -> dict:
+                  report_tsv: Path, keep_only: bool = False,
+                  threads: int = 1) -> dict:
     """Filter the annotation. Returns stats dict. Idempotent via lazy()."""
     if lazy([gff_out, report_tsv], desc="sanity filter"):
         return {}
     genome = _read_genome(genome_fa)
     genes, txs, order = _parse_gff3(gff_in)
 
+    # per-transcript checks run in a process pool when threads > 1 (the genome
+    # dict is shared with fork-ed workers copy-on-write); the main process
+    # then applies repairs / extensions and writes output. Results identical
+    # to the serial path.
+    global _GENOME
+    _GENOME = genome
+
     actions: list[tuple[str, str, str, str]] = []  # gid, tid, action, reason
     removed: set[str] = set()
-    extended: list[tuple[Tx, str]] = []            # (tx, "extended_stop")
+    extended_tids: list[str] = []
 
-    for tid in order:
-        tx = txs[tid]
-        prob = _structure_problem(tx)
-        if prob == "cds_outside_exon" and _repair_cds_outside_exon(tx):
-            actions.append((tx.gid, tid, "repaired", "cds_outside_exon"))
-            prob = _structure_problem(tx)  # re-check after repair
-        if prob:
-            removed.add(tx.tid)
-            actions.append((tx.gid, tid, "removed", prob))
-            continue
-        prot = _translate_cds(genome, tx)
-        # internal stop: any stop before the last codon
-        if "*" in prot[:-1]:
+    tx_list = [txs[tid] for tid in order]
+    if threads and threads > 1 and len(tx_list) > 1:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+        chunksize = max(1, len(tx_list) // (threads * 8))
+        with ProcessPoolExecutor(
+                max_workers=threads,
+                mp_context=mp.get_context("fork")) as pool:
+            results = list(pool.map(_process_one, tx_list,
+                                    chunksize=chunksize))
+    else:
+        results = [_process_one(tx) for tx in tx_list]
+
+    for tid, acts, is_removed, tx_new, is_extended in results:
+        actions.extend(acts)
+        txs[tid] = tx_new          # apply any exon repair done in the worker
+        if is_removed:
             removed.add(tid)
-            actions.append((tx.gid, tid, "removed", "internal_stop"))
-            continue
-        if prot and prot[-1] == "*":
-            pass  # proper terminal stop: nothing to do
-        else:
-            # try extending the 3'-most CDS segment by 3 bp
-            last = tx.cds_tx_order()[-1]
-            seq = genome.get(tx.mrna.seqid, "")
-            if tx.mrna.strand == "+":
-                nxt = seq[last.end:last.end + 3].upper()   # bases end+1..end+3
-            else:
-                nxt = seq[max(last.start - 4, 0):last.start - 1].upper()
-                nxt = nxt.translate(str.maketrans("ACGTN", "TGCAN"))[::-1]
-            if len(nxt) == 3 and nxt in STOP_CODONS:
-                extended.append((tx, "extended_stop"))
-                actions.append((tx.gid, tid, "extended", "extended_stop"))
-            else:
-                actions.append((tx.gid, tid, "kept", "no_stop"))
-        # note non-ATG start (first codon in transcription order)
-        if prot and not prot.startswith("M"):
-            actions.append((tx.gid, tid, "kept", "non_atg_start"))
+        if is_extended:
+            extended_tids.append(tid)
 
     # apply extensions (find covering exon by ORIGINAL coords before mutating)
-    for tx, _reason in extended:
+    for tid in extended_tids:
+        tx = txs[tid]
         last = tx.cds_tx_order()[-1]
         orig_s, orig_e = last.start, last.end
         cover = next((ex for ex in tx.exons
@@ -308,7 +348,7 @@ def sanity_filter(gff_in: Path, genome_fa: Path, gff_out: Path,
     from collections import Counter
     stats = Counter(r for _, _, _, r in actions)
     log.info("sanity filter: %d transcripts removed, %d extended, genes removed %d; %s",
-             len(removed), len(extended), len(removed_genes), dict(stats))
+             len(removed), len(extended_tids), len(removed_genes), dict(stats))
 
     if keep_only:
         # report only: write input unchanged is caller's business; here just report

@@ -125,6 +125,13 @@ def normalize_ids(gff3: Path) -> dict:
             new_parents.append(tid_map.get(p, gid_map.get(p, p)))
         return _attr_set(attrs, "Parent", ",".join(new_parents))
 
+    # pre-sort the tid prefix table once (longest first); the per-feature loop
+    # below then resolves most exon/CDS/UTR ids via their Parent in O(1),
+    # instead of scanning the whole table per line (was O(lines x tids)).
+    sorted_tid_items = sorted(tid_map.items(), key=lambda kv: -len(kv[0]))
+    # first-char set lets the fallback skip ids (e.g. "cds.<tid>") that share
+    # no transcript's first char and so can never carry a tid prefix (O(1)).
+    tid_first_chars = {k[0] for k in tid_map if k}
     out_lines = []
     for ln in lines:
         if ln.startswith("#"):
@@ -150,14 +157,21 @@ def normalize_ids(gff3: Path) -> dict:
             parent = _attr_get(attrs, "Parent")
             attrs = _remap_parent(attrs)
             if old_id and parent:
-                # swap the old transcript prefix for the new one, keep suffix;
-                # longest prefix first so t1 does not shadow t10
-                for p_old, p_new in sorted(tid_map.items(),
-                                           key=lambda kv: -len(kv[0])):
-                    if old_id.startswith(p_old):
-                        attrs = _attr_set(attrs, "ID",
-                                          p_new + old_id[len(p_old):])
-                        break
+                # fast path: the id is <parent-tid>.<suffix>, so the parent
+                # alone gives the new prefix in O(1) (covers virtually all rows)
+                p0 = parent.split(",")[0].strip()
+                new_tid = tid_map.get(p0)
+                if new_tid is not None and old_id.startswith(p0):
+                    attrs = _attr_set(attrs, "ID",
+                                      new_tid + old_id[len(p0):])
+                elif old_id[:1] in tid_first_chars:
+                    # fallback only when the id could still carry a tid prefix
+                    # (skips ids like "cds.<tid>" that share no tid first char)
+                    for p_old, p_new in sorted_tid_items:
+                        if old_id.startswith(p_old):
+                            attrs = _attr_set(attrs, "ID",
+                                              p_new + old_id[len(p_old):])
+                            break
         f[8] = attrs
         out_lines.append("\t".join(f))
 
