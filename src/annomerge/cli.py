@@ -322,7 +322,9 @@ def merge(
              "Repeat [blue]-p[/blue] per set and/or use 'label=path' comma lists "
              "(e.g. [blue]-p[/blue] near=near.pep,far=far.fa, or "
              "[blue]-p[/blue] near=near.pep [blue]-p[/blue] far=far.fa; "
-             "unlabeled -> filename stem). Headers: >id|species=Genus_species. "
+             "unlabeled -> filename stem). Files after a label join that "
+             "label's set: [blue]-p[/blue] near=n1.pep,n2.pep puts both in set "
+             "'near'. Headers: >id|species=Genus_species. "
              "Multiple UNLABELED files merge into one protein pool (mnp-filtered, "
              "unweighted); explicit labels keep the relatedness-weighted multi-set mode.",
         rich_help_panel="Input files"),

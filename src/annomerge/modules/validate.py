@@ -188,14 +188,19 @@ def parse_rna_entries(entries: list[str] | None) -> list[RnaSample]:
 
 _LABEL_RE = __import__("re").compile(r"^[A-Za-z0-9_.\-]+$")
 
-def parse_homolog_sets(spec: str) -> "dict[str, Path]":
-    """Parse '-p id1=xxx.fa,id2=abc.pep' -> {label: path}.
+def parse_homolog_sets(spec: str) -> "dict[str, list[Path]]":
+    """Parse '-p id1=a.fa,b.fa,id2=c.pep' -> {label: [paths]}.
 
-    Same syntax as -P predictors: 'label=path' pairs, comma-separated;
-    unlabeled items take their filename stem. Labels must be unique and
-    match [A-Za-z0-9_.-] (they become EVM source names / report columns).
+    A 'label=path' item starts a labeled set; every following UNLABELED
+    item joins the most recent labeled set, so one label may span several
+    files (-p ID1=1.1.fa,1.2.fa,ID2=2.1.fa,2.2.fa = two 2-file sets).
+    Items seen before any label (or when no label is given at all) each
+    form their own set named by filename stem (legacy behaviour).
+    Labels must be unique and match [A-Za-z0-9_.-] (they become EVM
+    source names / report columns).
     """
-    out: "dict[str, Path]" = {}
+    out: "dict[str, list[Path]]" = {}
+    cur: str | None = None   # most recent explicit label
     for item in spec.split(","):
         item = item.strip()
         if not item:
@@ -203,19 +208,31 @@ def parse_homolog_sets(spec: str) -> "dict[str, Path]":
         if "=" in item:
             label, p = item.split("=", 1)
             label = label.strip()
+            if not _LABEL_RE.match(label):
+                raise InputError(
+                    f"invalid homolog set label '{label}': only [A-Za-z0-9_.-] allowed"
+                )
+            if label in out:
+                raise InputError(
+                    f"duplicate homolog set label '{label}': to give one set several "
+                    f"files, list them after the label instead — e.g. {label}=a.fa,b.fa"
+                )
+            out[label] = []
+            cur = label
         else:
             p = item
-            label = Path(p.strip()).stem.split(".")[0]
-        if not _LABEL_RE.match(label):
-            raise InputError(
-                f"invalid homolog set label '{label}': only [A-Za-z0-9_.-] allowed"
-            )
-        if label in out:
-            raise InputError(
-                f"duplicate homolog set label '{label}': give each set an explicit "
-                "label, e.g. -p scer=scer.pep,sklu=sklu.pep"
-            )
-        out[label] = _require(p.strip(), f"homolog protein FASTA (set {label})")
+            if cur is None:
+                # no label seen yet: one stem-named set per file (legacy)
+                label = Path(p.strip()).stem.split(".")[0]
+                if label in out:
+                    raise InputError(
+                        f"duplicate homolog set label '{label}': give each set an "
+                        "explicit label, e.g. -p scer=scer.pep,sklu=sklu.pep"
+                    )
+                out[label] = []
+            else:
+                label = cur   # joins the most recent labeled set
+        out[label].append(_require(p.strip(), f"homolog protein FASTA (set {label})"))
     if not out:
         raise InputError("homolog protein FASTA (-p) is empty")
     return out
@@ -341,7 +358,27 @@ def validate(
     gids = set(fasta_seqids(g))
     tracker.note("genome: %d sequences", len(gids))
 
-    h_sets = parse_homolog_sets(homologs)
+    h_lists = parse_homolog_sets(homologs)
+    # flatten multi-file labels into one cached FASTA per set (downstream
+    # expects {label: Path}); single-file sets pass through unchanged
+    h_sets: dict[str, Path] = {}
+    for _lab, _paths in h_lists.items():
+        if len(_paths) == 1:
+            h_sets[_lab] = _paths[0]
+        else:
+            if not workdir:
+                raise InputError(
+                    "multi-file homolog sets require workdir to cache the merged file"
+                )
+            _mp = Path(workdir) / "input" / f"homolog_set.{_lab}.faa"
+            if not _mp.exists():
+                _mp.parent.mkdir(parents=True, exist_ok=True)
+                with open(_mp, "w") as _out:
+                    for _p in _paths:
+                        _out.write(_p.read_text())
+            log.info("homolog set %s: %d files merged -> %s",
+                     _lab, len(_paths), _mp.name)
+            h_sets[_lab] = _mp
     # option B: multiple UNLABELED files are one protein pool (mnp filtering
     # at stage 03 handles divergence; no per-set scoring).  Explicit
     # id=path labels keep the dormant relatedness-weighted multi-set mode.
