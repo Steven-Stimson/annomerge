@@ -48,6 +48,11 @@
   details > summary:hover { color: #4C72B0; }
   .chart { margin: 8px 0; }
   .chart svg { max-width: 100%; height: auto; }
+  .fig-table-row { display: flex; gap: 24px; align-items: flex-start;
+                   flex-wrap: wrap; margin: 8px 0; }
+  .fig-table-row .chart { flex: 0 1 auto; margin: 0; }
+  .fig-table-side { flex: 1 1 260px; min-width: 240px; }
+  .fig-table-side table { margin-top: 0; }
   .diagram { margin: 12px 0; }
   .diagram svg { width: 100%; height: auto; }
   .placeholder { background: #fbfcfe; border: 1.5px dashed #9db4d0;
@@ -131,21 +136,55 @@
 
 <h3>2.2 Homolog protein alignment</h3>
 {% if workflow.protein.n_mapped %}
-<p>{{ workflow.protein.n_mapped }} of {{ workflow.protein.n_raw or "?" }} homolog
-proteins mapped onto the genome (one best record per protein shown in the
-distributions below):</p>
-<div class="chart">{{ workflow.density_plot }}</div>
-{% if workflow.protein.mnp_rows %}
-<p>mnp filter: {{ workflow.protein.mnp_removed }} alignment(s) removed.</p>
-<table>
-  <tr><th>Filter reason</th><th class="num">Alignments removed</th></tr>
-  {% for reason, n in workflow.protein.mnp_rows %}
-  <tr><td><code>{{ reason }}</code></td><td class="num">{{ n }}</td></tr>
-  {% endfor %}
+<table class="kv">
+  <tr><td>Protein pool</td><td class="num">{{ workflow.protein.pool_name }}</td></tr>
+  <tr><td>Proteins in pool</td><td class="num">{{ workflow.protein.n_proteins }}</td></tr>
+  <tr><td>Alignments kept after mnp filter</td><td class="num">{{ workflow.protein.kept }}</td></tr>
+  <tr><td>Alignments removed by mnp filter</td><td class="num">{{ workflow.protein.drops }}</td></tr>
 </table>
-{% else %}
-<p class="muted">mnp filter removed nothing (or was disabled).</p>
-{% endif %}
+<div class="fig-table-row">
+  <div class="chart">{{ workflow.density_plot }}</div>
+  <div class="fig-table-side">
+    {% if workflow.protein.mnp_rows %}
+    <table>
+      <tr><th>Filter reason</th><th class="num">Alignments removed</th></tr>
+      {% for reason, n in workflow.protein.mnp_rows %}
+      <tr><td><code>{{ reason }}</code></td><td class="num">{{ n }}</td></tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="muted">mnp filter removed nothing (or was disabled).</p>
+    {% endif %}
+  </div>
+</div>
+<p class="muted">Distributions are computed on post-filter alignments (one best
+record per protein).</p>
+{% for s in workflow.protein.sets %}
+<h4>Pool {{ s.label }}</h4>
+<table class="kv">
+  <tr><td>Proteins in pool</td><td class="num">{{ s.n_proteins }}</td></tr>
+  <tr><td>Alignments kept after mnp filter</td><td class="num">{{ s.kept }}</td></tr>
+  <tr><td>Alignments removed by mnp filter</td><td class="num">{{ s.drops }}</td></tr>
+  <tr><td>Proteins mapped</td><td class="num">{{ s.n_mapped }}</td></tr>
+  <tr><td>Median identity x coverage (relatedness)</td><td class="num">{{ "%.4f"|format(s.relatedness) }}</td></tr>
+  <tr><td>Relatedness weight</td><td class="num">{{ "%.2f"|format(s.weight) }}</td></tr>
+</table>
+<div class="fig-table-row">
+  <div class="chart">{{ s.density_plot }}</div>
+  <div class="fig-table-side">
+    {% if s.mnp_rows %}
+    <table>
+      <tr><th>Filter reason</th><th class="num">Alignments removed</th></tr>
+      {% for reason, n in s.mnp_rows %}
+      <tr><td><code>{{ reason }}</code></td><td class="num">{{ n }}</td></tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="muted">mnp filter removed nothing (or was disabled).</p>
+    {% endif %}
+  </div>
+</div>
+{% endfor %}
 {% else %}
 <p class="note">No homolog protein alignments found.</p>
 {% endif %}

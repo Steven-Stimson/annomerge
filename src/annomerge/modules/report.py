@@ -645,11 +645,55 @@ def rna_alignment_stats(out: Path) -> list:
     return rows
 
 
+def _n_raw_queries(raw_paf: Path) -> int:
+    """Unique query proteins in a raw (pre-filter) miniprot PAF."""
+    qs: set = set()
+    if raw_paf.exists():
+        with open(raw_paf) as fh:
+            for line in fh:
+                if not line.startswith("#"):
+                    qs.add(line.split("\t", 1)[0])
+    return len(qs)
+
+
+def _mnp_stats(tsv: Path) -> tuple[int, int, list]:
+    """mnp_filter.tsv -> (kept, total_drops, [(reason, n), ...]).
+
+    'kept' is NOT a filter reason: it is reported separately and never
+    counted into the drop total.
+    """
+    kept, drops, rows = 0, 0, []
+    if tsv.exists():
+        with open(tsv) as fh:
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                if len(f) == 2 and f[0] != "reason" and f[1].isdigit():
+                    if f[0] == "kept":
+                        kept = int(f[1])
+                    else:
+                        if int(f[1]) > 0:      # only reasons that removed anything
+                            rows.append((f[0], int(f[1])))
+                        drops += int(f[1])
+    return kept, drops, rows
+
+
 def protein_alignment_stats(out: Path) -> dict:
-    """Homolog protein alignment: coverage/identity distributions + mnp filter."""
-    res: dict = {"qcov": [], "ident": [], "qlen": [], "n_mapped": 0, "n_raw": 0,
-                 "mnp_rows": [], "mnp_removed": 0}
-    tsv = Path(out) / "03.homolog" / "alignments.tsv"
+    """Homolog protein alignment: coverage/identity distributions + mnp filter.
+
+    Distributions come from alignments.tsv = the POST-filter miniprot PAF
+    (one best record per protein). Multi-set runs additionally expose one
+    entry per labeled pool (distributions grouped by the alignments 'set'
+    column, per-pool mnp stats from sets/<label>/, relatedness/weight from
+    sets.tsv).
+    """
+    hdir = Path(out) / "03.homolog"
+    res: dict = {"pool_name": "Total protein pool", "n_proteins": 0,
+                 "n_mapped": 0, "n_raw": 0, "kept": 0, "drops": 0,
+                 "mnp_rows": [], "qcov": [], "ident": [],
+                 "multi": False, "sets": []}
+    # --- distributions (post-filter, best record per protein), split by set
+    per_set: dict[str, dict] = {}
+    tsv = hdir / "alignments.tsv"
     if tsv.exists():
         seen: set = set()
         with open(tsv) as fh:
@@ -663,25 +707,55 @@ def protein_alignment_stats(out: Path) -> dict:
                 if q in seen:          # one record per protein for the distribution
                     continue
                 seen.add(q)
-                res["qcov"].append(float(f[ci["qcov"]]))
-                res["ident"].append(float(f[ci["ident"]]))
-                res["qlen"].append(int(f[ci["qlen"]]))
+                qc, idn = float(f[ci["qcov"]]), float(f[ci["ident"]])
+                res["qcov"].append(qc)
+                res["ident"].append(idn)
+                s = f[ci["set"]] if "set" in ci else "NA"
+                d = per_set.setdefault(s, {"qcov": [], "ident": []})
+                d["qcov"].append(qc)
+                d["ident"].append(idn)
         res["n_mapped"] = len(seen)
-    raw_paf = Path(out) / "03.homolog" / "miniprot.raw.paf"
-    if raw_paf.exists():
-        queries: set = set()
-        with open(raw_paf) as fh:
-            for line in fh:
-                queries.add(line.split("\t", 1)[0])
-        res["n_raw"] = len(queries)
-    mnp = Path(out) / "03.homolog" / "mnp_filter.tsv"
-    if mnp.exists():
-        with open(mnp) as fh:
+    # --- per-pool relatedness / weights / protein counts (sets.tsv)
+    set_info: dict[str, dict] = {}
+    sets_tsv = hdir / "sets.tsv"
+    if sets_tsv.exists():
+        with open(sets_tsv) as fh:
+            header = next(fh).rstrip("\n").split("\t")
+            ci = {n: i for i, n in enumerate(header)}
             for line in fh:
                 f = line.rstrip("\n").split("\t")
-                if len(f) == 2 and f[0] != "reason" and f[1].isdigit():
-                    res["mnp_rows"].append((f[0], int(f[1])))
-                    res["mnp_removed"] += int(f[1])
+                if len(f) < len(header):
+                    continue
+                set_info[f[ci["set"]]] = {
+                    "n_proteins": int(f[ci["n_proteins"]]),
+                    "n_mapped": int(f[ci["n_mapped"]]),
+                    "median_ident": float(f[ci["median_ident"]]),
+                    "median_qcov": float(f[ci["median_qcov"]]),
+                    "relatedness": float(f[ci["relatedness"]]),
+                    "weight": float(f[ci["weight"]]),
+                }
+    res["n_proteins"] = sum(s["n_proteins"] for s in set_info.values())
+    # --- pool-level mnp stats
+    res["n_raw"] = _n_raw_queries(hdir / "miniprot.raw.paf")
+    res["kept"], res["drops"], res["mnp_rows"] = _mnp_stats(hdir / "mnp_filter.tsv")
+    # --- per-set blocks (labeled multi-pool runs)
+    labels = [l for l in set_info if l != "all"]
+    if len(labels) > 1:
+        res["multi"] = True
+        for label in labels:
+            sdir = hdir / "sets" / label
+            kept, drops, rows = _mnp_stats(sdir / "mnp_filter.tsv")
+            dist = per_set.get(label, {"qcov": [], "ident": []})
+            res["sets"].append({
+                "label": label, **set_info[label],
+                "n_raw": _n_raw_queries(sdir / "miniprot.raw.paf"),
+                "kept": kept, "drops": drops, "mnp_rows": rows,
+                "qcov": dist["qcov"], "ident": dist["ident"],
+            })
+    elif len(set_info) == 1:
+        only = next(iter(set_info))
+        if only != "all":
+            res["pool_name"] = only
     return res
 
 
@@ -1079,6 +1153,10 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
     wf["density_plot"] = Markup(svg_density_marginal(
         wf["protein"].get("qcov") or [], wf["protein"].get("ident") or [],
         x_label="Query coverage", y_label="Alignment identity"))
+    for _s in wf["protein"].get("sets", []):
+        _s["density_plot"] = Markup(svg_density_marginal(
+            _s["qcov"], _s["ident"],
+            x_label="Query coverage", y_label="Alignment identity"))
     ctx["workflow"] = wf
     # support-tag census (section 3.4)
     ctx["tags"] = tag_overview(final_gff3)
