@@ -357,6 +357,11 @@ def merge(
         0.25, "--w-homolog", help="W_h: weight of the H_s (structure-aware homolog "
              "support: full-length AND anomaly-free) sub-block.",
         rich_help_panel="Scoring"),
+    w_busco: float = typer.Option(
+        0.10, "--w-busco",
+        help="W_b: weight of the B_s (BUSCO complete recall) sub-block; "
+             "skipped without --busco-lineage.",
+        rich_help_panel="Scoring"),
     w_omark: float = typer.Option(
         0.20, "--w-omark",
         help="W_o: weight of the O_s (OMArk consistent fraction) sub-block; "
@@ -603,7 +608,7 @@ def merge(
     a, b_, g_ = map(float, rna_weights.split(","))
     cfg = dict(rna_alpha=a, rna_beta=b_, rna_gamma=g_,
                w_rna=w_rna, w_homolog=w_homolog,
-               w_omark=w_omark,
+               w_busco=w_busco, w_omark=w_omark,
                omark_db=omark_db,
                omark_options=omark_options,
                fulllength_cov=fulllength_cov,
@@ -813,6 +818,7 @@ def merge(
                   "augment": augment, "viewer": vw,
                   "mnp_filter": _norm_mnp(mnp_filter) or "off",
                   "w_rna": w_rna, "w_homolog": w_homolog,
+                  "w_busco": w_busco, "w_omark": w_omark,
                   "min_predictor_score": min_predictor_score,
                   "goldset_min_orf": goldset_min_orf,
                   "weight_mapping": weight_mapping})
