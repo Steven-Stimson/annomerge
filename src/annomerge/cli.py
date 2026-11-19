@@ -308,16 +308,20 @@ def merge(
         None, "--genome", "-g",
         help="[bold green]MANDATORY[/bold green]. Reference genome FASTA.",
         rich_help_panel="Input files"),
-    predictors: Optional[str] = typer.Option(
+    predictors: Optional[List[str]] = typer.Option(
         None, "--predictions", "-P",
-        help="[bold green]MANDATORY[/bold green]. De novo gene predictions, "
-             "'name=path' comma list (unnamed -> filename stem), e.g. "
-             "[blue]-P[/blue] denovo1=a.gff3,denovo2=b.gff3.",
+        help="[bold green]MANDATORY[/bold green]. De novo gene predictions. "
+             "Repeat [blue]-P[/blue] per predictor and/or use a 'name=path' "
+             "comma list (unnamed -> filename stem), e.g. "
+             "[blue]-P[/blue] denovo1=a.gff3,denovo2=b.gff3 or "
+             "[blue]-P[/blue] denovo1=a.gff3 [blue]-P[/blue] denovo2=b.gff3.",
         rich_help_panel="Input files"),
-    homologs: Optional[str] = typer.Option(
+    homologs: Optional[List[str]] = typer.Option(
         None, "--proteins", "-p",
-        help="[bold green]MANDATORY[/bold green]. Homolog protein FASTA, "
-             "'label=path' comma list OK (e.g. [blue]-p[/blue] near=near.pep,far=far.fa; "
+        help="[bold green]MANDATORY[/bold green]. Homolog protein FASTA. "
+             "Repeat [blue]-p[/blue] per set and/or use 'label=path' comma lists "
+             "(e.g. [blue]-p[/blue] near=near.pep,far=far.fa, or "
+             "[blue]-p[/blue] near=near.pep [blue]-p[/blue] far=far.fa; "
              "unlabeled -> filename stem). Headers: >id|species=Genus_species. "
              "Multiple UNLABELED files merge into one protein pool (mnp-filtered, "
              "unweighted); explicit labels keep the relatedness-weighted multi-set mode.",
@@ -557,6 +561,10 @@ def merge(
                                  rich_help_panel="Advanced"),
 ):
 
+    # repeatable -P/-p values (and comma lists inside them) collapse into the
+    # single comma-separated spec the downstream parser has always taken
+    predictors = ",".join(predictors) if predictors else None
+    homologs = ",".join(homologs) if homologs else None
     missing = [n for n, v in (("--genome/-g", genome), ("--predictions/-P", predictors),
                               ("--proteins/-p", homologs)) if not v]
     if missing:
@@ -993,15 +1001,17 @@ def evaluate(
         None, "--annotation", "-a",
         help="[bold green]MANDATORY[/bold green]. Annotation GFF3/GTF to evaluate.",
         rich_help_panel="Input files"),
-    homologs: Optional[str] = typer.Option(
+    homologs: Optional[List[str]] = typer.Option(
         None, "--proteins", "-p",
         help="[bold green]MANDATORY[/bold green]. Homolog protein FASTA "
-             "('label=path' comma list; same rules as merge --proteins).",
+             "(repeat [blue]-p[/blue] per set, or 'label=path' comma list; "
+             "same rules as merge --proteins).",
         rich_help_panel="Input files"),
-    predictors: Optional[str] = typer.Option(
+    predictors: Optional[List[str]] = typer.Option(
         None, "--predictions", "-P",
-        help="Optional de novo predictions 'name=path' comma list (evidence "
-             "tracks + denovo_support attributes only; no scoring in evaluate).",
+        help="Optional de novo predictions; repeat [blue]-P[/blue] per predictor "
+             "or use a 'name=path' comma list (evidence tracks + denovo_support "
+             "attributes only; no scoring in evaluate).",
         rich_help_panel="Input files"),
     rna: Optional[List[str]] = typer.Option(
         None, "--rna", "-r", help="RNA evidence (same syntax as merge --rna).",
@@ -1069,6 +1079,9 @@ def evaluate(
                                  rich_help_panel="Advanced"),
 ):
 
+    # repeatable -P/-p values collapse into one comma-separated spec (as in merge)
+    predictors = ",".join(predictors) if predictors else None
+    homologs = ",".join(homologs) if homologs else None
     missing = [n for n, v in (("--genome/-g", genome), ("--annotation/-a", annotation),
                               ("--proteins/-p", homologs)) if not v]
     if missing:
