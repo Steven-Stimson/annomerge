@@ -18,7 +18,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-from ..utils import ToolError, ensure_dir, lazy, run, which
+from ..utils import ToolError, ensure_dir, lazy, run, tracker, which
 from .validate import ValidatedInputs
 
 log = logging.getLogger("annomerge")
@@ -230,7 +230,6 @@ def run_miniprot(genome: Path, proteins: Path, out_dir: Path, threads: int,
                    *(extra_opts or []), str(genome), str(proteins)]
             with open(raw, "w") as fh:
                 import subprocess
-                log.info("RUN  miniprot (%s) %s", mode, Path(proteins).name)
                 rc = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT).returncode
             if rc != 0:
                 raise ToolError(f"miniprot failed (rc={rc}): see {raw}")
@@ -238,7 +237,7 @@ def run_miniprot(genome: Path, proteins: Path, out_dir: Path, threads: int,
         counts = filter_miniprot_alignments(raw_gff, raw_paf, gff, paf,
                                             proteins, filt or {})
         drops = {k: v for k, v in counts.items() if k != "kept" and v}
-        log.info("miniprot mnp-filter (%s): kept %d, dropped %s",
+        tracker.note("miniprot mnp-filter (%s): kept %d, dropped %s",
                  Path(proteins).name, counts["kept"], drops or 0)
         (out_dir / "mnp_filter.tsv").write_text(
             "reason\tcount\n" + "".join(f"{k}\t{v}\n"
@@ -399,7 +398,7 @@ def _relatedness(vi: ValidatedInputs, hdir: Path) -> tuple[Path, dict[str, float
                      f"{_median([r['ident'] for r in rows]):.4f}\t"
                      f"{_median([r['qcov'] for r in rows]):.4f}\t"
                      f"{rel[label]:.6f}\t{weight[label]:.4f}\n")
-    log.info("homolog set relatedness: %s",
+    tracker.note("homolog set relatedness: %s",
              ", ".join(f"{k}: rel={rel[k]:.3f} w={weight[k]:.2f}" for k in rel))
     return sets_tsv, rel, weight
 
@@ -409,14 +408,14 @@ def run_homolog_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                        miniprot_opts: list[str] | None = None) -> dict:
     referee_min_wi = REFEREE_MIN_WI
     hdir = ensure_dir(out_dir / "03.homolog")
-    log.info("module 2 [homolog]: %s (%d set(s))", vi.homologs, len(vi.homolog_sets))
+    tracker.note("homolog proteins: %s (%d set(s))", vi.homologs, len(vi.homolog_sets))
     membership = _load_membership(vi)
     filt = parse_mnp_filter(mnp_filter)
     active = [k for k in ("UnStop", "UnShift", "minIden", "minPos", "minSize",
                           "maxRank", "R2Q", "Q2R", "topRank")
               if filt.get(k)] or filt.get("maxSize", 10**9) != 10**9
     if active:
-        log.info("homolog mnp-filter active (%s): %s", mnp_filter, active)
+        tracker.note("homolog mnp-filter active (%s): %s", mnp_filter, active)
 
     if len(vi.homolog_sets) > 1:
         paf, gff = _run_sets_miniprot(vi, hdir, threads, filt, miniprot_opts)
@@ -470,7 +469,7 @@ def run_homolog_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
             n_ref = sum(1 for r in rs if r["wi"] >= referee_min_wi)
             fh.write(f"{sp}\t{n}\t{n_ref}\t{sum(wis)/n:.4f}\t{med:.4f}\n")
 
-    log.info("module 2 [homolog] done: %d aligned proteins, %d referee (wi>=%.2f), %d species",
+    tracker.note("homolog done: %d aligned, %d referee (wi>=%.2f), %d species",
              len(best), len(referee), referee_min_wi, len(by_species))
     return {"paf": paf, "gff": gff, "alignments": aln_tsv, "referee_tsv": ref_tsv,
             "referee_ids": ref_ids, "species_stats": stats_tsv, "n_referee": len(referee),

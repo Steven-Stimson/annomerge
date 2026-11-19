@@ -28,7 +28,7 @@ import bisect
 import logging
 from pathlib import Path
 
-from ..utils import ensure_dir, lazy
+from ..utils import ensure_dir, lazy, tracker
 from .evm import lift_goldset
 from .sanity import _parse_gff3
 
@@ -156,7 +156,7 @@ def run_priority_merge(vi, out_dir: Path, preds: dict,
     lower scorers are dropped; exact (P, R_s) ties keep all tied, flagged).
     """
     d = ensure_dir(Path(out_dir))
-    log.info("module 4/5 [priority]: %d predictors + goldset", len(preds))
+    tracker.note("priority: %d predictors + goldset", len(preds))
 
     # 1. lift goldset to genome coords (same artifact EVM mode builds)
     goldset_gff = d / "goldset.genome.gff3"

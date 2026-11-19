@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pysam
 
-from ..utils import ensure_dir, lazy, run, which
+from ..utils import ensure_dir, lazy, run, tracker, which
 from .validate import ValidatedInputs
 
 log = logging.getLogger("annomerge")
@@ -77,7 +77,7 @@ def extract_junctions(bam: Path, out_bed: Path, min_reads: int = 1) -> Path:
         for (chrom, s, e, strand), n in sorted(counts.items()):
             if n >= min_reads:
                 fh.write(f"{chrom}\t{s}\t{e}\t.\t{n}\t{strand}\n")
-    log.info("junctions: %d (>= %d reads) from %s", sum(1 for v in counts.values() if v >= min_reads),
+    tracker.note("junctions: %d (>= %d reads) from %s", sum(1 for v in counts.values() if v >= min_reads),
              min_reads, bam.name)
     return out_bed
 
@@ -100,7 +100,7 @@ def merge_junctions(beds: list[Path], out_bed: Path) -> Path:
         for (chrom, s, e), (n, samples, strands) in sorted(agg.items()):
             strand = next(iter(strands)) if len(strands) == 1 else "."
             fh.write(f"{chrom}\t{s}\t{e}\t{len(samples)}\t{n}\t{strand}\n")
-    log.info("merged junctions: %d sites from %d samples", len(agg), len(beds))
+    tracker.note("merged junctions: %d sites from %d samples", len(agg), len(beds))
     return out_bed
 
 
@@ -142,7 +142,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                    stringtie_opts: list[str] | None = None) -> dict:
     """Execute the RNA branch. Returns dict of key outputs."""
     rdir = ensure_dir(out_dir / "02.rnaseq")
-    log.info("module 2 [rna]: %d fastq + %d bam + %d gtf inputs",
+    tracker.note("rna inputs: %d fastq + %d bam + %d gtf",
              len(vi.rna_fastqs), len(vi.rna_bams), len(vi.rna_gtfs))
 
     bams: list[Path] = []
@@ -167,6 +167,6 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
         gtf = vi.rna_gtfs[0]  # precomputed transcripts passed through
 
     result = {"bams": bams, "junctions_bed": merged_bed, "stringtie_gtf": gtf}
-    log.info("module 2 [rna] done: bams=%d junctions=%s stringtie=%s",
+    tracker.note("rna done: bams=%d, junctions=%s, stringtie=%s",
              len(bams), merged_bed, gtf)
     return result

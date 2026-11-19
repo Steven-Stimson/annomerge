@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from ..utils import ensure_dir, lazy, run, which
+from ..utils import ensure_dir, lazy, run, tracker, which
 from .validate import ValidatedInputs
 
 log = logging.getLogger("annomerge")
@@ -66,7 +66,7 @@ def run_goldset(vi: ValidatedInputs, out_dir: Path, threads: int,
         log.warning("goldset: no RNA transcripts available -> skipped (auto-degraded)")
         return None
     gdir = ensure_dir(out_dir / "04.goldset")
-    log.info("module 2b [goldset]: transcripts=%s", stringtie_gtf)
+    tracker.note("goldset transcripts: %s", stringtie_gtf)
 
     # 1. transcript sequences
     tfa = gdir / "transcripts.fa"
@@ -134,5 +134,5 @@ def run_goldset(vi: ValidatedInputs, out_dir: Path, threads: int,
                 det.write(f"{name}\t{has_hit}\t{hits.get(name, 0)}\n")
                 out.write(f">{name} homology_validated={has_hit}\n{seq}\n")
     n_gold = sum(1 for line in open(gold) if line.startswith(">"))
-    log.info("module 2b [goldset] done: %d gold proteins", n_gold)
+    tracker.note("goldset done: %d gold proteins", n_gold)
     return {"goldset_faa": gold, "details": details, "n_gold": n_gold}

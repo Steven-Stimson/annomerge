@@ -28,7 +28,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..utils import lazy
+from ..utils import lazy, tracker
 
 log = logging.getLogger("annomerge")
 
@@ -347,7 +347,7 @@ def sanity_filter(gff_in: Path, genome_fa: Path, gff_out: Path,
 
     from collections import Counter
     stats = Counter(r for _, _, _, r in actions)
-    log.info("sanity filter: %d transcripts removed, %d extended, genes removed %d; %s",
+    tracker.note("sanity filter: %d removed, %d extended, genes removed %d; %s",
              len(removed), len(extended_tids), len(removed_genes), dict(stats))
 
     if keep_only:

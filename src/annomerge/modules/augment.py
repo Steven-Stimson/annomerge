@@ -17,7 +17,7 @@ Internal-invariant: a donor's introns within the CDS span must equal the CDS
 introns exactly — CDS internal structure is never rewritten by backfill.
 """
 from __future__ import annotations
-from ..utils import inject_utr_features
+from ..utils import inject_utr_features, tracker
 
 import logging
 import re
@@ -474,16 +474,16 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     if not lazy([out_gff3], desc="augment merge"):
         stats["collapse_tol_bp"] = collapse_tol_bp
         _collapse_isoforms(genes, stats, tol_bp=collapse_tol_bp)
-        log.info("augment: %d isoform(s) collapsed (identical CDS, longest-UTR kept)", stats.get("isoforms_collapsed", 0))
+        tracker.note("augment: %d isoform(s) collapsed (identical CDS, longest-UTR kept)", stats.get("isoforms_collapsed", 0))
         _write(out_gff3, genes, stats)
         n5, n3 = inject_utr_features(out_gff3, out_gff3)
-        log.info("augment: UTR rows added: %d 5' + %d 3'", n5, n3)
+        tracker.note("augment: UTR rows added: %d 5' + %d 3'", n5, n3)
     stsv = d / "augment_stats.tsv"
     with open(stsv, "w") as fh:
         fh.write("key\tvalue\n")
         for k, v in sorted(stats.items()):
             fh.write(f"{k}\t{v}\n")
-    log.info("augment stats -> %s", stsv)
+    tracker.note("augment stats -> %s", stsv)
     return {"augment_gff3": out_gff3, "dir": d, "stats": dict(stats)}
 
 

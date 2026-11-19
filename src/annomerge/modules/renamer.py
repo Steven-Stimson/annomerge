@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-
+from ..utils import tracker
 log = logging.getLogger("annomerge")
 
 _GID_NUM = re.compile(r"^\.g(\d+)$")
@@ -177,5 +177,5 @@ def normalize_ids(gff3: Path) -> dict:
 
     gff3.write_text("\n".join(out_lines) + "\n")
     stats = {"genes_renamed": n_genes, "transcripts_renamed": len(tid_map)}
-    log.info("ID normalize %s: %s", gff3.name, stats)
+    tracker.note("ID normalize %s: %s", gff3.name, stats)
     return stats

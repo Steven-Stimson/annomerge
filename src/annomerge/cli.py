@@ -20,7 +20,7 @@ from .modules.validate import InputError, validate
 from .modules.rna import run_rna_branch
 from .modules.homolog import run_homolog_branch
 from .modules.goldset import run_goldset
-from .utils import ensure_dir, parse_extra_opts, setup_logging
+from .utils import ensure_dir, parse_extra_opts, set_run_log_dir, setup_logging, tracker
 
 app = typer.Typer(
     name="annomerge",
@@ -101,6 +101,7 @@ def _main(
 def _prepare(outdir: str, verbose: bool) -> Path:
     setup_logging(verbose)
     out = ensure_dir(Path(outdir))
+    set_run_log_dir(out / "logs" / "run")
     return out
 
 
@@ -159,31 +160,38 @@ def _run_evidence_pipeline(
     stringtie_opts: Optional[List[str]] = None,
     td_opts: Optional[List[str]] = None,
 ):
+    tracker.big("01", "validate", "validate inputs (genome, predictions, evidence)")
     vi = validate(
         genome=genome, homologs=homologs, predictors=predictors,
         annotation=annotation, rna=rna, busco=busco,
         workdir=str(out),
     )
+    tracker.big_done()
     results: dict = {}
 
     # module 2: RNA branch
     rna_res = None
     if vi.has_rna:
+        tracker.big("02", "rna", "RNA-seq alignment and assembly (hisat2/stringtie/junctions)")
         rna_res = run_rna_branch(vi, out, threads,
                                  hisat2_opts=hisat2_opts,
                                  stringtie_opts=stringtie_opts)
         results["rna"] = rna_res
+        tracker.big_done()
     else:
         import logging
         logging.getLogger("annomerge").warning(
             "no RNA evidence; RNA branch skipped (auto-degraded)")
 
     # module 2: homology branch
+    tracker.big("03", "homolog", "homolog protein alignment (miniprot)")
     results["homolog"] = run_homolog_branch(
         vi, out, threads, mnp_filter=mnp_filter, miniprot_opts=miniprot_opts)
+    tracker.big_done()
 
     # module 2b: gold set (built whenever RNA evidence exists)
     if vi.has_rna:
+        tracker.big("04", "goldset", "build gold set (gffread + TransDecoder)")
         gtf = rna_res["stringtie_gtf"] if rna_res else (vi.rna_gtfs[0] if vi.rna_gtfs else None)
         results["goldset"] = run_goldset(
             vi, out, threads, stringtie_gtf=gtf,
@@ -191,6 +199,7 @@ def _run_evidence_pipeline(
             min_orf_aa=goldset_min_orf,
             td_opts=td_opts,
         )
+        tracker.big_done()
     return results, vi
 
 
@@ -578,6 +587,7 @@ def merge(
         raise typer.Exit(2)
 
     # module 3: predictor scoring + weight mapping
+    tracker.big("05", "score", "predictor scoring + EVM weight calibration")
     from .modules.scoring import score_one_predictor, map_weights
     from .modules.validate import parse_predictors
 
@@ -622,7 +632,11 @@ def merge(
                 _log.warning("omark prefetch [%s]: %s", _name, _e)
 
         with ThreadPoolExecutor(max_workers=len(_jobs)) as _pool:
-            list(_pool.map(_prefetch_omark, _jobs))
+            _futs = [_pool.submit(_prefetch_omark, _item) for _item in _jobs]
+            from concurrent.futures import as_completed as _as_completed
+            for _i, _f in enumerate(_as_completed(_futs), 1):
+                _f.result()
+                tracker.parallel("OMArk", _i, len(_futs))
     for name, gff in preds.items():
         d = score_one_predictor(name, gff, vi, score_dir, threads, results, cfg)
         details[name] = d
@@ -644,6 +658,7 @@ def merge(
                      f"{evm_w.get(name) or 'EXCLUDE'}\t"
                      f"{d.get('hard_reject', '')}\n")
     typer.echo(f"\n=== EVM weights ===\n{wtab.read_text()}")
+    tracker.big_done()
 
     # module 4/5: integration (skipped with --weight-only)
     if weight_only:
@@ -668,6 +683,7 @@ def merge(
     stringtie_gtf = (results.get("rna", {}) or {}).get("stringtie_gtf")
     hom_res = results.get("homolog") or {}
     rna_res = results.get("rna") or {}
+    tracker.big("06", "merge", "EVM integration + sanity filter + ID normalize")
     from .modules.evm import run_evm
     # homolog-set relatedness weights: per-set EVM protein evidence weights and
     # per-protein weights for confidence assessment (multi-set homolog input)
@@ -700,11 +716,13 @@ def merge(
     # module 5c-1: ID normalisation (<seqid>.g<n>.t<m>; Name= keeps old ID)
     from .modules.renamer import normalize_ids
     typer.secho(f"ID normalize (evm): {normalize_ids(integ_d / 'evm.sanity.gff3')}", fg="green")
+    tracker.big_done()
 
     # module 5c: isoform resolution + UTR backfill (isoform mode only)
     final_gff3 = integ_d / "evm.sanity.gff3"
     final_d = integ_d
     if mode == "isoform":
+        tracker.big("07", "augment", "isoform resolution + UTR backfill")
         from .modules.augment import run_augment
         aug = run_augment(
             vi, out / "07.augment",
@@ -731,10 +749,12 @@ def merge(
         typer.secho(f"augment sanity filter: {aug_sanity or 'skipped (exists)'}", fg="green")
         # module 5c-2: ID normalisation of the final annotation
         typer.secho(f"ID normalize (final): {normalize_ids(aug['dir'] / 'augment.sanity.gff3')}", fg="green")
+        tracker.big_done()
         final_gff3 = aug["dir"] / "augment.sanity.gff3"
         final_d = aug["dir"]
 
     # module 6: coverage-aware evidence tiering (tier, not delete)
+    tracker.big("08", "assessment", "confidence tiering + support tagging")
     from .modules.confidence import confidence_annotation
     assess_d = ensure_dir(out / "08.assessment")
     if mode == "evm":
@@ -760,8 +780,10 @@ def merge(
     tag_stats = annotate_support(final_gff3, assess_d / "confidence.tsv",
                                  preds or {})
     typer.secho(f"support tags: {tag_stats}", fg="green")
+    tracker.big_done()
     # module 7/8: report (run summary + stats + completeness + accuracy + charts)
     import shlex, sys
+    tracker.big("09", "result", "report + evidence browser")
     from .modules.report import run_report
     rep = run_report(
         out, final_gff3, vi.genome, final_d,
@@ -795,6 +817,7 @@ def merge(
                             full=(vw == "full"),
                             show_rna_coverage=show_rna_coverage)
         typer.secho(f"evidence browser: {vw_res['html']}", fg="green")
+    tracker.big_done()
     # publish layer removed: the module dirs themselves are the numbered
     # deliverables (01.validate ... 09.result)
     typer.secho(f"deliverables: {out}/01.validate ... 09.result", fg="green")
@@ -1072,6 +1095,7 @@ def evaluate(
     # -F). NO sanity filter / renamer / coordinate lift here: the user's
     # annotation is the assessment target and stays exactly as submitted
     # (original IDs, original models; assessment tags are appended later).
+    tracker.big("06", "evaluate", "normalize annotation + lift gold set")
     eval_d = ensure_dir(out / "06.evaluate")
     final_gff3 = _annotation_to_gff3(Path(annotation), eval_d / "annotation.gff3")
     # Gold set lift to genome coordinates: merge does this inside EVM;
@@ -1084,8 +1108,10 @@ def evaluate(
         from .modules.evm import lift_goldset
         lift_goldset(gold_dir, rna_res["stringtie_gtf"], eval_d,
                      eval_d / "goldset.genome.gff3", genome_fa=vi.genome)
+    tracker.big_done()
     # module 6: coverage-aware evidence tiering (identical to merge;
     # sanity_tsv=None — nothing was filtered)
+    tracker.big("08", "assessment", "confidence tiering + support tagging")
     from .modules.confidence import confidence_annotation, annotate_support
     assess_d = ensure_dir(out / "08.assessment")
     hom_res = results.get("homolog") or {}
@@ -1108,8 +1134,10 @@ def evaluate(
     tag_stats = annotate_support(final_gff3, assess_d / "confidence.tsv",
                                  vi.predictors or {})
     typer.secho(f"support tags: {tag_stats}", fg="green")
+    tracker.big_done()
     # module 7/8: report (gene set stats + completeness + charts)
     import shlex, sys
+    tracker.big("09", "result", "report + evidence browser")
     from .modules.report import run_report
     rep = run_report(
         out, final_gff3, vi.genome, eval_d,
@@ -1139,6 +1167,7 @@ def evaluate(
                             full=(vw == "full"),
                             show_rna_coverage=show_rna_coverage)
         typer.secho(f"evidence browser: {vw_res['html']}", fg="green")
+    tracker.big_done()
     typer.secho(f"deliverables: {out}/01.validate ... 09.result", fg="green")
 
 

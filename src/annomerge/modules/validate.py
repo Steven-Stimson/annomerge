@@ -14,7 +14,7 @@ import gzip
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-
+from ..utils import tracker
 log = logging.getLogger("annomerge")
 
 
@@ -324,11 +324,11 @@ def validate(
     under workdir/input/) so every downstream consumer keeps seeing one
     transparent FASTA; a protein->set membership table is kept alongside.
     """
-    log.info("module 1: input validation")
+    tracker.note("input validation")
 
     g = _require(genome, "genome FASTA (-g)")
     gids = set(fasta_seqids(g))
-    log.info("genome: %d sequences", len(gids))
+    tracker.note("genome: %d sequences", len(gids))
 
     h_sets = parse_homolog_sets(homologs)
     # option B: multiple UNLABELED files are one protein pool (mnp filtering

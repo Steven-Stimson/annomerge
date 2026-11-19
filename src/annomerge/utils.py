@@ -1,13 +1,112 @@
 """Shared utilities: logging, subprocess wrapper, lazy (resumable) execution."""
 from __future__ import annotations
 
+import itertools
 import logging
+import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 log = logging.getLogger("annomerge")
+
+
+def _fmt_dt(sec: float) -> str:
+    """Format an elapsed time, e.g. 8s / 5m07s / 1h23m45s."""
+    sec = int(round(sec))
+    if sec < 60:
+        return f"{sec}s"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m{s:02d}s"
+
+
+class StepTracker:
+    """English step-by-step progress logger.
+
+    The pipeline is narrated as numbered big steps (``[STEP 02] rna - ...``)
+    and, within each, compact one-line sub-step entries
+    (``  [02|2/6] hisat2 DRR070508 (5m04s)``). Parallel fan-out is aggregated
+    (``  [06|EVM] 3/7 done``) so worker output never interleaves into the main
+    log. fail() pinpoints the failing step and its per-step log file.
+    """
+
+    def __init__(self) -> None:
+        self.step_id = "00"
+        self.step_name = "pipeline"
+        self.sub_total: int | None = None
+        self.sub_done = 0
+        self._t0: float | None = None
+        self._lock = threading.Lock()
+
+    def big(self, sid: str, name: str, desc: str, total: int | None = None) -> None:
+        """Start a big step (01-09); resets the sub-step counter."""
+        with self._lock:
+            self.step_id, self.step_name = sid, name
+            self.sub_total, self.sub_done = total, 0
+            self._t0 = time.monotonic()
+        log.info("")
+        log.info("[STEP %s] %s - %s", sid, name, desc)
+
+    def sub(self, label: str, note: str = "") -> None:
+        """One completed sub-step (main thread only, see run())."""
+        with self._lock:
+            self.sub_done += 1
+            n, tot = self.sub_done, self.sub_total
+        prog = f"{n}/{tot}" if tot else str(n)
+        suffix = f" ({note})" if note else ""
+        log.info("  [%s|%s] %s%s", self.step_id, prog, label, suffix)
+
+    def skip(self, label: str) -> None:
+        """A sub-step skipped because its outputs already exist (cached)."""
+        with self._lock:
+            self.sub_done += 1
+            n, tot = self.sub_done, self.sub_total
+        prog = f"{n}/{tot}" if tot else str(n)
+        log.info("  [%s|%s] %s (cached)", self.step_id, prog, label)
+
+    def parallel(self, label: str, done: int, total: int) -> None:
+        """Aggregate progress for a parallel fan-out (e.g. EVM partitions)."""
+        log.info("  [%s|%s] %d/%d done", self.step_id, label, done, total)
+
+    def note(self, msg: str, *args) -> None:
+        """A progress/info line inside the current big step (indented, no counter).
+        Main thread only, so parallel workers do not interleave info lines."""
+        if threading.current_thread() is threading.main_thread():
+            log.info("  [%s] " + msg, self.step_id, *args)
+
+    def big_done(self, note: str = "") -> None:
+        dt = time.monotonic() - self._t0 if self._t0 else 0.0
+        with self._lock:
+            n, tot = self.sub_done, self.sub_total
+        prog = f" - {n}/{tot} steps" if tot else ""
+        extra = f" - {note}" if note else ""
+        log.info("[STEP %s] %s done%s%s (%s)",
+                 self.step_id, self.step_name, prog, extra, _fmt_dt(dt))
+
+    def fail(self, label: str, detail: str = "") -> None:
+        extra = f" - {detail}" if detail else ""
+        log.error("[STEP %s] %s FAILED at: %s%s",
+                  self.step_id, self.step_name, label, extra)
+
+
+tracker = StepTracker()
+
+# Per-step log directory: when set, run() redirects external-tool output here
+# (one file per command) instead of letting it flood the main log.
+_RUN_LOG_DIR: Path | None = None
+_run_counter = itertools.count(1)
+
+
+def set_run_log_dir(d: Path | str | None) -> None:
+    """Set the directory that run() uses for auto per-command log files."""
+    global _RUN_LOG_DIR
+    _RUN_LOG_DIR = None if d is None else ensure_dir(Path(d))
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -54,23 +153,37 @@ def which(tool: str) -> str:
 
 
 def run(cmd: list[str] | str, *, shell: bool = False, log_file: Path | None = None,
-        desc: str = "", cwd: Path | str | None = None) -> None:
-    """Run a command, raising ToolError on non-zero exit."""
-    if desc:
-        log.info("RUN  %s", desc)
+        desc: str = "", cwd: Path | str | None = None, track: bool = True) -> None:
+    """Run a command, raising ToolError on non-zero exit.
+
+    The external tool's stdout/stderr is redirected to a per-command log file
+    and never interleaved into the main log: the explicit ``log_file`` if given,
+    otherwise an auto-named file under the run-log dir (see set_run_log_dir),
+    otherwise discarded. Main-thread calls log a one-line sub-step entry via the
+    StepTracker; worker threads stay silent so parallel fan-out (EVM partitions,
+    OMArk prefetch, multi-sample) does not interleave — the caller aggregates it.
+    """
     shown = cmd if isinstance(cmd, str) else " ".join(map(str, cmd))
     log.debug("cmd: %s", shown)
-    stdout = subprocess.DEVNULL if log_file else None
-    stderr = subprocess.STDOUT if log_file else None
+    if log_file is None and _RUN_LOG_DIR is not None:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", desc or "cmd").strip("_")[:60] or "cmd"
+        log_file = Path(_RUN_LOG_DIR) / f"{next(_run_counter):03d}_{safe}.log"
+    t0 = time.monotonic()
     if log_file:
         with open(log_file, "ab") as fh:
-            rc = subprocess.run(cmd, shell=shell, stdout=fh, stderr=subprocess.STDOUT,
-                                cwd=cwd).returncode
+            rc = subprocess.run(cmd, shell=shell, stdout=fh,
+                                stderr=subprocess.STDOUT, cwd=cwd).returncode
     else:
-        rc = subprocess.run(cmd, shell=shell, stdout=stdout, stderr=stderr,
-                            cwd=cwd).returncode
+        rc = subprocess.run(cmd, shell=shell, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.STDOUT, cwd=cwd).returncode
+    dt = time.monotonic() - t0
     if rc != 0:
-        raise ToolError(f"command failed (rc={rc}): {shown}" + (f" (log: {log_file})" if log_file else ""))
+        tracker.fail(desc or shown,
+                     f"rc={rc}" + (f", log: {log_file}" if log_file else ""))
+        raise ToolError(f"command failed (rc={rc}): {shown}" +
+                        (f" (log: {log_file})" if log_file else ""))
+    if track and desc and threading.current_thread() is threading.main_thread():
+        tracker.sub(desc, _fmt_dt(dt))
 
 
 def lazy(outputs: list[Path] | Path, *, desc: str = "") -> bool:
@@ -78,8 +191,8 @@ def lazy(outputs: list[Path] | Path, *, desc: str = "") -> bool:
     if not isinstance(outputs, list):
         outputs = [outputs]
     ok = all(Path(o).exists() and Path(o).stat().st_size > 0 for o in outputs)
-    if ok and desc:
-        log.info("SKIP %s (outputs exist)", desc)
+    if ok and desc and threading.current_thread() is threading.main_thread():
+        tracker.skip(desc)
     return ok
 
 

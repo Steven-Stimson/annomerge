@@ -17,7 +17,7 @@ import re
 import shutil
 from pathlib import Path
 
-from ..utils import ensure_dir, lazy, run, which
+from ..utils import ensure_dir, lazy, run, tracker, which
 from .sanity import _read_genome as _read_fasta
 
 log = logging.getLogger("annomerge")
@@ -198,7 +198,7 @@ def lift_goldset(goldset_dir: Path, stringtie_gtf: Path, d: Path,
                 else:
                     n_bad += 1
     if genome is not None:
-        log.info("lift validation: %d valid (ATG..stop, mod3), %d invalid",
+        tracker.note("lift validation: %d valid (ATG..stop, mod3), %d invalid",
                  n_ok, n_bad)
     return out_gff3
 
@@ -228,7 +228,7 @@ def split_genome_balanced(genome_fa: Path, n_parts: int) -> list[list[str]]:
         bins[i].append(acc)
         sizes[i] += ln
     parts = [b for b in bins if b]
-    log.info("genome split into %d size-balanced parts: %s",
+    tracker.note("genome split into %d size-balanced parts: %s",
              len(parts), ", ".join(f"[{len(b)} acc]" for b in parts))
     return parts
 
@@ -391,7 +391,7 @@ def miniprot_to_protein_gff(miniprot_gff: Path, out_gff3: Path,
                           f"{r['strand']}\t.\tID={mid}.part{j};"
                           f"Parent={mid}.match;Target={r['prot']} {ps} {pe}\n")
             n_match += 1
-    log.info("EVM protein evidence: %d matches (%s)", n_match,
+    tracker.note("EVM protein evidence: %d matches (%s)", n_match,
              "per-set sources" if membership else "single source")
     return out_gff3
 
@@ -411,7 +411,7 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
     PROTEIN line per set, so closer relatives count more inside EVM.
     """
     d = ensure_dir(evm_dir)
-    log.info("module 4/5 [evm]: %d predictions + transcripts + proteins + goldset",
+    tracker.note("evm: %d predictions + transcripts + proteins + goldset",
              len(preds))
 
     # 1. prep evidence files
@@ -491,13 +491,15 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
                 pev[ename] = _filter_gff_by_accessions(
                     epath, set(accs), pd / f"{ename}.part.gff3")
             jobs.append((pgenome, pcombined, pev, pd))
-        log.info("EVM split: %d parts, running with %d workers",
-                 len(jobs), min(len(jobs), threads))
+        tracker.note("EVM split: %d parts, running with %d workers",
+                     len(jobs), min(len(jobs), threads))
         with ThreadPoolExecutor(max_workers=min(len(jobs), threads)) as ex:
-            results = list(ex.map(lambda j: _evm_run_one(j[0], j[1], j[2], wfile,
-                                                         j[3], min_intron), jobs))
-        for r in results:
-            acc_gffs.update(r)
+            futs = [ex.submit(_evm_run_one, j[0], j[1], j[2], wfile,
+                              j[3], min_intron) for j in jobs]
+            from concurrent.futures import as_completed
+            for i, fut in enumerate(as_completed(futs), 1):
+                acc_gffs.update(fut.result())
+                tracker.parallel("EVM", i, len(futs))
     # concatenate per-accession gff3s in the ORIGINAL genome order
     if not lazy([final], desc="EVM final concat"):
         acc_order = []
@@ -517,5 +519,5 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
                             header_done = True
                         continue
                     out.write(gline)
-    log.info("module 4/5 [evm] done: %s", final)
+    tracker.note("evm done: %s", final)
     return {"evm_gff3": final, "weights": wfile}

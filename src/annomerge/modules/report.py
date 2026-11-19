@@ -19,7 +19,7 @@ import shutil
 from collections import Counter
 from pathlib import Path
 
-from ..utils import ensure_dir, lazy, run, which
+from ..utils import ensure_dir, lazy, run, tracker, which
 from .sanity import _parse_gff3, _read_genome
 
 log = logging.getLogger("annomerge")
@@ -1038,7 +1038,7 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
     d = ensure_dir(Path(out) / "09.result")
     assess = ensure_dir(Path(out) / "08.assessment")
     ctx: dict = {"meta": _summary_meta(run_meta)}
-    log.info("module 7/8 [report]: collecting stats")
+    tracker.note("collecting stats")
     ctx["gene_set"] = gene_set_stats(final_gff3)
     ctx["evidence"] = evidence_distribution(assess / "confidence.tsv")
     faa = longest_isoform_proteins(final_gff3, genome_fa,

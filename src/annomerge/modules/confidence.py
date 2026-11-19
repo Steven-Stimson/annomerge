@@ -44,7 +44,7 @@ import shutil
 from collections import Counter
 from pathlib import Path
 
-from ..utils import lazy
+from ..utils import lazy, tracker
 from .sanity import _parse_gff3, _read_genome, _subseq
 
 log = logging.getLogger("annomerge")
@@ -337,7 +337,7 @@ def confidence_annotation(gff_in: Path, genome_fa: Path, junctions_bed: Path | N
             if len(cds_segs) == 1:
                 cov.add_cds(tid, tx.mrna.seqid, cds_segs)
     if cov is not None:
-        log.info("confidence: bedcov over %d regions...", len(cov.regions))
+        tracker.note("confidence: bedcov over %d regions...", len(cov.regions))
         cov.run()
 
     # pass 2: tier every transcript
@@ -441,7 +441,7 @@ def confidence_annotation(gff_in: Path, genome_fa: Path, junctions_bed: Path | N
                  "locus_mean_depth\trna_reached\tprotein_support_frac\t"
                  "protein_basis\tprotein_reached\tsanity_notes\tintrinsic_flags\n")
         fh.write("\n".join(rows) + "\n")
-    log.info("confidence: %s", dict(tier_count))
+    tracker.note("confidence tiers: %s", dict(tier_count))
     return dict(tier_count)
 
 

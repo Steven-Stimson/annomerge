@@ -31,7 +31,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..utils import ensure_dir, lazy, run, which
+from ..utils import ensure_dir, lazy, run, tracker, which
 
 log = logging.getLogger("annomerge")
 
@@ -609,7 +609,7 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
                         evidence: dict, cfg: dict) -> dict:
     """Score a single predictor across all available sub-blocks."""
     pdir = ensure_dir(out_root / name)
-    log.info("module 3 [%s]: scoring %s", name, gff)
+    tracker.note("scoring %s: %s", name, gff)
     ablate = set(cfg.get("ablate", []))
 
     pred_faa = extract_proteins(vi.genome, gff, pdir / "proteins.faa")
@@ -754,7 +754,5 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
         import json as _json
         _json.dump({k: v for k, v in detail.items() if not k.startswith("_")},
                    fh, indent=2, ensure_ascii=False, default=str)
-    log.info("module 3 [%s] P=%s subscores=%s", name,
-             f"{w:.4f}" if w is not None else "NA",
-             {k: (f"{v:.3f}" if v is not None else "NA") for k, v in sub.items()})
+    tracker.sub(f"score {name}", (f"P={w:.4f}" if w is not None else "P=NA"))
     return detail
