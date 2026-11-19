@@ -728,7 +728,7 @@ def score_one_predictor(name: str, gff: Path, vi, out_root: Path, threads: int,
             detail["O_s_note"] = f"omark failed: {e}"
 
     weights = {"R_s": cfg["w_rna"], "H_s": cfg["w_homolog"],
-               "B_s": cfg["w_conserve"], "O_s": cfg.get("w_omark", 0.0)}
+               "B_s": 0.10, "O_s": cfg.get("w_omark", 0.0)}  # B_s weight fixed at 0.10
     coverage = None
     if cfg.get("weight_mode") == "adaptive":
         # adaptive: scale each database-driven sub-block by its informative

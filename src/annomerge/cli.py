@@ -46,20 +46,23 @@ app = typer.Typer(
 )
 
 _ADV_CAUTION = ("[yellow]Caution:[/yellow] only touch these if you fully understand "
-                "the consequences; the defaults are calibrated for the AnnoMerge "
-                "evidence chain. Pipeline-managed flags are rejected.")
+                "the consequences")
 
 _MNP_HELP = (
-    "miniprot alignment quality filter (comma-separated tokens). "
-    "[cyan]Default: 'UnStop,UnShift'[/cyan]; pass [blue]0[/blue] to disable filtering. "
-    "Switches: [blue]UnStop[/blue] (drop in-frame-stop alignments), "
-    "[blue]UnShift[/blue] (drop frameshift alignments). "
-    "Numeric thresholds ([blue]key=value[/blue], 0 = off): "
-    "[blue]minIden[/blue] min identity, [blue]minPos[/blue] min positive-rate, "
-    "[blue]minSize[/blue]/[blue]maxSize[/blue] aligned-CDS length range, "
-    "[blue]maxRank[/blue] keep Rank<=N mappings, [blue]topRank[/blue] keep best "
-    "N mappings per protein, [blue]R2Q[/blue]/[blue]Q2R[/blue] lower bounds of the "
-    "reference-vs-query CDS length ratio from each side.")
+    "\b\n"
+    "miniprot alignment quality filter (comma-separated tokens).\n"
+    "[cyan]Default: 'UnStop,UnShift'[/cyan]; pass [blue]0[/blue] to disable filtering.\n"
+    "Switches:\n"
+    "  [blue]UnStop[/blue]   drop in-frame-stop alignments\n"
+    "  [blue]UnShift[/blue]  drop frameshift alignments\n"
+    "Numeric thresholds ([blue]key=value[/blue], 0 = off):\n"
+    "  [blue]minIden[/blue]  min identity\n"
+    "  [blue]minPos[/blue]   min positive-rate\n"
+    "  [blue]minSize[/blue]/[blue]maxSize[/blue]  aligned-CDS length range\n"
+    "  [blue]maxRank[/blue]  keep Rank<=N mappings\n"
+    "  [blue]topRank[/blue]  keep best N mappings per protein\n"
+    "  [blue]R2Q[/blue]/[blue]Q2R[/blue]  lower bounds of the reference-vs-query "
+    "CDS length ratio from each side")
 
 _TD_HELP_BASE = (
     "extra flags for TransDecoder.LongOrfs/Predict, e.g. \"-S --single_best_only\". "
@@ -205,8 +208,8 @@ def _run_evidence_pipeline(
 
 _SCORING_FORMULA = """
 [bold]Scoring model[/bold] (module 3 — every de novo predictor gets one P (Prediction score)):
-    P = w_r·R_s + w_h·H_s + w_b·B_s + w_o·O_s
-                          (default w_r=0.45, w_h=0.25, w_b=0.10, w_o=0.20)
+  P = w_r·R_s + w_h·H_s + w_b·B_s + w_o·O_s
+  (default w_r=0.45, w_h=0.25, w_b=0.10, w_o=0.20)
 Each sub-block maps to exactly ONE evidence source (no double counting):
   R_s  RNA support bundle: junction support + exon precision + single-exon bias
        (internals α/β/γ, see --rna-weights) + GoldMatch (full-length protein
@@ -220,12 +223,13 @@ Each sub-block maps to exactly ONE evidence source (no double counting):
   O_s  orthology consistency: OMArk Consistent fraction (needs --omark-db)
 
 Sub-blocks without evidence are skipped and the remaining weights are
-renormalized (--weight-mode adaptive additionally scales the B_s / O_s
-weights by their informative coverage — the fraction of proteins the
-database actually gave a verdict on). A predictor enters EVM only when its
-P reaches --min-predictor-score (and a P cannot be computed at all with
-fewer than 2 usable sub-blocks). P is then mapped to integer EVM weights
-(--weight-mapping).
+renormalized.
+  --weight-mode adaptive additionally scales the B_s / O_s weights by
+  their informative coverage — the fraction of proteins the database
+  actually gave a verdict on.
+A predictor enters EVM only when its P reaches --min-predictor-score
+(a P cannot be computed at all with fewer than 2 usable sub-blocks).
+P is then mapped to integer EVM weights (--weight-mapping).
 """
 
 _MERGE_HELP = """[bold]merge[/bold]: score de novo predictors, calibrate EVM
@@ -320,11 +324,14 @@ def merge(
         rich_help_panel="Input files"),
     rna: Optional[List[str]] = typer.Option(
         None, "--rna", "-r",
-        help="RNA evidence; repeat [blue]-r[/blue] per sample. Each value is a "
-             "comma-separated file list, auto-detected by extension: .bam = aligned "
-             "reads; .gtf/.gff[3] = assembled transcripts; .fastq/.fq(.gz): one file = "
-             "isoseq/long-read (CCS) sample, two files = PE short reads. A .txt/.list "
-             "value is parsed as a sample sheet, one 'ID=files' sample per line. "
+        help="\b\n"
+             "RNA evidence; repeat [blue]-r[/blue] per sample. Each value is a "
+             "comma-separated file list, auto-detected by extension:\n"
+             "  .bam            aligned reads\n"
+             "  .gtf/.gff[3]    assembled transcripts\n"
+             "  .fastq/.fq(.gz) one file = isoseq/long-read (CCS) sample; "
+             "two files = PE short reads\n"
+             "  .txt/.list      sample sheet, one 'ID=files' sample per line\n"
              "Omitting RNA entirely degrades the run to EVM + homolog evidence.",
         rich_help_panel="Input files"),
     busco: Optional[str] = typer.Option(
@@ -335,14 +342,6 @@ def merge(
         None, "--omark-db",
         help="OMAmer database (.h5) for OMArk orthology QC (runs after BUSCO).",
         rich_help_panel="Input files"),
-    omark_options: Optional[str] = typer.Option(
-        None, "--omark-options",
-        help="Extra flags forwarded to the omark assessment step, e.g. "
-             "\"-e --taxid 33090 --taxonomic_rank kingdom\" or "
-             "\"-e /path/to/taxa.sqlite\". Protected (pipeline-managed): "
-             "-f, -d, -o, -i/--isoform_file (isoform collapsing is generated "
-             "automatically from each predictor GFF).",
-        rich_help_panel="Advanced"),
     threads: int = typer.Option(
         8, "--threads", "-t", help="Threads (also sets the EVM genome-split granularity).",
         rich_help_panel="Input files"),
@@ -357,11 +356,6 @@ def merge(
     w_homolog: float = typer.Option(
         0.25, "--w-homolog", help="W_h: weight of the H_s (structure-aware homolog "
              "support: full-length AND anomaly-free) sub-block.",
-        rich_help_panel="Scoring"),
-    w_conserve: float = typer.Option(
-        0.10, "--w-conserve",
-        help="W_b: weight of the B_s (BUSCO complete recall) sub-block; skipped "
-             "without --busco-lineage.",
         rich_help_panel="Scoring"),
     w_omark: float = typer.Option(
         0.20, "--w-omark",
@@ -403,23 +397,26 @@ def merge(
         rich_help_panel="Scoring"),
     weight_mapping: str = typer.Option(
         "auto", "--weight-mapping",
-        help="P -> EVM integer weight mapping: [cyan]auto[/cyan] (rank when "
-             ">=3 predictors so any number of inputs is spread across the "
-             "1..5 weight space, else linear), [cyan]linear[/cyan] or "
-             "[cyan]rank[/cyan].",
+        help="\b\nP -> EVM integer weight mapping:\n"
+             "  [cyan]auto[/cyan]    (default) rank when >=3 predictors — any "
+             "number of inputs is spread across the 1..5 weight space; "
+             "linear otherwise\n"
+             "  [cyan]linear[/cyan]  min-max linear scaling\n"
+             "  [cyan]rank[/cyan]    by rank order",
         rich_help_panel="Scoring"),
     weight_mode: str = typer.Option(
-        "fixed", "--weight-mode",
-        help="P aggregation mode: [cyan]fixed[/cyan] (default, classic) or "
-             "[cyan]adaptive[/cyan] (scale the B_s / O_s sub-block weights by "
-             "their informative coverage — the fraction of proteins the "
-             "database actually gave a verdict on).",
+        "adaptive", "--weight-mode",
+        help="\b\nP aggregation mode:\n"
+             "  [cyan]adaptive[/cyan]  (default) scale the B_s / O_s sub-block "
+             "weights by their informative coverage — the fraction of "
+             "proteins the database actually gave a verdict on\n"
+             "  [cyan]fixed[/cyan]     classic fixed weights",
         rich_help_panel="Scoring"),
     ablate: Optional[str] = typer.Option(
         None, "--ablate",
-        help="Comma list of sub-blocks to disable (rna,homolog,conserve,omark,structure; "
-             "'structure' only turns off the anomaly screen inside H_s) "
-             "— ablation experiments only.",
+        help="\b\nComma list of sub-blocks to disable — ablation experiments only:\n"
+             "  rna, homolog, conserve, omark, structure\n"
+             "('structure' only turns off the anomaly screen inside H_s)",
         rich_help_panel="Scoring"),
     # ---------------------------------------------------- EVM integration
     w_gold_evm: int = typer.Option(
@@ -435,8 +432,8 @@ def merge(
         rich_help_panel="EVM integration"),
     evm_options: Optional[str] = typer.Option(
         None, "--evm-options",
-        help="Extra EVM settings, 'key=value' comma list. Allowed keys: "
-             "[blue]min_intron[/blue] (bp, default 20; EVM --min_intron_length). "
+        help="\b\nExtra EVM settings, 'key=value' comma list. Allowed keys:\n"
+             "  [blue]min_intron[/blue]  bp, default 20 (EVM --min_intron_length)\n"
              "Example: [blue]--evm-options[/blue] \"min_intron=30\".",
         rich_help_panel="EVM integration"),
     # ------------------------------------------------------------- augment
@@ -448,13 +445,14 @@ def merge(
         rich_help_panel="Augment"),
     aug_dedup: str = typer.Option(
         "geometric", "--aug-dedup",
-        help="Near-duplicate UTR-donor removal, two philosophies: "
-             "[cyan]geometric[/cyan] (default): merge donors whose spans sit within "
-             "±--aug-jitter-bp on both ends (assembly-jitter clustering). "
-             "[cyan]evidence[/cyan]: EviAnn-style voting — a novel splice site must pass "
-             "the splice-PWM gate (--aug-pwm-gate), junction-read corroboration "
-             "(--aug-junc-reads) and expression filters (--aug-tpm-ratio, --aug-min-tpm); "
-             "no bp threshold. Independent of both: --aug-collapse-tol-bp folds "
+        help="\b\nNear-duplicate UTR-donor removal, two philosophies:\n"
+             "  [cyan]geometric[/cyan]  (default) merge donors whose spans sit "
+             "within ±--aug-jitter-bp on both ends (assembly-jitter clustering)\n"
+             "  [cyan]evidence[/cyan]   EviAnn-style voting — a novel splice "
+             "site must pass the splice-PWM gate (--aug-pwm-gate), junction-read "
+             "corroboration (--aug-junc-reads) and expression filters "
+             "(--aug-tpm-ratio, --aug-min-tpm); no bp threshold\n"
+             "Independent of both: --aug-collapse-tol-bp folds "
              "identical-intron-chain isoforms after dedup.",
         rich_help_panel="Augment"),
     aug_jitter_bp: int = typer.Option(
@@ -490,22 +488,33 @@ def merge(
     # ----------------------------------------------- assessment & report
     viewer: str = typer.Option(
         "lite", "--viewer",
-        help="Evidence browser build: [cyan]full[/cyan] (embeds the genome sequence, "
-             "base-level track, much larger), [cyan]lite[/cyan] (default: coordinates "
-             "only), [cyan]no[/cyan] (skip).",
+        help="\b\nEvidence browser build:\n"
+             "  [cyan]full[/cyan]  embeds the genome sequence (base-level "
+             "track, much larger)\n"
+             "  [cyan]lite[/cyan]  (default) coordinates only\n"
+             "  [cyan]no[/cyan]    skip",
         rich_help_panel="Assessment & report"),
     show_rna_coverage: int = typer.Option(
         1, "--show-rna-coverage",
-        help="RNA coverage tracks embedded in the evidence browser: "
-             "[cyan]0[/cyan] = none (smallest browser), [cyan]1[/cyan] = merged "
-             "track over all samples only (default, a single track), "
-             "[cyan]2[/cyan] = merged + one track per sample (largest; per-sample "
-             "depth resolution).",
+        help="\b\nRNA coverage tracks embedded in the evidence browser:\n"
+             "  [cyan]0[/cyan]  none (smallest browser)\n"
+             "  [cyan]1[/cyan]  (default) merged track over all samples only "
+             "(a single track)\n"
+             "  [cyan]2[/cyan]  merged + one track per sample (largest; "
+             "per-sample depth resolution)",
         rich_help_panel="Assessment & report"),
     weight_only: bool = typer.Option(
         False, "--weight-only", help="Stop after the EVM weight table.",
         rich_help_panel="Assessment & report"),
     # ------------------------------------------------------------- advanced
+    omark_options: Optional[str] = typer.Option(
+        None, "--omark-options",
+        help="Extra flags forwarded to the omark assessment step, e.g. "
+             "\"-e --taxid 33090 --taxonomic_rank kingdom\" or "
+             "\"-e /path/to/taxa.sqlite\". Protected (pipeline-managed): "
+             "-f, -d, -o, -i/--isoform_file (isoform collapsing is generated "
+             "automatically from each predictor GFF).",
+        rich_help_panel="Advanced"),
     hisat2_options: Optional[str] = typer.Option(
         None, "--hisat2-options",
         help="Extra HISAT2 alignment flags, e.g. \"-k 3 --sp "
@@ -593,7 +602,7 @@ def merge(
 
     a, b_, g_ = map(float, rna_weights.split(","))
     cfg = dict(rna_alpha=a, rna_beta=b_, rna_gamma=g_,
-               w_rna=w_rna, w_homolog=w_homolog, w_conserve=w_conserve,
+               w_rna=w_rna, w_homolog=w_homolog,
                w_omark=w_omark,
                omark_db=omark_db,
                omark_options=omark_options,
@@ -804,7 +813,6 @@ def merge(
                   "augment": augment, "viewer": vw,
                   "mnp_filter": _norm_mnp(mnp_filter) or "off",
                   "w_rna": w_rna, "w_homolog": w_homolog,
-                  "w_conserve": w_conserve,
                   "min_predictor_score": min_predictor_score,
                   "goldset_min_orf": goldset_min_orf,
                   "weight_mapping": weight_mapping})
@@ -1015,15 +1023,18 @@ def evaluate(
         rich_help_panel="Input files"),
     viewer: str = typer.Option(
         "lite", "--viewer",
-        help="Evidence browser build: [cyan]full[/cyan] / [cyan]lite[/cyan] "
-             "(default) / [cyan]no[/cyan].",
+        help="\b\nEvidence browser build:\n"
+             "  [cyan]full[/cyan]  embeds the genome sequence\n"
+             "  [cyan]lite[/cyan]  (default) coordinates only\n"
+             "  [cyan]no[/cyan]    skip",
         rich_help_panel="Assessment & report"),
     show_rna_coverage: int = typer.Option(
         1, "--show-rna-coverage",
-        help="RNA coverage tracks embedded in the evidence browser: "
-             "[cyan]0[/cyan] = none, [cyan]1[/cyan] = merged track over all "
-             "samples only (default, a single track), [cyan]2[/cyan] = merged + "
-             "one track per sample.",
+        help="\b\nRNA coverage tracks embedded in the evidence browser:\n"
+             "  [cyan]0[/cyan]  none\n"
+             "  [cyan]1[/cyan]  (default) merged track over all samples only "
+             "(a single track)\n"
+             "  [cyan]2[/cyan]  merged + one track per sample",
         rich_help_panel="Assessment & report"),
     hisat2_options: Optional[str] = typer.Option(
         None, "--hisat2-options",
