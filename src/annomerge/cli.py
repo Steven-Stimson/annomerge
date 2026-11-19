@@ -332,6 +332,9 @@ def merge(
              "  .fastq/.fq(.gz) one file = isoseq/long-read (CCS) sample; "
              "two files = PE short reads\n"
              "  .txt/.list      sample sheet, one 'ID=files' sample per line\n"
+             "Prefix a value with [blue]ID=[/blue] to name the sample explicitly "
+             "(same syntax as [blue]-p[/blue] label=path):\n"
+             "  [blue]-r[/blue] S1=S1_1.fq.gz,S1_2.fq.gz\n"
              "Omitting RNA entirely degrades the run to EVM + homolog evidence.",
         rich_help_panel="Input files"),
     busco: Optional[str] = typer.Option(

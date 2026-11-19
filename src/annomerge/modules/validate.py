@@ -133,6 +133,9 @@ def parse_rna_entries(entries: list[str] | None) -> list[RnaSample]:
 
     Each entry is either an inline sample or a list file:
       -r sample_r1.fq,sample_r2.fq     PE short-read sample
+      -r S1=sample_r1.fq,sample_r2.fq  same, with an explicit sample ID
+                                       (like -p label=path; the '=' must sit in
+                                       the FIRST file token of the entry)
       -r ccs.fq                        single FASTQ -> isoseq (long-read) sample
       -r aligned.bam                   pre-aligned BAM
       -r a.gtf,b.gtf                   assembled transcripts (>=1 GTF per sample)
@@ -164,13 +167,21 @@ def parse_rna_entries(entries: list[str] | None) -> list[RnaSample]:
                         _sample_from_files(filespec.split(","), sid,
                                            f"{entry}:{ln} ({sid})"))
         else:
-            samples.append(_sample_from_files(entry.split(","), None,
+            # inline sample: optional 'ID=' prefix names the sample explicitly;
+            # only honoured when '=' is inside the first file token (so a
+            # directory component containing '=' is never parsed as an ID)
+            sid, filespec = None, entry
+            head, sep, rest = entry.partition("=")
+            if sep and head.strip() and "/" not in head and "," not in head:
+                sid, filespec = head.strip(), rest
+            samples.append(_sample_from_files(filespec.split(","), sid,
                                               f"-r {entry}"))
     seen: set[str] = set()
     for s in samples:
         if s.name in seen:
             raise InputError(f"duplicate RNA sample name: {s.name!r} "
-                             "(use a list file with explicit IDs)")
+                             "(name samples explicitly with -r ID=files "
+                             "or a list file)")
         seen.add(s.name)
     return samples
 
