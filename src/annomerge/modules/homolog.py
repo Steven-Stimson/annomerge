@@ -214,7 +214,8 @@ def filter_miniprot_alignments(raw_gff: Path, raw_paf: Path,
 
 def run_miniprot(genome: Path, proteins: Path, out_dir: Path, threads: int,
                  filt: dict | None = None,
-                 extra_opts: list[str] | None = None) -> tuple[Path, Path]:
+                 extra_opts: list[str] | None = None,
+                 max_intron: int | None = None) -> tuple[Path, Path]:
     """Run miniprot once, producing PAF and GFF.
 
     extra_opts are inserted into both invocations (protected: -t, --paf, --gff).
@@ -227,7 +228,10 @@ def run_miniprot(genome: Path, proteins: Path, out_dir: Path, threads: int,
     if not (raw_paf.exists() and raw_gff.exists()):
         for mode, raw in (("--paf", raw_paf), ("--gff", raw_gff)):
             cmd = [which("miniprot"), f"-t{threads}", mode,
-                   *(extra_opts or []), str(genome), str(proteins)]
+                   *(extra_opts or [])]
+            if max_intron:
+                cmd += ["-G", str(max_intron)]
+            cmd += [str(genome), str(proteins)]
             with open(raw, "w") as fh:
                 import subprocess
                 rc = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT).returncode
@@ -310,7 +314,8 @@ def _median(xs: list[float]) -> float:
 
 def _run_sets_miniprot(vi: ValidatedInputs, hdir: Path, threads: int,
                        filt: dict | None = None,
-                       extra_opts: list[str] | None = None) -> tuple[Path, Path]:
+                       extra_opts: list[str] | None = None,
+                       max_intron: int | None = None) -> tuple[Path, Path]:
     """Per-set miniprot runs, merged transparently into hdir/miniprot.{paf,gff}."""
     sroot = ensure_dir(hdir / "sets")
     n_sets = len(vi.homolog_sets)
@@ -318,7 +323,7 @@ def _run_sets_miniprot(vi: ValidatedInputs, hdir: Path, threads: int,
     set_outputs = []
     for label, path in vi.homolog_sets.items():
         set_outputs.append(run_miniprot(vi.genome, path, ensure_dir(sroot / label),
-                                        t_each, filt, extra_opts))
+                                        t_each, filt, extra_opts, max_intron))
     paf = hdir / "miniprot.paf"
     gff = hdir / "miniprot.gff"
     if not lazy([paf, gff], desc="merge per-set miniprot"):
@@ -405,7 +410,8 @@ def _relatedness(vi: ValidatedInputs, hdir: Path) -> tuple[Path, dict[str, float
 
 def run_homolog_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                        mnp_filter: str = "",
-                       miniprot_opts: list[str] | None = None) -> dict:
+                       miniprot_opts: list[str] | None = None,
+                       max_intron: int | None = None) -> dict:
     referee_min_wi = REFEREE_MIN_WI
     hdir = ensure_dir(out_dir / "03.homolog")
     tracker.note("homolog proteins: %s (%d set(s))", vi.homologs, len(vi.homolog_sets))
@@ -418,10 +424,11 @@ def run_homolog_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
         tracker.note("homolog mnp-filter active (%s): %s", mnp_filter, active)
 
     if len(vi.homolog_sets) > 1:
-        paf, gff = _run_sets_miniprot(vi, hdir, threads, filt, miniprot_opts)
+        paf, gff = _run_sets_miniprot(vi, hdir, threads, filt, miniprot_opts,
+                                      max_intron)
     else:
         paf, gff = run_miniprot(vi.genome, vi.homologs, hdir, threads, filt,
-                                miniprot_opts)
+                                miniprot_opts, max_intron)
 
     sets_tsv, rel, weight = _relatedness(vi, hdir)
 
