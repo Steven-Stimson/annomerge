@@ -791,7 +791,7 @@ def merge(
         rna_res.get("junctions_bed"),
         integ_d / "protein.gff3" if (integ_d / "protein.gff3").exists()
         else hom_res.get("gff"),
-        rna_res.get("bams", []),
+        rna_res.get("coverage_bams") or rna_res.get("bams", []),
         final_d / "goldset.genome.gff3" if (final_d / "goldset.genome.gff3").exists()
         else integ_d / "goldset.genome.gff3",
         final_d / "sanity_filter.tsv",

@@ -1,15 +1,25 @@
-"""Module 2 - RNA branch: HISAT2 alignment -> samtools -> StringTie -> junctions.bed.
+"""Module 2 - RNA branch: HISAT2/minimap2 alignment -> StringTie -> junctions.bed.
+
+Aligner is chosen per sample tag:
+  fastq/fasta            HISAT2 (Illumina SE/PE)
+  isoseq*/ont            minimap2 -x splice[:hq] (long reads)
+  transcripts            minimap2 -x splice:hq -u f (assembled transcripts;
+                         excluded from coverage tracks: their depth is 1x)
+  mix                    HISAT2 (Illumina part) + minimap2 (long-read part),
+                         assembled with stringtie --mix
+  bam/bam_isoseq/bam_mix pre-aligned, passed through
 
 Lazy/resumable: existing non-empty outputs are skipped.
-Outputs (under <outdir>/rna/):
+Outputs (under <outdir>/02.rnaseq/):
   hisat2_index/            HISAT2 index
-  bam/<sample>.sorted.bam  sorted+indexed BAM per sample
+  bam/<sample>.sorted.bam  sorted+indexed BAM per sample (mix: .ilmn/.lr)
   stringtie/stringtie.gtf  merged assembly (all samples)
   junctions.bed            per-junction read support, merged over samples
 """
 from __future__ import annotations
 
 import logging
+import shlex
 from collections import defaultdict
 from pathlib import Path
 
@@ -19,6 +29,12 @@ from ..utils import ensure_dir, lazy, run, tracker, which
 from .validate import ValidatedInputs
 
 log = logging.getLogger("annomerge")
+
+_FASTA_SUF = (".fa", ".fasta", ".fna", ".fa.gz", ".fasta.gz", ".fna.gz")
+
+
+def _is_fasta(p: Path) -> bool:
+    return p.name.lower().endswith(_FASTA_SUF)
 
 
 def build_index(genome: Path, index_dir: Path, threads: int) -> Path:
@@ -32,30 +48,88 @@ def build_index(genome: Path, index_dir: Path, threads: int) -> Path:
 
 
 def align_sample(sample, index_prefix: Path, bam_dir: Path, threads: int,
-                 extra_opts: list[str] | None = None) -> Path:
-    """HISAT2 -> samtools sort -> index. Returns sorted BAM path."""
+                 extra_opts: list[str] | None = None,
+                 max_intron: int | None = None,
+                 min_intron: int | None = None,
+                 files: list | None = None,
+                 name: str | None = None) -> Path:
+    """HISAT2 -> samtools sort -> index. Returns sorted BAM path.
+
+    files/name override: used by mix samples (Illumina part only).  -f is
+    derived from the input file extension, not the sample tag (the Illumina
+    part of a mix sample may be fasta).
+    """
+    files = list(files or sample.files)
+    name = name or sample.name
     ensure_dir(bam_dir)
-    bam = bam_dir / f"{sample.name}.sorted.bam"
-    if lazy([bam, Path(str(bam) + ".bai")], desc=f"align {sample.name}"):
+    bam = bam_dir / f"{name}.sorted.bam"
+    if lazy([bam, Path(str(bam) + ".bai")], desc=f"align {name}"):
         return bam
-    sam = bam_dir / f"{sample.name}.sam"
+    sam = bam_dir / f"{name}.sam"
     cmd = [which("hisat2"), "-x", str(index_prefix), "-p", str(threads),
            "--dta", "-S", str(sam)]  # --dta: downstream transcriptome assembly
+    if _is_fasta(files[0]):
+        cmd.append("-f")
+    if min_intron:
+        cmd += ["--min-intronlen", str(min_intron)]
+    if max_intron:
+        cmd += ["--max-intronlen", str(max_intron)]
     cmd += list(extra_opts or [])
-    if len(sample.files) == 2:
-        cmd += ["-1", str(sample.files[0]), "-2", str(sample.files[1])]
+    if len(files) == 2:
+        cmd += ["-1", str(files[0]), "-2", str(files[1])]
     else:
-        cmd += ["-U", str(sample.files[0])]
-    run(cmd, log_file=bam_dir / f"{sample.name}.hisat2.log", desc=f"hisat2 {sample.name}")
+        cmd += ["-U", str(files[0])]
+    run(cmd, log_file=bam_dir / f"{name}.hisat2.log", desc=f"hisat2 {name}")
     run([which("samtools"), "sort", "-@", str(threads), "-o", str(bam), str(sam)],
-        desc=f"samtools sort {sample.name}")
+        desc=f"samtools sort {name}")
     sam.unlink()
-    run([which("samtools"), "index", str(bam)], desc=f"samtools index {sample.name}")
+    run([which("samtools"), "index", str(bam)], desc=f"samtools index {name}")
+    return bam
+
+
+def align_minimap2(sample, genome: Path, bam_dir: Path, threads: int,
+                   max_intron: int = 500000,
+                   extra_opts: list[str] | None = None,
+                   files: list | None = None,
+                   name: str | None = None,
+                   preset: str | None = None) -> Path:
+    """minimap2 (splice-aware) -> samtools sort -> index. Returns sorted BAM.
+
+    Used for long-read samples (isoseq_*/ont), assembled transcripts and the
+    long-read part of mix samples.  preset comes from the sample tag
+    (splice:hq for HiFi/transcripts, splice for CLR/ONT); the long-read part
+    of a mix defaults to plain 'splice' and can be overridden with
+    --minimap2-options '-x splice:hq'.  -u f (transcript strand is known)
+    is only applied to transcripts samples.
+    """
+    files = list(files or sample.files)
+    name = name or sample.name
+    ensure_dir(bam_dir)
+    bam = bam_dir / f"{name}.sorted.bam"
+    if lazy([bam, Path(str(bam) + ".bai")], desc=f"minimap2 {name}"):
+        return bam
+    preset = preset or sample.mm2_preset or "splice:hq"
+    cmd = [which("minimap2"), "-a", "-x", preset,
+           "-t", str(threads), "-G", str(max_intron)]
+    if sample.tag == "transcripts":
+        cmd += ["-u", "f"]       # assembled transcripts: strand is known
+    cmd += [str(genome), str(files[0])]
+    cmd += list(extra_opts or [])
+    pipe = " ".join(shlex.quote(str(c)) for c in cmd) \
+        + f" | {shlex.quote(which('samtools'))} sort -@ {threads}" \
+        + f" -o {shlex.quote(str(bam))} -"
+    run(pipe, shell=True, log_file=bam_dir / f"{name}.minimap2.log",
+        desc=f"minimap2 {name}")
+    run([which("samtools"), "index", str(bam)], desc=f"samtools index {name}")
     return bam
 
 
 def extract_junctions(bam: Path, out_bed: Path, min_reads: int = 1) -> Path:
-    """Extract splice junctions (CIGAR N blocks) with per-junction read counts."""
+    """Extract splice junctions (CIGAR N blocks) with per-junction read counts.
+
+    Strand: minimap2 splice alignments carry the ts tag (transcript strand);
+    everything else falls back to the alignment direction.
+    """
     if lazy([out_bed], desc=f"junctions {bam.stem}"):
         return out_bed
     counts: dict[tuple[str, int, int, str], int] = defaultdict(int)
@@ -64,7 +138,8 @@ def extract_junctions(bam: Path, out_bed: Path, min_reads: int = 1) -> Path:
             if read.is_unmapped or not read.cigartuples:
                 continue
             pos = read.reference_start
-            strand = "-" if read.is_reverse else "+"
+            strand = read.get_tag("ts") if read.has_tag("ts") \
+                else ("-" if read.is_reverse else "+")
             for op, length in read.cigartuples:
                 if op == 3:  # N: skipped region = intron
                     counts[(read.reference_name, pos, pos + length, strand)] += 1
@@ -104,28 +179,36 @@ def merge_junctions(beds: list[Path], out_bed: Path) -> Path:
     return out_bed
 
 
-def assemble(bams: list[Path], gtf_out: Path, threads: int,
-             extra_opts: list[str] | None = None,
-             long_read: set[Path] | None = None) -> Path:
+def assemble(units: list[dict], gtf_out: Path, threads: int,
+             extra_opts: list[str] | None = None) -> Path:
     """StringTie per sample, then stringtie --merge.
 
-    extra_opts are inserted into every per-sample assembly call (protected:
-    input BAM, -p, -o, -L — isoseq samples get -L automatically).
-    The --merge step is pipeline-managed and not user-tunable.
+    units: [{"name": str, "bams": [Path], "mode": str}] with mode
+      default   one BAM, plain stringtie
+      longread  one BAM, stringtie -L
+      mix       two BAMs (Illumina, long-read): stringtie --mix b1 b2
+    extra_opts are appended to every per-sample call (protected: input BAMs,
+    -p, -o, -L, --mix — those are pipeline-managed).
     """
     if lazy([gtf_out], desc="stringtie"):
         return gtf_out
     sd = gtf_out.parent
     ensure_dir(sd)
     per_sample = []
-    for bam in bams:
-        g = sd / f"{bam.stem.replace('.sorted', '')}.gtf"
-        if not lazy([g], desc=f"stringtie {bam.stem}"):
-            cmd = [which("stringtie"), str(bam), "-p", str(threads), "-o", str(g)]
-            if long_read and bam in long_read:
-                cmd.append("-L")
+    for u in units:
+        g = sd / f"{u['name']}.gtf"
+        if not lazy([g], desc=f"stringtie {u['name']}"):
+            if u["mode"] == "mix":
+                cmd = [which("stringtie"), str(u["bams"][0]), str(u["bams"][1]),
+                       "--mix", "-p", str(threads), "-o", str(g)]
+            else:
+                cmd = [which("stringtie"), str(u["bams"][0]),
+                       "-p", str(threads), "-o", str(g)]
+                if u["mode"] == "longread":
+                    cmd.append("-L")
             cmd += list(extra_opts or [])
-            run(cmd, log_file=sd / f"{bam.stem}.stringtie.log", desc=f"stringtie {bam.stem}")
+            run(cmd, log_file=sd / f"{u['name']}.stringtie.log",
+                desc=f"stringtie {u['name']}")
         per_sample.append(g)
     if len(per_sample) == 1:
         per_sample[0].rename(gtf_out)
@@ -139,34 +222,81 @@ def assemble(bams: list[Path], gtf_out: Path, threads: int,
 
 def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                    hisat2_opts: list[str] | None = None,
-                   stringtie_opts: list[str] | None = None) -> dict:
-    """Execute the RNA branch. Returns dict of key outputs."""
+                   stringtie_opts: list[str] | None = None,
+                   minimap2_opts: list[str] | None = None,
+                   max_intron: int = 500000,
+                   min_intron: int = 20) -> dict:
+    """Execute the RNA branch. Returns dict of key outputs.
+
+    bams:            every aligned BAM (junction extraction + assembly)
+    coverage_bams:   BAMs whose depth is real sequencing depth (excludes
+                     'transcripts' samples — their depth is a meaningless
+                     1x plate, and the long-read part of mix samples)
+    """
     rdir = ensure_dir(out_dir / "02.rnaseq")
-    tracker.note("rna inputs: %d fastq + %d bam + %d gtf",
+    tracker.note("rna inputs: %d to align + %d pre-aligned + %d gtf",
              len(vi.rna_fastqs), len(vi.rna_bams), len(vi.rna_gtfs))
 
     bams: list[Path] = []
-    if vi.rna_fastqs:
+    coverage_bams: list[Path] = []
+    units: list[dict] = []
+    idx = None
+    bam_dir = rdir / "bam"
+
+    if any(s.tag in ("fastq", "fasta", "mix") for s in vi.rna_fastqs):
         idx = build_index(vi.genome, rdir / "hisat2_index", threads)
-        for s in vi.rna_fastqs:
-            bams.append(align_sample(s, idx, rdir / "bam", threads,
-                                     extra_opts=hisat2_opts))
-    bams += [s.files[0] for s in vi.rna_bams]
-    long_read = {s.files[0] for s in vi.rna_fastqs + vi.rna_bams if s.is_longread}
+
+    for s in vi.rna_fastqs:
+        if s.tag in ("fastq", "fasta"):
+            b = align_sample(s, idx, bam_dir, threads, extra_opts=hisat2_opts,
+                             max_intron=max_intron, min_intron=min_intron)
+            bams.append(b)
+            coverage_bams.append(b)
+            units.append({"name": s.name, "bams": [b], "mode": "default"})
+        elif s.use_minimap2:
+            b = align_minimap2(s, vi.genome, bam_dir, threads,
+                               max_intron=max_intron, extra_opts=minimap2_opts)
+            bams.append(b)
+            units.append({"name": s.name, "bams": [b], "mode": "longread"})
+            if s.tag != "transcripts":       # real reads: depth is meaningful
+                coverage_bams.append(b)
+        elif s.tag == "mix":
+            b1 = align_sample(s, idx, bam_dir, threads, extra_opts=hisat2_opts,
+                              max_intron=max_intron, min_intron=min_intron,
+                              files=s.illumina_files, name=f"{s.name}.ilmn")
+            b2 = align_minimap2(s, vi.genome, bam_dir, threads,
+                                max_intron=max_intron, extra_opts=minimap2_opts,
+                                files=s.longread_files, name=f"{s.name}.lr",
+                                preset="splice")
+            bams += [b1, b2]
+            coverage_bams.append(b1)         # long-read part stays out of coverage
+            units.append({"name": s.name, "bams": [b1, b2], "mode": "mix"})
+
+    for s in vi.rna_bams:
+        if s.tag == "bam_mix":
+            bams += list(s.files)
+            coverage_bams.append(s.files[0])
+            units.append({"name": s.name, "bams": list(s.files), "mode": "mix"})
+        else:
+            bams.append(s.files[0])
+            coverage_bams.append(s.files[0])
+            units.append({"name": s.name, "bams": [s.files[0]],
+                          "mode": "longread" if s.stringtie_longread else "default"})
 
     beds = []
     for bam in bams:
-        beds.append(extract_junctions(bam, rdir / "bam" / (Path(bam).stem + ".junctions.bed")))
+        beds.append(extract_junctions(bam, bam_dir / (Path(bam).stem + ".junctions.bed")))
     merged_bed = merge_junctions(beds, rdir / "junctions.bed") if beds else None
 
     gtf = None
-    if bams:
-        gtf = assemble(bams, rdir / "stringtie" / "stringtie.gtf", threads,
-                       extra_opts=stringtie_opts, long_read=long_read)
+    if units:
+        gtf = assemble(units, rdir / "stringtie" / "stringtie.gtf", threads,
+                       extra_opts=stringtie_opts)
     elif vi.rna_gtfs:
         gtf = vi.rna_gtfs[0]  # precomputed transcripts passed through
 
-    result = {"bams": bams, "junctions_bed": merged_bed, "stringtie_gtf": gtf}
-    tracker.note("rna done: bams=%d, junctions=%s, stringtie=%s",
-             len(bams), merged_bed, gtf)
+    result = {"bams": bams, "coverage_bams": coverage_bams,
+              "junctions_bed": merged_bed, "stringtie_gtf": gtf}
+    tracker.note("rna done: bams=%d (coverage=%d), junctions=%s, stringtie=%s",
+             len(bams), len(coverage_bams), merged_bed, gtf)
     return result

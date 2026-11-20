@@ -1110,7 +1110,8 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
     # coverage bedgraphs: gated by show_rna_coverage (0=none / 1=merged only /
     # 2=merged+per-sample); must run BEFORE build_tracks_json so its metadata
     # lands in tracks.json
-    cov = sample_coverage(rna.get("bams") or [], data, threads,
+    cov = sample_coverage(rna.get("coverage_bams") or rna.get("bams") or [],
+                          data, threads,
                           mode=show_rna_coverage)
 
     # 3) tracks.json first: it copies denovo_<name>.gff3 into data/, which
