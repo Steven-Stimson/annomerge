@@ -59,6 +59,9 @@ class HomeDep:
 EXE_DEPS: tuple[ExeDep, ...] = (
     ExeDep("hisat2", ("HISAT2", "HISAT2_HOME"), ("hisat2", "hisat2-build"),
            "hisat2: conda install -c bioconda hisat2"),
+    ExeDep("minimap2", ("MINIMAP2", "MINIMAP2_HOME"), ("minimap2",),
+           "minimap2: conda install -c bioconda minimap2 "
+           "(aligner for long-read/transcripts/mix RNA samples)"),
     ExeDep("samtools", ("SAMTOOLS", "SAMTOOLS_HOME"), ("samtools",),
            "samtools: conda install -c bioconda samtools"),
     ExeDep("stringtie", ("STRINGTIE", "STRINGTIE_HOME"), ("stringtie",),
