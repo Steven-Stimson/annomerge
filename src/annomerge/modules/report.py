@@ -756,6 +756,19 @@ def protein_alignment_stats(out: Path) -> dict:
         only = next(iter(set_info))
         if only != "all":
             res["pool_name"] = only
+    # multi-pool runs filter INSIDE each pool (sets/<label>/), so the pool-level
+    # files do not exist: report the per-pool sums as the total-pool figures
+    if res["multi"]:
+        if not res["kept"] and not res["drops"] and not res["mnp_rows"]:
+            agg: dict[str, int] = {}
+            for s in res["sets"]:
+                res["kept"] += s["kept"]
+                res["drops"] += s["drops"]
+                for r, n in s["mnp_rows"]:
+                    agg[r] = agg.get(r, 0) + n
+            res["mnp_rows"] = sorted(agg.items())
+        if not res["n_raw"]:
+            res["n_raw"] = sum(s["n_raw"] for s in res["sets"])
     return res
 
 
