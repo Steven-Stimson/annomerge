@@ -354,6 +354,75 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
     return len(out)
 
 
+def _write_stringtie_gtf(src: Path, dst: Path) -> None:
+    """Copy the StringTie GTF without its 'transcript' rows.
+
+    igv.js renders the GTF transcript row as a feature of its own, so every
+    transcript occupied TWO rows (the transcript span plus its exons).
+    With only exon rows left, igv synthesizes one feature per transcript_id
+    and draws exons + introns on a single row.
+    """
+    n_drop = 0
+    with open(src) as fh, open(dst, "w") as out:
+        for line in fh:
+            if line.startswith("#"):
+                out.write(line)
+                continue
+            f = line.split("\t")
+            if len(f) >= 3 and f[2] == "transcript":
+                n_drop += 1
+                continue
+            out.write(line)
+    log.info("viewer: stringtie.gtf transcript rows dropped: %d", n_drop)
+
+
+def _protein_accession(attrs: str) -> str:
+    """Protein accession from a miniprot attribute column: the first token
+    of Target=, with any '|species=...' suffix stripped."""
+    m = re.search(r"Target=([^\s;]+)", attrs)
+    return (m.group(1).split("|", 1)[0] if m else "") or "?"
+
+
+def _dedup_protein_lines(lines: list) -> tuple[list, int, int]:
+    """Merge mRNA records with an identical CDS structure (same seqid,
+    strand and ordered CDS (start,end,phase) tuples) into a single feature;
+    its Name becomes the comma-joined protein accessions of the group.
+
+    Returns (merged_lines, n_mrna_before, n_mrna_after)."""
+    records: list = []          # [(mrna_fields, [child_lines])]
+    cur: list | None = None
+    for line in lines:
+        f = line.rstrip("\n").split("\t")
+        if len(f) < 9:
+            continue
+        if f[2] == "mRNA":
+            cur = (f, [])
+            records.append(cur)
+        elif cur is not None:
+            cur[1].append(line)
+    groups: dict = {}
+    for f, children in records:
+        cds = []
+        for ln in children:
+            c = ln.split("\t")
+            if len(c) >= 9 and c[2] == "CDS":
+                cds.append((c[3], c[4], c[7]))
+        key = (f[0], f[6], tuple(sorted(cds)))
+        groups.setdefault(key, []).append((f, children))
+    out: list = []
+    n_before = len(records)
+    for members in groups.values():
+        f0, ch0 = members[0]
+        if len(members) > 1:
+            accs = [_protein_accession(m[0][8]) for m in members]
+            attrs = re.sub(r";?Name=[^;]*", "", f0[8])
+            attrs += f";Name={','.join(accs)}"
+            f0 = f0[:8] + [attrs]
+        out.append("\t".join(f0) + "\n")
+        out.extend(ch0)
+    return out, n_before, len(groups)
+
+
 # ------------------------------------------------------------ tracks.json
 def _split_protein_tracks(pgff: Path, data_dir: Path,
                           set_weights: dict) -> list:
@@ -383,9 +452,13 @@ def _split_protein_tracks(pgff: Path, data_dir: Path,
     for src in by_src:
         label = src
         fname = f"protein_{label}.gff3"
+        merged, n_raw_mrna, n_kept = _dedup_protein_lines(by_src[src])
         with open(data_dir / fname, "w") as out:
             out.write("##gff-version 3\n")
-            out.writelines(by_src[src])
+            out.writelines(merged)
+        if n_kept < n_raw_mrna:
+            log.info("viewer protein %s: %d alignments merged into %d "
+                     "unique CDS structures", label, n_raw_mrna, n_kept)
         w = set_weights.get(label)
         tracks.append({"set": label, "weight": round(w, 4) if w else None,
                        "file": fname})
@@ -1022,7 +1095,9 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
     rna = results.get("rna") or {}
     st_gtf = rna.get("stringtie_gtf")
     if st_gtf and Path(st_gtf).exists():
-        _link_or_copy(Path(st_gtf), data / "stringtie.gtf")
+        # drop 'transcript' rows so igv renders one row per transcript
+        # (exons + intron line) instead of two (transcript span + exons)
+        _write_stringtie_gtf(Path(st_gtf), data / "stringtie.gtf")
     # NOTE: the HISAT2 junctions.bed track was removed from the browser by
     # design (user request): junctions remain in 02.rnaseq for the pipeline,
     # but are no longer copied into the viewer data/ or embedded.
