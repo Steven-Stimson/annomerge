@@ -108,24 +108,6 @@ def _prepare(outdir: str, verbose: bool) -> Path:
     return out
 
 
-def _parse_evm_options(spec: str | None) -> dict:
-    """'--evm-options "min_intron=20"' -> {min_intron: 20} (whitelisted keys)."""
-    out: dict = {}
-    for tok in (spec or "").split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        key, _, val = tok.partition("=")
-        key = key.strip()
-        if key == "min_intron":
-            out["min_intron"] = int(float(val))
-        else:
-            typer.secho(f"unknown --evm-options key {key!r} "
-                        f"(allowed: min_intron)", fg="red", err=True)
-            raise typer.Exit(2)
-    return out
-
-
 def _norm_mnp(spec: str) -> str:
     """'0' (or none/off) disables the mnp filter entirely."""
     return "" if spec.strip().lower() in ("0", "none", "off") else spec
@@ -162,6 +144,9 @@ def _run_evidence_pipeline(
     hisat2_opts: Optional[List[str]] = None,
     stringtie_opts: Optional[List[str]] = None,
     td_opts: Optional[List[str]] = None,
+    minimap2_opts: Optional[List[str]] = None,
+    max_intron: int = 500000,
+    min_intron: int = 20,
 ):
     tracker.big("01", "validate", "validate inputs (genome, predictions, evidence)")
     vi = validate(
@@ -178,7 +163,10 @@ def _run_evidence_pipeline(
         tracker.big("02", "rna", "RNA-seq alignment and assembly (hisat2/stringtie/junctions)")
         rna_res = run_rna_branch(vi, out, threads,
                                  hisat2_opts=hisat2_opts,
-                                 stringtie_opts=stringtie_opts)
+                                 stringtie_opts=stringtie_opts,
+                                 minimap2_opts=minimap2_opts,
+                                 max_intron=max_intron,
+                                 min_intron=min_intron)
         results["rna"] = rna_res
         tracker.big_done()
     else:
@@ -189,7 +177,8 @@ def _run_evidence_pipeline(
     # module 2: homology branch
     tracker.big("03", "homolog", "homolog protein alignment (miniprot)")
     results["homolog"] = run_homolog_branch(
-        vi, out, threads, mnp_filter=mnp_filter, miniprot_opts=miniprot_opts)
+        vi, out, threads, mnp_filter=mnp_filter, miniprot_opts=miniprot_opts,
+        max_intron=max_intron)
     tracker.big_done()
 
     # module 2b: gold set (built whenever RNA evidence exists)
@@ -249,10 +238,16 @@ weights and integrate all evidence into a final annotation.
   annomerge merge -g genome.fa -P denovo1=a.gff3 -p a.pep,b.pep,c.fa \\
       -r rnaseq_r1.fq,rnaseq_r2.fq
 
-  # multiple RNA samples: repeat -r, one input type per sample
-  #   (2 fastq = PE pair, 1 fastq = isoseq/CCS, 1 bam, >=1 gtf/gff3)
-  annomerge merge -g genome.fa -P denovo1=a.gff3 -p proteins.pep \\
-      -r pe_r1.fq,pe_r2.fq -r ccs.fq -r aligned.bam -r asm1.gtf,asm2.gtf
+  # multiple RNA samples: repeat -r, one input type per sample (no tag =
+  #   inferred: 1-2 fastq/fasta = Illumina SE/PE, 1 bam, >=1 gtf)
+  annomerge merge -g genome.fa -P denovo1=a.gff3 -p proteins.pep \
+      -r pe_r1.fq,pe_r2.fq -r ccs.fq:isoseq_hifi -r aligned.bam -r asm1.gtf,asm2.gtf
+
+  # long-read / mixed samples via explicit tags
+  annomerge merge -g genome.fa -P denovo1=a.gff3 -p proteins.pep \
+      -r pe_r1.fq,pe_r2.fq -r ccs.fq:isoseq_hifi -r ont.fq:ont \
+      -r "M=il_1.fq,il_2.fq,lr.fq:mix" -r tx.fa:transcripts \
+      -r iso.bam:bam_isoseq -r ilmn.bam,lr.bam:bam_mix
 
   # many RNA samples via a list file (one 'ID=files' sample per line)
   annomerge merge -g genome.fa -P denovo1=a.gff3 -p proteins.pep -r samples.txt
@@ -331,16 +326,24 @@ def merge(
     rna: Optional[List[str]] = typer.Option(
         None, "--rna", "-r",
         help="\b\n"
-             "RNA evidence; repeat [blue]-r[/blue] per sample. Each value is a "
-             "comma-separated file list, auto-detected by extension:\n"
-             "  .bam            aligned reads\n"
-             "  .gtf/.gff[3]    assembled transcripts\n"
-             "  .fastq/.fq(.gz) one file = isoseq/long-read (CCS) sample; "
-             "two files = PE short reads\n"
-             "  .txt/.list      sample sheet, one 'ID=files' sample per line\n"
-             "Prefix a value with [blue]ID=[/blue] to name the sample explicitly "
-             "(same syntax as [blue]-p[/blue] label=path):\n"
-             "  [blue]-r[/blue] S1=S1_1.fq.gz,S1_2.fq.gz\n"
+             "RNA evidence; repeat [blue]-r[/blue] per sample. Form:\n"
+             "  [blue]-r[/blue] [ID=]file[,file...][:tag]\n"
+             "Without a tag the type is inferred: 1-2 fastq/fasta = Illumina\n"
+             "(SE/PE), 1 BAM = aligned Illumina, >=1 GTF = assembled\n"
+             "transcripts. Explicit tags (long-read & mixed samples):\n"
+             "  [blue]isoseq[/blue]/[blue]isoseq_hifi[/blue]  PacBio HiFi (minimap2 splice:hq)\n"
+             "  [blue]isoseq_clr[/blue]               PacBio CLR (splice)\n"
+             "  [blue]ont[/blue]                      ONT (splice)\n"
+             "  [blue]transcripts[/blue]            assembled transcript FASTA\n"
+             "                           (splice:hq -u f; excluded from coverage)\n"
+             "  [blue]bam_isoseq[/blue]             pre-aligned long-read BAM (stringtie -L)\n"
+             "  [blue]mix[/blue]                    one sample sequenced both ways:\n"
+             "                           Illumina (1-2 files) then long-read (1),\n"
+             "                           assembled with stringtie --mix\n"
+             "  [blue]bam_mix[/blue]                pre-aligned pair: Illumina BAM FIRST,\n"
+             "                           long-read BAM second\n"
+             "A .txt/.list value is a sample sheet, one sample per line:\n"
+             "  [ID=]file [file ...] [tag]   (ID needs '=', tag is the last token)\n"
              "Omitting RNA entirely degrades the run to EVM + homolog evidence.",
         rich_help_panel="Input files"),
     busco: Optional[str] = typer.Option(
@@ -444,12 +447,6 @@ def merge(
         help="EVM evidence weight: miniprot homolog proteins (base; per-set weights "
              "apply in labeled multi-set mode).",
         rich_help_panel="EVM integration"),
-    evm_options: Optional[str] = typer.Option(
-        None, "--evm-options",
-        help="\b\nExtra EVM settings, 'key=value' comma list. Allowed keys:\n"
-             "  [blue]min_intron[/blue]  bp, default 20 (EVM --min_intron_length)\n"
-             "Example: [blue]--evm-options[/blue] \"min_intron=30\".",
-        rich_help_panel="EVM integration"),
     # ------------------------------------------------------------- augment
     augment: bool = typer.Option(
         False, "--augment",
@@ -521,6 +518,35 @@ def merge(
         False, "--weight-only", help="Stop after the EVM weight table.",
         rich_help_panel="Assessment & report"),
     # ------------------------------------------------------------- advanced
+    max_intron: Optional[int] = typer.Option(
+        None, "--max-intron",
+        help="Max intron length (bp) for hisat2/minimap2/miniprot. Default: "
+             "derived from --ploidy as 500000*2/ploidy (diploid = 500000, "
+             "after the EviAnn polyploid scaling).",
+        rich_help_panel="Advanced"),
+    min_intron: int = typer.Option(
+        20, "--min-intron",
+        help="Min intron length (bp): hisat2 --min-intronlen and EVM "
+             "--min_intron_length.",
+        rich_help_panel="Advanced"),
+    ploidy: int = typer.Option(
+        2, "--ploidy",
+        help="Genome ploidy; only used to derive the default --max-intron "
+             "(500000*2/ploidy). Ignored when --max-intron is given.",
+        rich_help_panel="Advanced"),
+    partial: int = typer.Option(
+        0, "--partial",
+        help="\b\nIncomplete-CDS transcripts in the final annotation:\n"
+             "  [cyan]0[/cyan]  (default) discard\n"
+             "  [cyan]1[/cyan]  keep and tag (partial=true)",
+        rich_help_panel="Advanced"),
+    minimap2_options: Optional[str] = typer.Option(
+        None, "--minimap2-options",
+        help="Extra minimap2 flags for long-read/transcripts/mix alignment, "
+             "e.g. \"-x splice:hq\" (overrides the tag-derived preset) or "
+             "\"--splice-flank=no\". Protected: -t, -a, -G (use --max-intron), "
+             "-u. " + _ADV_CAUTION,
+        rich_help_panel="Advanced"),
     omark_options: Optional[str] = typer.Option(
         None, "--omark-options",
         help="Extra flags forwarded to the omark assessment step, e.g. "
@@ -583,13 +609,16 @@ def merge(
     if wm not in ("fixed", "adaptive"):
         typer.secho(f"unknown --weight-mode {weight_mode!r} (fixed|adaptive)", fg="red", err=True)
         raise typer.Exit(2)
-    evm_opts = _parse_evm_options(evm_options)
     omark_options = _check_omark_options(omark_options)
+    # intron bounds: --max-intron defaults to 500000*2/ploidy (diploid 500k)
+    eff_max_intron = max_intron if max_intron else int(500000 * 2 / ploidy)
     try:
         hisat2_opts = parse_extra_opts(
             hisat2_options, ("-x", "-p", "-S", "-1", "-2", "-U", "--dta"), "hisat2")
         stringtie_opts = parse_extra_opts(
             stringtie_options, ("-p", "-o", "-L"), "stringtie")
+        minimap2_opts = parse_extra_opts(
+            minimap2_options, ("-t", "-a", "-G", "-u"), "minimap2")
         miniprot_opts = parse_extra_opts(
             miniprot_options, ("-t", "--paf", "--gff"), "miniprot")
         td_opts = parse_extra_opts(
@@ -608,6 +637,8 @@ def merge(
             predictors=predictors, mnp_filter=_norm_mnp(mnp_filter),
             miniprot_opts=miniprot_opts, hisat2_opts=hisat2_opts,
             stringtie_opts=stringtie_opts, td_opts=td_opts,
+            minimap2_opts=minimap2_opts, max_intron=eff_max_intron,
+            min_intron=min_intron,
         )
     except InputError as e:
         typer.secho(f"input error: {e}", fg="red", err=True)
@@ -726,7 +757,7 @@ def merge(
         stringtie_gtf=stringtie_gtf,
         miniprot_gff=hom_res.get("gff"),
         goldset_dir=goldset_dir,
-        threads=threads, min_intron=evm_opts.get("min_intron", 20),
+        threads=threads, min_intron=min_intron,
         w_gold=w_gold_evm, w_transcript=w_transcript_evm, w_protein=w_protein_evm,
         protein_set_weights=protein_evm_weights,
         protein_membership=membership if multi else None)
@@ -1057,6 +1088,25 @@ def evaluate(
              "(a single track)\n"
              "  [cyan]2[/cyan]  merged + one track per sample",
         rich_help_panel="Assessment & report"),
+    max_intron: Optional[int] = typer.Option(
+        None, "--max-intron",
+        help="Max intron length (bp) for hisat2/minimap2/miniprot. Default: "
+             "derived from --ploidy as 500000*2/ploidy (diploid = 500000).",
+        rich_help_panel="Advanced"),
+    min_intron: int = typer.Option(
+        20, "--min-intron",
+        help="Min intron length (bp): hisat2 --min-intronlen.",
+        rich_help_panel="Advanced"),
+    ploidy: int = typer.Option(
+        2, "--ploidy",
+        help="Genome ploidy; only used to derive the default --max-intron "
+             "(500000*2/ploidy). Ignored when --max-intron is given.",
+        rich_help_panel="Advanced"),
+    minimap2_options: Optional[str] = typer.Option(
+        None, "--minimap2-options",
+        help="Extra minimap2 flags for long-read/transcripts/mix alignment. "
+             "Protected: -t, -a, -G (use --max-intron), -u. " + _ADV_CAUTION,
+        rich_help_panel="Advanced"),
     hisat2_options: Optional[str] = typer.Option(
         None, "--hisat2-options",
         help="Extra HISAT2 alignment flags. Protected: -x, -p, -S, -1, -2, -U, "
@@ -1096,11 +1146,14 @@ def evaluate(
         typer.secho(f"unknown --viewer {viewer!r} (full|lite|no)", fg="red", err=True)
         raise typer.Exit(2)
     omark_options = _check_omark_options(omark_options)
+    eff_max_intron = max_intron if max_intron else int(500000 * 2 / ploidy)
     try:
         hisat2_opts = parse_extra_opts(
             hisat2_options, ("-x", "-p", "-S", "-1", "-2", "-U", "--dta"), "hisat2")
         stringtie_opts = parse_extra_opts(
             stringtie_options, ("-p", "-o", "-L"), "stringtie")
+        minimap2_opts = parse_extra_opts(
+            minimap2_options, ("-t", "-a", "-G", "-u"), "minimap2")
         miniprot_opts = parse_extra_opts(
             miniprot_options, ("-t", "--paf", "--gff"), "miniprot")
         td_opts = parse_extra_opts(
@@ -1120,6 +1173,8 @@ def evaluate(
             mnp_filter=_norm_mnp(mnp_filter),
             miniprot_opts=miniprot_opts, hisat2_opts=hisat2_opts,
             stringtie_opts=stringtie_opts, td_opts=td_opts,
+            minimap2_opts=minimap2_opts, max_intron=eff_max_intron,
+            min_intron=min_intron,
         )
     except InputError as e:
         typer.secho(f"input error: {e}", fg="red", err=True)
@@ -1158,7 +1213,7 @@ def evaluate(
         final_gff3, vi.genome,
         rna_res.get("junctions_bed"),
         hom_res.get("gff"),
-        rna_res.get("bams", []),
+        rna_res.get("coverage_bams") or rna_res.get("bams", []),
         eval_d / "goldset.genome.gff3",
         None,
         assess_d / "confidence.tsv",
