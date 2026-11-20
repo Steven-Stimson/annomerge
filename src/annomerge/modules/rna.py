@@ -179,16 +179,37 @@ def merge_junctions(beds: list[Path], out_bed: Path) -> Path:
     return out_bed
 
 
+def _gtf_has_transcripts(gtf: Path) -> bool:
+    """True when the GTF contains at least one transcript/mRNA feature."""
+    if not gtf.exists():
+        return False
+    with open(gtf) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.split("\t")
+            if len(f) > 2 and f[2] in ("transcript", "mRNA"):
+                return True
+    return False
+
+
 def assemble(units: list[dict], gtf_out: Path, threads: int,
              extra_opts: list[str] | None = None) -> Path:
     """StringTie per sample, then stringtie --merge.
 
-    units: [{"name": str, "bams": [Path], "mode": str}] with mode
+    units: [{"name": str, "bams": [Path], "mode": str, "opts": [str]?}]
+    with mode
       default   one BAM, plain stringtie
       longread  one BAM, stringtie -L
       mix       two BAMs (Illumina, long-read): stringtie --mix b1 b2
+    optional "opts" are per-unit StringTie flags, inserted BEFORE extra_opts
+    so user --stringtie-options still wins (e.g. transcripts units get
+    relaxed thresholds: single-copy transcripts are 1x coverage by nature
+    and stringtie -L assembles nothing from them).
     extra_opts are appended to every per-sample call (protected: input BAMs,
     -p, -o, -L, --mix — those are pipeline-managed).
+    Samples that assemble nothing are dropped before --merge (stringtie
+    --merge dies on a transcript-less input GTF).
     """
     if lazy([gtf_out], desc="stringtie"):
         return gtf_out
@@ -206,10 +227,20 @@ def assemble(units: list[dict], gtf_out: Path, threads: int,
                        "-p", str(threads), "-o", str(g)]
                 if u["mode"] == "longread":
                     cmd.append("-L")
+                cmd += list(u.get("opts") or [])
             cmd += list(extra_opts or [])
             run(cmd, log_file=sd / f"{u['name']}.stringtie.log",
                 desc=f"stringtie {u['name']}")
-        per_sample.append(g)
+        if _gtf_has_transcripts(g):
+            per_sample.append(g)
+        else:
+            log.warning("stringtie %s: no transcripts assembled — excluded "
+                        "from merge", u["name"])
+    if not per_sample:
+        log.warning("stringtie: no transcripts assembled in any sample; "
+                    "writing an empty merged GTF")
+        gtf_out.write_text("##gff-version 3\n")
+        return gtf_out
     if len(per_sample) == 1:
         per_sample[0].rename(gtf_out)
     else:
@@ -257,9 +288,15 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
             b = align_minimap2(s, vi.genome, bam_dir, threads,
                                max_intron=max_intron, extra_opts=minimap2_opts)
             bams.append(b)
-            units.append({"name": s.name, "bams": [b], "mode": "longread"})
-            if s.tag != "transcripts":       # real reads: depth is meaningful
-                coverage_bams.append(b)
+            if s.tag == "transcripts":
+                # assembled transcripts: 1x coverage per isoform by nature —
+                # stringtie -L assembles nothing from them; use the default
+                # (short-read) mode with relaxed thresholds instead
+                units.append({"name": s.name, "bams": [b], "mode": "default",
+                              "opts": ["-c", "1", "-j", "1"]})
+            else:
+                units.append({"name": s.name, "bams": [b], "mode": "longread"})
+                coverage_bams.append(b)   # real reads: depth is meaningful
         elif s.tag == "mix":
             b1 = align_sample(s, idx, bam_dir, threads, extra_opts=hisat2_opts,
                               max_intron=max_intron, min_intron=min_intron,

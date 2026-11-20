@@ -355,7 +355,13 @@ def sanity_filter(gff_in: Path, genome_fa: Path, gff_out: Path,
 
     # --partial policy for incomplete-CDS transcripts
     if partial == 0:
-        # default: discard (reported as partial_cds(...) in the tsv)
+        # default: discard (reported as partial_cds(...) in the tsv); the
+        # worker's earlier kept/no_stop|non_atg_start notes for these
+        # transcripts are superseded and dropped to keep the tsv consistent
+        flip = set(partial_map)
+        actions[:] = [a for a in actions
+                      if not (a[1] in flip and a[2] == "kept"
+                              and a[3] in ("no_stop", "non_atg_start"))]
         for tid, reasons in partial_map.items():
             removed.add(tid)
             actions.append((txs[tid].gid, tid, "removed",
