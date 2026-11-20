@@ -202,10 +202,15 @@ def assemble(units: list[dict], gtf_out: Path, threads: int,
       default   one BAM, plain stringtie
       longread  one BAM, stringtie -L
       mix       two BAMs (Illumina, long-read): stringtie --mix b1 b2
-    optional "opts" are per-unit StringTie flags, inserted BEFORE extra_opts
-    so user --stringtie-options still wins (e.g. transcripts units get
-    relaxed thresholds: single-copy transcripts are 1x coverage by nature
-    and stringtie -L assembles nothing from them).
+    optional "opts" are per-unit, pipeline-managed StringTie flags (e.g.
+    transcripts units get relaxed thresholds: single-copy transcripts are
+    1x coverage by nature and stringtie -L assembles nothing from them).
+    NOTE override direction: StringTie honours the FIRST occurrence of a
+    repeated flag (verified on 3.0.3: '-c 99 -c 1' applies 99) — opposite
+    of minimap2/miniprot (last wins). "opts" is inserted BEFORE extra_opts,
+    so the pipeline's per-unit thresholds win and a user --stringtie-options
+    repeat of the same flag is silently ignored; this is intentional
+    (protects the transcripts thresholds).
     extra_opts are appended to every per-sample call (protected: input BAMs,
     -p, -o, -L, --mix — those are pipeline-managed).
     Samples that assemble nothing are dropped before --merge (stringtie
