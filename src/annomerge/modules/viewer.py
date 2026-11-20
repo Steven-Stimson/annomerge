@@ -363,16 +363,21 @@ def _write_stringtie_gtf(src: Path, dst: Path) -> None:
     and draws exons + introns on a single row.
     """
     n_drop = 0
-    with open(src) as fh, open(dst, "w") as out:
+    kept: list = []
+    with open(src) as fh:
         for line in fh:
             if line.startswith("#"):
-                out.write(line)
+                kept.append(line)
                 continue
             f = line.split("\t")
             if len(f) >= 3 and f[2] == "transcript":
                 n_drop += 1
                 continue
-            out.write(line)
+            kept.append(line)
+    # read fully BEFORE writing: dst may hard-link src (same inode, e.g. an
+    # older viewer data dir), where open(dst, "w") would truncate the input
+    with open(dst, "w") as out:
+        out.writelines(kept)
     log.info("viewer: stringtie.gtf transcript rows dropped: %d", n_drop)
 
 
