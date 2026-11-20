@@ -17,6 +17,10 @@ Port of Paludamentum's sanity_filter_gff3.py rules (design doc v2.2 §2.2):
                       extend last CDS segment (and its exon) by 3 bp
     no_stop           CDS ends without stop codon (3' partial)
     non_atg_start     first codon is not ATG
+  --partial policy (sanity_filter(partial=...)):
+    0 (default)     no_stop / non_atg_start transcripts are discarded
+                    (reported as partial_cds(...) in the tsv)
+    1               kept, and the mRNA feature is tagged partial=true
 
 Genes whose transcripts are all removed are removed. Gene/transcript spans are
 recomputed from children after edits. Output: filtered GFF3 + sanity_filter.tsv
@@ -249,13 +253,14 @@ def _process_one(tx: Tx):
         acts.append((tx.gid, tid, "repaired", "cds_outside_exon"))
         prob = _structure_problem(tx)   # re-check after repair
     if prob:
-        return (tid, acts + [(tx.gid, tid, "removed", prob)], True, tx, False)
+        return (tid, acts + [(tx.gid, tid, "removed", prob)], True, tx, False, [])
     prot = _translate_cds(_GENOME, tx)
     # internal stop: any stop before the last codon
     if "*" in prot[:-1]:
         return (tid, acts + [(tx.gid, tid, "removed", "internal_stop")],
-                True, tx, False)
+                True, tx, False, [])
     is_extended = False
+    partial_reasons: list[str] = []   # incomplete-CDS flags (see --partial)
     if prot and prot[-1] == "*":
         pass   # proper terminal stop: nothing to do
     else:
@@ -273,16 +278,25 @@ def _process_one(tx: Tx):
             acts.append((tx.gid, tid, "extended", "extended_stop"))
         else:
             acts.append((tx.gid, tid, "kept", "no_stop"))
+            partial_reasons.append("no_stop")      # 3' incomplete
     # note non-ATG start (first codon in transcription order)
     if prot and not prot.startswith("M"):
         acts.append((tx.gid, tid, "kept", "non_atg_start"))
-    return (tid, acts, False, tx, is_extended)
+        partial_reasons.append("non_atg_start")    # 5' incomplete
+    return (tid, acts, False, tx, is_extended, partial_reasons)
 
 
 def sanity_filter(gff_in: Path, genome_fa: Path, gff_out: Path,
                   report_tsv: Path, keep_only: bool = False,
-                  threads: int = 1) -> dict:
-    """Filter the annotation. Returns stats dict. Idempotent via lazy()."""
+                  threads: int = 1, partial: int = 0) -> dict:
+    """Filter the annotation. Returns stats dict. Idempotent via lazy().
+
+    partial: incomplete-CDS policy (--partial):
+      0  (default) discard transcripts whose CDS is incomplete (no terminal
+         stop after the extension attempt, and/or a non-ATG start); the
+         removal is reported as partial_cds(<reasons>) in the tsv
+      1  keep them and tag the mRNA feature with partial=true in the output
+    """
     if lazy([gff_out, report_tsv], desc="sanity filter"):
         return {}
     genome = _read_genome(genome_fa)
@@ -312,11 +326,14 @@ def sanity_filter(gff_in: Path, genome_fa: Path, gff_out: Path,
     else:
         results = [_process_one(tx) for tx in tx_list]
 
-    for tid, acts, is_removed, tx_new, is_extended in results:
+    partial_map: dict[str, list[str]] = {}   # tid -> incomplete-CDS reasons
+    for tid, acts, is_removed, tx_new, is_extended, p_reasons in results:
         actions.extend(acts)
         txs[tid] = tx_new          # apply any exon repair done in the worker
         if is_removed:
             removed.add(tid)
+        elif p_reasons:
+            partial_map[tid] = p_reasons
         if is_extended:
             extended_tids.append(tid)
 
@@ -335,6 +352,21 @@ def sanity_filter(gff_in: Path, genome_fa: Path, gff_out: Path,
             last.start -= 3
             if cover is not None:
                 cover.start = min(cover.start, last.start)
+
+    # --partial policy for incomplete-CDS transcripts
+    if partial == 0:
+        # default: discard (reported as partial_cds(...) in the tsv)
+        for tid, reasons in partial_map.items():
+            removed.add(tid)
+            actions.append((txs[tid].gid, tid, "removed",
+                            "partial_cds(" + "+".join(reasons) + ")"))
+    else:
+        # keep and tag the mRNA feature (partial=true)
+        for tid in partial_map:
+            mrna = txs[tid].mrna
+            if "partial=" not in mrna.attrs:
+                sep = "" if mrna.attrs.endswith(";") else ";"
+                mrna.attrs = f"{mrna.attrs}{sep}partial=true"
 
     # recompute spans; drop genes without surviving transcripts
     gene_has_tx: dict[str, list[str]] = {}

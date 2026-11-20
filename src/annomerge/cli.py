@@ -147,6 +147,7 @@ def _run_evidence_pipeline(
     minimap2_opts: Optional[List[str]] = None,
     max_intron: int = 500000,
     min_intron: int = 20,
+    partial: int = 0,
 ):
     tracker.big("01", "validate", "validate inputs (genome, predictions, evidence)")
     vi = validate(
@@ -638,7 +639,7 @@ def merge(
             miniprot_opts=miniprot_opts, hisat2_opts=hisat2_opts,
             stringtie_opts=stringtie_opts, td_opts=td_opts,
             minimap2_opts=minimap2_opts, max_intron=eff_max_intron,
-            min_intron=min_intron,
+            min_intron=min_intron, partial=partial,
         )
     except InputError as e:
         typer.secho(f"input error: {e}", fg="red", err=True)
@@ -769,7 +770,7 @@ def merge(
     sanity_stats = sanity_filter(
         integ_gff3, vi.genome,
         integ_d / "evm.sanity.gff3", integ_d / "sanity_filter.tsv",
-        threads=threads)
+        threads=threads, partial=partial)
     typer.secho(f"sanity filter: {sanity_stats or 'skipped (exists)'}", fg="green")
     # module 5c-1: ID normalisation (<seqid>.g<n>.t<m>; Name= keeps old ID)
     from .modules.renamer import normalize_ids
@@ -803,7 +804,7 @@ def merge(
         aug_sanity = sanity_filter(
             aug["augment_gff3"], vi.genome,
             aug["dir"] / "augment.sanity.gff3", aug["dir"] / "sanity_filter.tsv",
-            threads=threads)
+            threads=threads, partial=partial)
         typer.secho(f"augment sanity filter: {aug_sanity or 'skipped (exists)'}", fg="green")
         # module 5c-2: ID normalisation of the final annotation
         typer.secho(f"ID normalize (final): {normalize_ids(aug['dir'] / 'augment.sanity.gff3')}", fg="green")
