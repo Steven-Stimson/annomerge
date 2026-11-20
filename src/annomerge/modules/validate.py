@@ -67,12 +67,19 @@ def parse_predictors(spec: str | None) -> dict[str, Path]:
     return out
 
 
+_LR_FASTQ_TAGS = ("isoseq", "isoseq_hifi", "isoseq_clr", "ont", "transcripts")
+_KNOWN_TAGS = ("fastq", "fasta") + _LR_FASTQ_TAGS + \
+              ("bam", "bam_isoseq", "mix", "bam_mix", "gtf")
+_MM2_PRESET = {"isoseq": "splice:hq", "isoseq_hifi": "splice:hq",
+               "isoseq_clr": "splice", "ont": "splice",
+               "transcripts": "splice:hq"}
+
+
 @dataclass
 class RnaSample:
     files: list[Path]
-    tag: str  # fastq | bam | gtf
+    tag: str               # one of _KNOWN_TAGS
     name_override: str | None = None
-    isoseq: bool = False   # long-read (CCS) sample: stringtie -L downstream
 
     @property
     def name(self) -> str:
@@ -80,7 +87,9 @@ class RnaSample:
             return self.name_override
         n = self.files[0].name
         for suf in (".fastq.gz", ".fq.gz", ".fastq", ".fq", ".bam",
-                    ".gtf", ".gff3", ".gff"):
+                    ".gtf", ".gff3", ".gff",
+                    ".fasta.gz", ".fa.gz", ".fna.gz",
+                    ".fasta", ".fa", ".fna"):
             if n.endswith(suf):
                 n = n[: -len(suf)]
         for tail in ("_1", "_2", "_R1", "_R2"):
@@ -88,8 +97,48 @@ class RnaSample:
                 n = n[: -len(tail)]
         return n
 
+    # ---- derived behaviour ----------------------------------------------
+    @property
+    def is_longread(self) -> bool:
+        return self.tag in _LR_FASTQ_TAGS + ("bam_isoseq",)
+
+    @property
+    def needs_alignment(self) -> bool:
+        return self.tag in ("fastq", "fasta", "mix") + _LR_FASTQ_TAGS
+
+    @property
+    def use_minimap2(self) -> bool:
+        return self.tag in _LR_FASTQ_TAGS
+
+    @property
+    def mm2_preset(self) -> str | None:
+        return _MM2_PRESET.get(self.tag)
+
+    @property
+    def stringtie_longread(self) -> bool:        # stringtie -L downstream
+        return self.tag in _LR_FASTQ_TAGS + ("bam_isoseq",)
+
+    @property
+    def is_mix(self) -> bool:
+        return self.tag in ("mix", "bam_mix")
+
+    @property
+    def illumina_files(self) -> list[Path]:      # mix: Illumina part
+        if self.tag == "mix":
+            return self.files[:-1]
+        if self.tag == "bam_mix":
+            return self.files[:1]
+        return self.files
+
+    @property
+    def longread_files(self) -> list[Path]:      # mix: long-read part
+        if self.tag in ("mix", "bam_mix"):
+            return self.files[-1:]
+        return self.files if self.is_longread else []
+
 
 _FQ_SUF = (".fastq.gz", ".fq.gz", ".fastq", ".fq")
+_FA_SUF = (".fasta.gz", ".fa.gz", ".fna.gz", ".fasta", ".fa", ".fna")
 _GTF_SUF = (".gtf", ".gff3", ".gff")
 _LIST_SUF = (".txt", ".list")
 
@@ -98,52 +147,138 @@ def _sniff_rna(path: Path) -> str:
     n = path.name.lower()
     if n.endswith(_FQ_SUF):
         return "fastq"
+    if n.endswith(_FA_SUF):
+        return "fasta"
     if n.endswith(".bam"):
         return "bam"
     if n.endswith(_GTF_SUF):
         return "gtf"
     raise InputError(
         f"cannot tell RNA input type from extension: {path} "
-        "(expected .fastq/.fq[.gz], .bam, .gtf/.gff[3], or a .txt/.list file)")
+        "(expected .fastq/.fq[.gz], .fasta/.fa/.fna[.gz], .bam, "
+        ".gtf/.gff[3], or a .txt/.list file)")
 
 
-def _sample_from_files(raw_files: list[str], name: str | None, ln_tag: str) -> RnaSample:
+def _sample_from_files(raw_files: list[str], name: str | None,
+                       ln_tag: str, tag: str | None = None) -> RnaSample:
     files = [_require(f.strip(), f"RNA file ({ln_tag})") for f in raw_files if f.strip()]
     if not files:
         raise InputError(f"{ln_tag}: no input files given")
-    tags = {_sniff_rna(f) for f in files}
-    if len(tags) != 1:
-        raise InputError(
-            f"{ln_tag}: mixed input types in one sample ({', '.join(sorted(tags))}); "
-            "give each RNA sample its own -r (one type per sample)")
-    tag = tags.pop()
-    isoseq = False
-    if tag == "fastq":
-        if len(files) == 1:
-            isoseq = True   # lone FASTQ defaults to long-read (isoseq/CCS)
-        elif len(files) != 2:
-            raise InputError(f"{ln_tag}: fastq sample needs 1 (isoseq/SE) or 2 (PE) files")
-    elif tag == "bam" and len(files) != 1:
-        raise InputError(f"{ln_tag}: bam sample needs exactly 1 file")
-    return RnaSample(files=files, tag=tag, name_override=name, isoseq=isoseq)
+    if tag is None:
+        # inference: a lone fastq/fasta is Illumina SE (long-read types must
+        # be requested with an explicit tag)
+        kinds = {_sniff_rna(f) for f in files}
+        if len(kinds) != 1:
+            raise InputError(
+                f"{ln_tag}: mixed input types in one sample "
+                f"({', '.join(sorted(kinds))}); give each RNA sample its own "
+                "-r (or use the 'mix' tag for Illumina + long-read)")
+        k = kinds.pop()
+        tag = k
+        if k in ("fastq", "fasta") and len(files) > 2:
+            raise InputError(
+                f"{ln_tag}: {len(files)} files and no tag — is this a 'mix' "
+                "sample (Illumina + long-read)? Add an explicit tag")
+    else:
+        tag = tag.lower()
+        if tag not in _KNOWN_TAGS:
+            raise InputError(f"{ln_tag}: unknown tag {tag!r} "
+                             f"(known tags: {', '.join(_KNOWN_TAGS)})")
+    if tag in ("fastq", "fasta"):
+        if len(files) not in (1, 2):
+            raise InputError(f"{ln_tag}: {tag} sample needs 1 (SE) or 2 (PE) files")
+        bad = [f for f in files if _sniff_rna(f) != tag]
+        if bad:
+            raise InputError(f"{ln_tag}: tag is {tag} but file is not: {bad[0]}")
+    elif tag in _LR_FASTQ_TAGS:
+        if len(files) != 1:
+            raise InputError(f"{ln_tag}: {tag} sample needs exactly 1 file")
+        if _sniff_rna(files[0]) not in ("fastq", "fasta"):
+            raise InputError(f"{ln_tag}: {tag} expects a fastq/fasta file, got {files[0]}")
+    elif tag in ("bam", "bam_isoseq"):
+        if len(files) != 1 or _sniff_rna(files[0]) != "bam":
+            raise InputError(f"{ln_tag}: {tag} sample needs exactly 1 .bam file")
+    elif tag == "mix":
+        if len(files) not in (2, 3):
+            raise InputError(f"{ln_tag}: mix sample needs Illumina (1-2 files) "
+                             "+ long-read (1 file)")
+        if any(_sniff_rna(f) not in ("fastq", "fasta") for f in files):
+            raise InputError(f"{ln_tag}: mix expects fastq/fasta files only")
+        if len({_sniff_rna(f) for f in files[:-1]}) != 1:
+            raise InputError(f"{ln_tag}: mix Illumina part must be a single type")
+    elif tag == "bam_mix":
+        if len(files) != 2 or any(_sniff_rna(f) != "bam" for f in files):
+            raise InputError(f"{ln_tag}: bam_mix needs exactly 2 .bam files")
+    elif tag == "gtf":
+        if any(_sniff_rna(f) != "gtf" for f in files):
+            raise InputError(f"{ln_tag}: gtf sample expects .gtf/.gff3/.gff files")
+    return RnaSample(files=files, tag=tag, name_override=name)
+
+
+_INLINE_TAG_RE = __import__("re").compile(r":([A-Za-z_]+)$")
+
+
+def _split_inline(entry: str):
+    """'ID=f1,f2:tag' -> (id | None, [files], tag | None).
+    The 'ID=' prefix is honoured only when '=' sits inside the first file
+    token; ':tag' is honoured only as the LAST token and must be a known tag
+    (so paths containing ':' or '=' are never misparsed)."""
+    sid, filespec = None, entry
+    head, sep, rest = entry.partition("=")
+    if sep and head.strip() and "/" not in head and "," not in head:
+        sid, filespec = head.strip(), rest
+    tag = None
+    m = _INLINE_TAG_RE.search(filespec)
+    if m:
+        tok = m.group(1).lower()
+        if tok in _KNOWN_TAGS:
+            tag = tok
+            filespec = filespec[: m.start()]
+        elif not Path(filespec).exists():
+            raise InputError(
+                f"unknown RNA sample tag :{m.group(1)} in {entry!r} "
+                f"(known tags: {', '.join(_KNOWN_TAGS)})")
+        # else: a real file whose name contains ':' -- keep the name as-is
+    return sid, filespec.split(","), tag
+
+
+def _parse_list_line(line: str, ln_tag: str):
+    """EviAnn-style list line: '[ID=name] file [file ...] [tag]'.
+    Files may also be comma-joined (legacy 'ID=1.fq,2.fq' form).
+    NOTE: the sample ID must use the 'ID=' prefix (with '='); a bare
+    leading token is always treated as a file name, never as an ID."""
+    tokens = line.split()
+    tag = None
+    if tokens and tokens[-1].lower() in _KNOWN_TAGS:
+        tag = tokens.pop(-1).lower()
+    sid = None
+    if tokens and "=" in tokens[0] and "/" not in tokens[0].split("=", 1)[0]:
+        head = tokens.pop(0)
+        sid, _, first = head.partition("=")
+        sid = sid.strip() or None
+        if first:
+            tokens.insert(0, first)
+    files: list[str] = []
+    for tok in tokens:
+        files.extend(t for t in tok.split(",") if t)
+    return sid, files, tag
 
 
 def parse_rna_entries(entries: list[str] | None) -> list[RnaSample]:
     """Parse -r/--rna entries.
-
     Each entry is either an inline sample or a list file:
-      -r sample_r1.fq,sample_r2.fq     PE short-read sample
-      -r S1=sample_r1.fq,sample_r2.fq  same, with an explicit sample ID
-                                       (like -p label=path; the '=' must sit in
-                                       the FIRST file token of the entry)
-      -r ccs.fq                        single FASTQ -> isoseq (long-read) sample
-      -r aligned.bam                   pre-aligned BAM
-      -r a.gtf,b.gtf                   assembled transcripts (>=1 GTF per sample)
-      -r samples.txt                  list file, one sample per line:
-                                         ID1=1.fq,2.fq
-                                         ID2=xxx.fq
-                                         ID3=xxx.gtf,yyy.gtf,zzz.gtf
-                                       (same per-line rules; ID = sample name)
+      -r sample_1.fq,sample_2.fq      PE Illumina sample (inferred)
+      -r S1=sample_1.fq,sample_2.fq   same, with an explicit sample ID
+      -r se.fq                        SE Illumina sample (inferred)
+      -r ccs.fq:isoseq_hifi           PacBio HiFi long-read sample
+      -r ont.fq:ont                   ONT long-read sample
+      -r tx.fa:transcripts            assembled transcripts (fasta)
+      -r "M=il_1.fq,il_2.fq,lr.fq:mix"  one sample sequenced both ways
+      -r aligned.bam                  pre-aligned BAM (Illumina)
+      -r iso.bam:bam_isoseq           pre-aligned long-read BAM
+      -r a.gtf,b.gtf                  assembled transcripts (GTF)
+      -r samples.txt                  list file, one sample per line
+                                      (EviAnn style: [ID=name] files... [tag])
     """
     samples: list[RnaSample] = []
     for entry in entries or []:
@@ -156,26 +291,14 @@ def parse_rna_entries(entries: list[str] | None) -> list[RnaSample]:
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
-                    if "=" not in line:
-                        raise InputError(
-                            f"{entry}:{ln}: expected 'ID=files' (key=value), got: {line!r}")
-                    sid, _, filespec = line.partition("=")
-                    sid = sid.strip()
-                    if not sid:
-                        raise InputError(f"{entry}:{ln}: empty sample ID")
+                    sid, files, tag = _parse_list_line(line, f"{entry}:{ln}")
                     samples.append(
-                        _sample_from_files(filespec.split(","), sid,
-                                           f"{entry}:{ln} ({sid})"))
+                        _sample_from_files(files, sid,
+                                           f"{entry}:{ln}" + (f" ({sid})" if sid else ""),
+                                           tag=tag))
         else:
-            # inline sample: optional 'ID=' prefix names the sample explicitly;
-            # only honoured when '=' is inside the first file token (so a
-            # directory component containing '=' is never parsed as an ID)
-            sid, filespec = None, entry
-            head, sep, rest = entry.partition("=")
-            if sep and head.strip() and "/" not in head and "," not in head:
-                sid, filespec = head.strip(), rest
-            samples.append(_sample_from_files(filespec.split(","), sid,
-                                              f"-r {entry}"))
+            sid, files, tag = _split_inline(entry)
+            samples.append(_sample_from_files(files, sid, f"-r {entry}", tag=tag))
     seen: set[str] = set()
     for s in samples:
         if s.name in seen:
@@ -321,11 +444,11 @@ class ValidatedInputs:
 
     @property
     def rna_fastqs(self) -> list[RnaSample]:
-        return [s for s in self.rna_samples if s.tag == "fastq"]
-
+        return [s for s in self.rna_samples if s.needs_alignment]
     @property
     def rna_bams(self) -> list[RnaSample]:
-        return [s for s in self.rna_samples if s.tag in ("bam", "bam_isoseq")]
+        return [s for s in self.rna_samples
+                if s.tag in ("bam", "bam_isoseq", "bam_mix")]
 
     @property
     def rna_gtfs(self) -> list[Path]:

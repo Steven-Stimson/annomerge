@@ -152,7 +152,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
             bams.append(align_sample(s, idx, rdir / "bam", threads,
                                      extra_opts=hisat2_opts))
     bams += [s.files[0] for s in vi.rna_bams]
-    long_read = {s.files[0] for s in vi.rna_fastqs + vi.rna_bams if s.isoseq}
+    long_read = {s.files[0] for s in vi.rna_fastqs + vi.rna_bams if s.is_longread}
 
     beds = []
     for bam in bams:
