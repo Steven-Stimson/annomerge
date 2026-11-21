@@ -80,7 +80,8 @@ def align_sample(sample, index_prefix: Path, bam_dir: Path, threads: int,
     else:
         cmd += ["-U", str(files[0])]
     run(cmd, log_file=bam_dir / f"{name}.hisat2.log", desc=f"hisat2 {name}")
-    run([which("samtools"), "sort", "-@", str(threads), "-o", str(bam), str(sam)],
+    run([which("samtools"), "sort", "-m", "256M", "-@", str(threads),
+         "-o", str(bam), str(sam)],
         desc=f"samtools sort {name}")
     sam.unlink()
     run([which("samtools"), "index", str(bam)], desc=f"samtools index {name}")
@@ -116,7 +117,7 @@ def align_minimap2(sample, genome: Path, bam_dir: Path, threads: int,
     cmd += [str(genome), str(files[0])]
     cmd += list(extra_opts or [])
     pipe = " ".join(shlex.quote(str(c)) for c in cmd) \
-        + f" | {shlex.quote(which('samtools'))} sort -@ {threads}" \
+        + f" | {shlex.quote(which('samtools'))} sort -m 256M -@ {threads}" \
         + f" -o {shlex.quote(str(bam))} -"
     run(pipe, shell=True, log_file=bam_dir / f"{name}.minimap2.log",
         desc=f"minimap2 {name}")

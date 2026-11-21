@@ -605,7 +605,9 @@ def _sanitize_faa(faa: Path) -> None:
     (in place, via a temp file). Diamond 2.2 deadlocks (futex wait at
     'Loading query sequences') on '.' characters, which gffread -y emits for
     fuzzy/trans-spliced CDS in real NCBI GFF3 annotations. Idempotent: files
-    without bad letters are left untouched."""
+    without bad letters are left untouched. Sequences are uppercased first
+    (lowercase residues are biological sequence, not placeholders); '*' and
+    U/B/Z/J are all mapped to X (diamond's alphabet has none of them)."""
     try:
         dirty = False
         out_lines = []
@@ -614,7 +616,7 @@ def _sanitize_faa(faa: Path) -> None:
                 if line.startswith(">"):
                     out_lines.append(line)
                     continue
-                seq = line.rstrip("\n")
+                seq = line.rstrip("\n").upper()
                 if not set(seq) <= _AA_OK:
                     dirty = True
                     seq = "".join(c if c in _AA_OK else "X" for c in seq)
