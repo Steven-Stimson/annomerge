@@ -57,7 +57,7 @@ confidence 分层与浏览器 coverage 轨道只统计真实测序深度的 BAM�
 - **diamond 死锁修复**（scoring.py `_sanitize_faa`）：diamond 2.2 对含 `.` 残基的
   蛋白序列会在 "Loading query sequences" 处 futex 死锁（ath TAIR10 注释实测
   195/48133 条含点，来自 gffread -y 对模糊/trans-spliced CDS 的翻译）。
-  extract_proteins 现在幂等清洗：小写先 upper，`.*`/U/B/Z/J 等非标准残基 → X。
+  extract_proteins 现在幂等清洗：小写残基视为合法（判定前先 upper()）；`.`、`*` 与 U/B/Z/J 等非标准字母 → X。
 - **samtools sort 内存封顶**：rna.py 两处 `samtools sort` 加 `-m 256M`
   （默认 768MB/线程在小内存容器会把 hisat2/minimap2 挤到 OOM）。
 
@@ -79,9 +79,18 @@ confidence 分层与浏览器 coverage 轨道只统计真实测序深度的 BAM�
    在 evaluate + NCBI 注释下可能含 `.`（仅展示用途，不喂工具）。
 3. miniprot 对大规模 homolog 集（~10 万蛋白）在 16c 下约需 1 小时级，属正常。
 
-## 提交清单（git log --oneline）
+## 提交清单（git log --oneline，新→旧）
 
 ```
-4a140a2 scoring: sanitize gffread proteins for diamond
-（步骤 1-7 的 9 个 commit 见 git log）
+5d9745c step 9: review follow-ups + delivery notes
+4a140a2 scoring: sanitize gffread proteins for diamond (step 8 e2e finding)
+ea6a7e0 rna: docstring — per-unit stringtie opts are pipeline-managed
+70d5d14 step 7: partial tsv fix + toy e2e tests
+4839bd1 step 6: --partial semantics in sanity/cli
+ede75ef step 5: cli merge/evaluate params + -r help
+021ac1c step 4: miniprot -G max_intron passthrough
+474de56 step 3: rna.py minimap2/mix/transcripts rewrite
+67245f5 step 2: deps register minimap2
+98e0c1e step 1: RnaSample tag model in validate.py
 ```
+（以实际 git log 为准；以上为本次改造的全部 commit）
