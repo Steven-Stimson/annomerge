@@ -55,6 +55,8 @@
   .fig-table-side table { margin-top: 0; }
   .diagram { margin: 12px 0; }
   .diagram svg { width: 100%; height: auto; }
+  .logo { text-align: center; margin: 4px 0 12px; }
+  .logo svg { width: 360px; max-width: 60%; height: auto; }
   .placeholder { background: #fbfcfe; border: 1.5px dashed #9db4d0;
                  border-radius: 8px; padding: 14px 18px; margin: 12px 0;
                  color: #456; }
@@ -92,6 +94,9 @@
   <div id="toc-list"></div>
 </nav>
 <h1>AnnoMerge Report</h1>
+{% if logo_svg %}
+<div class="logo">{{ logo_svg }}</div>
+{% endif %}
 
 <!-- ============================================================ 1. Run Summary -->
 <details>

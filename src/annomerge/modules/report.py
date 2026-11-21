@@ -363,6 +363,8 @@ _TEMPLATE = (Path(__file__).resolve().parent.parent / "assets"
              / "report_template.html").read_text()
 _WORKFLOW_SVG = (Path(__file__).resolve().parent.parent / "assets"
                  / "workflow_diagram.svg")
+_LOGO_SVG = (Path(__file__).resolve().parent.parent / "assets"
+             / "logo.svg")
 def render_html(ctx: dict, out_html: Path,
                 meta: dict | None = None) -> Path:
     """Render the single-page report."""
@@ -371,8 +373,10 @@ def render_html(ctx: dict, out_html: Path,
     env = Environment(loader=BaseLoader(), autoescape=True)
     tpl = env.from_string(_TEMPLATE)
     diagram = Markup(_WORKFLOW_SVG.read_text()) if _WORKFLOW_SVG.exists() else None
+    logo = Markup(_LOGO_SVG.read_text()) if _LOGO_SVG.exists() else None
     html = tpl.render(meta=meta or ctx.get("meta", {}),
                       workflow_diagram=diagram,
+                      logo_svg=logo,
                       gene_set=ctx.get("gene_set", {}),
                       busco=ctx.get("busco", {}),
                       omark=ctx.get("omark", {}),

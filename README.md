@@ -1,6 +1,16 @@
 # AnnoMerge
 
+<p align="center">
+  <img src="src/annomerge/assets/logo.svg" alt="AnnoMerge logo" width="420">
+</p>
+
 AnnoMerge: Merge multiple genome annotations by support of RNA and proteins.
+
+## Workflow
+
+<p align="center">
+  <img src="src/annomerge/assets/workflow_diagram.svg" alt="AnnoMerge workflow" width="900">
+</p>
 
 ## Installation
 
