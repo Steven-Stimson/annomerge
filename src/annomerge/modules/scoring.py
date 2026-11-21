@@ -597,11 +597,47 @@ def ranks_frac(r: int, n: int) -> float:
 
 # ---------------------------------------------------------------- driver
 
+_AA_OK = set("ACDEFGHIKLMNPQRSTVWY")
+
+
+def _sanitize_faa(faa: Path) -> None:
+    """Replace any residue letter outside the 20 standard amino acids with X
+    (in place, via a temp file). Diamond 2.2 deadlocks (futex wait at
+    'Loading query sequences') on '.' characters, which gffread -y emits for
+    fuzzy/trans-spliced CDS in real NCBI GFF3 annotations. Idempotent: files
+    without bad letters are left untouched."""
+    try:
+        dirty = False
+        out_lines = []
+        with open(faa) as fh:
+            for line in fh:
+                if line.startswith(">"):
+                    out_lines.append(line)
+                    continue
+                seq = line.rstrip("\n")
+                if not set(seq) <= _AA_OK:
+                    dirty = True
+                    seq = "".join(c if c in _AA_OK else "X" for c in seq)
+                    out_lines.append(seq + "\n")
+                else:
+                    out_lines.append(line)
+        if dirty:
+            tmp = faa.with_suffix(faa.suffix + ".san")
+            with open(tmp, "w") as out:
+                out.writelines(out_lines)
+            tmp.replace(faa)
+            log.info("sanitized %s (non-standard residues -> X)", faa.name)
+    except OSError as e:
+        log.warning("sanitize %s failed: %s", faa, e)
+
+
 def extract_proteins(genome: Path, gff: Path, out_faa: Path) -> Path:
-    """gffread -y: translate CDS to proteins."""
+    """gffread -y: translate CDS to proteins; residues are sanitized to the
+    standard 20 (+X) so downstream diamond never deadlocks."""
     if not lazy([out_faa], desc=f"gffread -y {gff.name}"):
         run([which("gffread"), "-g", str(genome), "-y", str(out_faa), str(gff)],
             desc=f"gffread proteins {gff.name}")
+    _sanitize_faa(out_faa)
     return out_faa
 
 
