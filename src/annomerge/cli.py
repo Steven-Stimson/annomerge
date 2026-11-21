@@ -181,7 +181,7 @@ def _run_evidence_pipeline(
     # module 2: RNA branch
     rna_res = None
     if vi.has_rna:
-        tracker.big("02", "rna", "RNA-seq alignment and assembly (hisat2/stringtie/junctions)")
+        tracker.big("02", "rna", "RNA-seq evidence: alignment (hisat2/minimap2, tag-dependent), assembly (stringtie), splice junctions")
         rna_res = run_rna_branch(vi, out, threads,
                                  hisat2_opts=hisat2_opts,
                                  stringtie_opts=stringtie_opts,
