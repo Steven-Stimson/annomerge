@@ -18,7 +18,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-from ..utils import ToolError, ensure_dir, lazy, run, tracker, which
+from ..utils import ToolError, ToolOpts, ensure_dir, lazy, run, tracker, which
 from .validate import ValidatedInputs
 
 log = logging.getLogger("annomerge")
@@ -314,16 +314,22 @@ def _median(xs: list[float]) -> float:
 
 def _run_sets_miniprot(vi: ValidatedInputs, hdir: Path, threads: int,
                        filt: dict | None = None,
-                       extra_opts: list[str] | None = None,
+                       extra_opts: ToolOpts | list | None = None,
                        max_intron: int | None = None) -> tuple[Path, Path]:
-    """Per-set miniprot runs, merged transparently into hdir/miniprot.{paf,gff}."""
+    """Per-set miniprot runs, merged transparently into hdir/miniprot.{paf,gff}.
+
+    extra_opts may be a ToolOpts (LABEL=flags targets one set; targeted flags
+    are appended after the global ones, miniprot is last-wins) or a plain list
+    (applied to every set)."""
     sroot = ensure_dir(hdir / "sets")
     n_sets = len(vi.homolog_sets)
     t_each = max(1, threads // n_sets)
     set_outputs = []
     for label, path in vi.homolog_sets.items():
+        set_extra = (extra_opts.for_target(label)
+                     if isinstance(extra_opts, ToolOpts) else extra_opts)
         set_outputs.append(run_miniprot(vi.genome, path, ensure_dir(sroot / label),
-                                        t_each, filt, extra_opts, max_intron))
+                                        t_each, filt, set_extra, max_intron))
     paf = hdir / "miniprot.paf"
     gff = hdir / "miniprot.gff"
     if not lazy([paf, gff], desc="merge per-set miniprot"):
@@ -410,13 +416,29 @@ def _relatedness(vi: ValidatedInputs, hdir: Path) -> tuple[Path, dict[str, float
 
 def run_homolog_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                        mnp_filter: str = "",
-                       miniprot_opts: list[str] | None = None,
+                       miniprot_opts: ToolOpts | list | None = None,
                        max_intron: int | None = None) -> dict:
     referee_min_wi = REFEREE_MIN_WI
     hdir = ensure_dir(out_dir / "03.homolog")
     tracker.note("homolog proteins: %s (%d set(s))", vi.homologs, len(vi.homolog_sets))
     membership = _load_membership(vi)
     filt = parse_mnp_filter(mnp_filter)
+    if miniprot_opts is None:
+        miniprot_opts = ToolOpts([], {})
+    elif not isinstance(miniprot_opts, ToolOpts):
+        miniprot_opts = ToolOpts(list(miniprot_opts), {})
+    # targeted 'LABEL=flags' needs the labeled multi-set mode
+    if miniprot_opts.per_target:
+        labels = set(vi.homolog_sets)
+        if len(labels) <= 1:
+            raise ToolError(
+                "miniprot: targeted options need at least 2 labeled homolog "
+                "sets (-p label=file); this run has a single set/pool")
+        bad = sorted(set(miniprot_opts.per_target) - labels)
+        if bad:
+            raise ToolError(
+                f"miniprot: targeted option(s) for unknown homolog set(s) "
+                f"{bad}; available labels: {sorted(labels)}")
     active = [k for k in ("UnStop", "UnShift", "minIden", "minPos", "minSize",
                           "maxRank", "R2Q", "Q2R", "topRank")
               if filt.get(k)] or filt.get("maxSize", 10**9) != 10**9
@@ -428,7 +450,7 @@ def run_homolog_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                                       max_intron)
     else:
         paf, gff = run_miniprot(vi.genome, vi.homologs, hdir, threads, filt,
-                                miniprot_opts, max_intron)
+                                miniprot_opts.for_target(None), max_intron)
 
     sets_tsv, rel, weight = _relatedness(vi, hdir)
 

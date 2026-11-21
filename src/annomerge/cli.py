@@ -20,7 +20,8 @@ from .modules.validate import InputError, validate
 from .modules.rna import run_rna_branch
 from .modules.homolog import run_homolog_branch
 from .modules.goldset import run_goldset
-from .utils import ensure_dir, parse_extra_opts, set_run_log_dir, setup_logging, tracker
+from .utils import (ensure_dir, parse_extra_opts, parse_targeted_opts,
+                    set_run_log_dir, setup_logging, tracker)
 
 app = typer.Typer(
     name="annomerge",
@@ -47,6 +48,11 @@ app = typer.Typer(
 
 _ADV_CAUTION = ("[yellow]Caution:[/yellow] only touch these if you fully understand "
                 "the consequences")
+
+_TARGETED_NOTE = (" Repeatable. A bare value applies globally; 'NAME=flags' "
+                  "targets one RNA sample (explicit ID or filename stem) or "
+                  "homolog set label; targeted flags are appended after the "
+                  "global ones (last wins). Unknown names are rejected.")
 
 _MNP_HELP = (
     "\b\n"
@@ -111,6 +117,20 @@ def _prepare(outdir: str, verbose: bool) -> Path:
 def _norm_mnp(spec: str) -> str:
     """'0' (or none/off) disables the mnp filter entirely."""
     return "" if spec.strip().lower() in ("0", "none", "off") else spec
+
+
+def _yamlable(v):
+    """Make a parsed option value yaml-safe (ToolOpts -> plain dict)."""
+    from .utils import ToolOpts
+    if isinstance(v, ToolOpts):
+        return {"global": v.global_flags, "targeted": v.per_target}
+    return v
+
+
+def _yamlable_key(k: str) -> str:
+    """Parsed ToolOpts land under '<name>_resolved' in resolved_params.yaml
+    so they are not confused with the raw '<name>_options' CLI values."""
+    return k[:-5] + "_resolved" if k.endswith("_opts") else k
 
 
 def _check_omark_options(spec: str | None) -> str | None:
@@ -543,12 +563,12 @@ def merge(
              "Keep is the default because --augment isoforms otherwise lose\n"
              "their incomplete-ORF variants (AS structure collapses).",
         rich_help_panel="Advanced"),
-    minimap2_options: Optional[str] = typer.Option(
+    minimap2_options: Optional[List[str]] = typer.Option(
         None, "--minimap2-options",
         help="Extra minimap2 flags for long-read/transcripts/mix alignment, "
              "e.g. \"-x splice:hq\" (overrides the tag-derived preset) or "
              "\"--splice-flank=no\". Protected: -t, -a, -G (use --max-intron), "
-             "-u. " + _ADV_CAUTION,
+             "-u." + _TARGETED_NOTE + " " + _ADV_CAUTION,
         rich_help_panel="Advanced"),
     omark_options: Optional[str] = typer.Option(
         None, "--omark-options",
@@ -558,22 +578,23 @@ def merge(
              "-f, -d, -o, -i/--isoform_file (isoform collapsing is generated "
              "automatically from each predictor GFF).",
         rich_help_panel="Advanced"),
-    hisat2_options: Optional[str] = typer.Option(
+    hisat2_options: Optional[List[str]] = typer.Option(
         None, "--hisat2-options",
         help="Extra HISAT2 alignment flags, e.g. \"-k 3 --sp "
              "max=15\". Inserted into every per-sample alignment. Protected: "
-             "-x, -p, -S, -1, -2, -U, --dta.",
+             "-x, -p, -S, -1, -2, -U, --dta." + _TARGETED_NOTE,
         rich_help_panel="Advanced"),
-    stringtie_options: Optional[str] = typer.Option(
+    stringtie_options: Optional[List[str]] = typer.Option(
         None, "--stringtie-options",
         help="Extra StringTie flags for per-sample assembly, e.g. \"-f 0.1 -c 5\". "
              "Protected: the input BAM, -p, -o, -L (isoseq samples get -L "
-             "automatically). The --merge step is pipeline-managed.",
+             "automatically). The --merge step is pipeline-managed."
+             + _TARGETED_NOTE,
         rich_help_panel="Advanced"),
-    miniprot_options: Optional[str] = typer.Option(
+    miniprot_options: Optional[List[str]] = typer.Option(
         None, "--miniprot-options",
         help="Extra miniprot flags, e.g. \"-I -S\". Inserted into both PAF and "
-             "GFF runs. Protected: -t, --paf, --gff.",
+             "GFF runs. Protected: -t, --paf, --gff." + _TARGETED_NOTE,
         rich_help_panel="Advanced"),
     mnp_filter: str = typer.Option(
         "UnStop,UnShift", "--mnp-filter", help=_MNP_HELP,
@@ -616,13 +637,13 @@ def merge(
     # intron bounds: --max-intron defaults to 500000*2/ploidy (diploid 500k)
     eff_max_intron = max_intron if max_intron else int(500000 * 2 / ploidy)
     try:
-        hisat2_opts = parse_extra_opts(
+        hisat2_opts = parse_targeted_opts(
             hisat2_options, ("-x", "-p", "-S", "-1", "-2", "-U", "--dta"), "hisat2")
-        stringtie_opts = parse_extra_opts(
+        stringtie_opts = parse_targeted_opts(
             stringtie_options, ("-p", "-o", "-L"), "stringtie")
-        minimap2_opts = parse_extra_opts(
+        minimap2_opts = parse_targeted_opts(
             minimap2_options, ("-t", "-a", "-G", "-u"), "minimap2")
-        miniprot_opts = parse_extra_opts(
+        miniprot_opts = parse_targeted_opts(
             miniprot_options, ("-t", "--paf", "--gff"), "miniprot")
         td_opts = parse_extra_opts(
             transdecoder_options, ("-t", "-m", "--retain_blastp_hits"), "TransDecoder")
@@ -631,7 +652,9 @@ def merge(
         raise typer.Exit(2)
 
     out = _prepare(outdir, verbose)
-    params = {k: v for k, v in locals().items() if k not in ("out",)}
+    from .utils import ToolOpts as _ToolOpts
+    params = {(_yamlable_key(k) if isinstance(v, _ToolOpts) else k): _yamlable(v)
+              for k, v in locals().items() if k not in ("out",)}
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
         results, vi = _run_evidence_pipeline(
@@ -1105,24 +1128,27 @@ def evaluate(
         help="Genome ploidy; only used to derive the default --max-intron "
              "(500000*2/ploidy). Ignored when --max-intron is given.",
         rich_help_panel="Advanced"),
-    minimap2_options: Optional[str] = typer.Option(
+    minimap2_options: Optional[List[str]] = typer.Option(
         None, "--minimap2-options",
         help="Extra minimap2 flags for long-read/transcripts/mix alignment. "
-             "Protected: -t, -a, -G (use --max-intron), -u. " + _ADV_CAUTION,
+             "Protected: -t, -a, -G (use --max-intron), -u."
+             + _TARGETED_NOTE + " " + _ADV_CAUTION,
         rich_help_panel="Advanced"),
-    hisat2_options: Optional[str] = typer.Option(
+    hisat2_options: Optional[List[str]] = typer.Option(
         None, "--hisat2-options",
         help="Extra HISAT2 alignment flags. Protected: -x, -p, -S, -1, -2, -U, "
-             "--dta. " + _ADV_CAUTION,
+             "--dta." + _TARGETED_NOTE + " " + _ADV_CAUTION,
         rich_help_panel="Advanced"),
-    stringtie_options: Optional[str] = typer.Option(
+    stringtie_options: Optional[List[str]] = typer.Option(
         None, "--stringtie-options",
         help="Extra StringTie flags for per-sample assembly. Protected: input "
-             "BAM, -p, -o, -L. " + _ADV_CAUTION,
+             "BAM, -p, -o, -L." + _TARGETED_NOTE + " " + _ADV_CAUTION,
         rich_help_panel="Advanced"),
-    miniprot_options: Optional[str] = typer.Option(
+    miniprot_options: Optional[List[str]] = typer.Option(
         None, "--miniprot-options",
-        help="Extra miniprot flags. Protected: -t, --paf, --gff. " + _ADV_CAUTION,
+        help="Extra miniprot flags, e.g. \"-I -S\". Inserted into both PAF and "
+             "GFF runs. Protected: -t, --paf, --gff."
+             + _TARGETED_NOTE + " " + _ADV_CAUTION,
         rich_help_panel="Advanced"),
     transdecoder_options: Optional[str] = typer.Option(
         None, "--transdecoder-options", help=_TD_HELP,
@@ -1151,13 +1177,13 @@ def evaluate(
     omark_options = _check_omark_options(omark_options)
     eff_max_intron = max_intron if max_intron else int(500000 * 2 / ploidy)
     try:
-        hisat2_opts = parse_extra_opts(
+        hisat2_opts = parse_targeted_opts(
             hisat2_options, ("-x", "-p", "-S", "-1", "-2", "-U", "--dta"), "hisat2")
-        stringtie_opts = parse_extra_opts(
+        stringtie_opts = parse_targeted_opts(
             stringtie_options, ("-p", "-o", "-L"), "stringtie")
-        minimap2_opts = parse_extra_opts(
+        minimap2_opts = parse_targeted_opts(
             minimap2_options, ("-t", "-a", "-G", "-u"), "minimap2")
-        miniprot_opts = parse_extra_opts(
+        miniprot_opts = parse_targeted_opts(
             miniprot_options, ("-t", "--paf", "--gff"), "miniprot")
         td_opts = parse_extra_opts(
             transdecoder_options, ("-t", "-m", "--retain_blastp_hits"), "TransDecoder")
@@ -1166,7 +1192,9 @@ def evaluate(
         raise typer.Exit(2)
 
     out = _prepare(outdir, verbose)
-    params = {k: v for k, v in locals().items() if k not in ("out",)}
+    from .utils import ToolOpts as _ToolOpts
+    params = {(_yamlable_key(k) if isinstance(v, _ToolOpts) else k): _yamlable(v)
+              for k, v in locals().items() if k not in ("out",)}
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
         results, vi = _run_evidence_pipeline(

@@ -54,6 +54,21 @@ tag 一览（`annomerge merge --help` 的 `-r` 帮助有完整表）：
 confidence 分层与浏览器 coverage 轨道只统计真实测序深度的 BAM：
 排除 transcripts（天然 1x 假象）与 mix/bam_mix 的长读侧。
 
+### 4b. 工具 --options 支持按样本/集定向（NAME=flags）
+
+`--minimap2-options` / `--miniprot-options` / `--hisat2-options` / `--stringtie-options`
+四个参数均可**重复传参**，每条两种形态：
+
+- 裸 flags（全局）：`--minimap2-options "--splice-flank=no"` 作用于所有该工具调用
+- 定向：`--minimap2-options "isoseq_sub=-x splice:hq"` 只作用于该样本/集
+
+规则：定向名 = RNA 样本的显式 ID 或文件名 stem，或 homolog 集的 label；
+合并顺序为 tag 默认 → 全局 → 定向（minimap2/miniprot last-wins，stringtie 的管道
+per-unit 阈值如 transcripts 的 -c 1 -j 1 始终在最前、受 first-occurrence-wins 保护）；
+定向到不存在的名字硬报错并列出可用名；miniprot 定向需 ≥2 个带 label 的集；
+mix 样本名同时定向 hisat2（.ilmn 侧）与 minimap2（.lr 侧）。
+resolved_params.yaml 同时记录原始 *_options 与解析后 *_resolved（global/targeted）。
+
 ### 5. 本步（e2e）新增修复
 
 - **diamond 死锁修复**（scoring.py `_sanitize_faa`）：diamond 2.2 对含 `.` 残基的

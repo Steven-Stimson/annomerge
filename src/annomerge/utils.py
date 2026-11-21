@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 log = logging.getLogger("annomerge")
 
@@ -143,6 +144,58 @@ def parse_extra_opts(spec: str | None, protected: tuple[str, ...], tool: str) ->
                     f"{tool}: '{tok}' overlaps a pipeline-managed option ({f}); "
                     f"remove it from the extra options. Protected: {', '.join(protected)}")
     return toks
+
+
+class ToolOpts(NamedTuple):
+    """Resolved extra options for one external tool: global flags plus
+    per-target overrides (RNA sample name or homolog-set label)."""
+    global_flags: list[str]
+    per_target: dict[str, list[str]]
+
+    def for_target(self, name: str | None) -> list[str]:
+        """Global flags followed by the overrides for `name` (last wins)."""
+        if name is None:
+            return list(self.global_flags)
+        return list(self.global_flags) + list(self.per_target.get(name, []))
+
+
+def parse_targeted_opts(specs: list[str] | None, protected: tuple[str, ...],
+                        tool: str) -> ToolOpts:
+    """Parse repeatable --xxx-options values into a ToolOpts.
+
+    Each value is either bare flags (global, e.g. "-k 3 --splice-flank=no")
+    or a targeted override 'NAME=flags' where NAME is an RNA sample name or a
+    homolog-set label (e.g. "isoseq_sub=-x splice:hq"). A value counts as
+    targeted iff it contains '=' and the part before the first '=' is a bare
+    name (no leading '-', no spaces), so flag forms like '--min-length=200'
+    stay global. A bare '=' token in a global spec (e.g. the mistyped
+    "iso = -x hq") is rejected up front instead of leaking into the tool
+    command line. Protected-flag checks apply to every spec (global or
+    targeted).
+    """
+    global_flags: list[str] = []
+    per_target: dict[str, list[str]] = {}
+    for spec in specs or []:
+        spec = spec.strip()
+        if not spec:
+            continue
+        head, sep, rest = spec.partition("=")
+        if sep and head and not head.startswith("-") and " " not in head:
+            name = head
+            if not rest.strip():
+                raise ToolError(f"{tool}: targeted option '{spec}' has no flags")
+            if name in per_target:
+                raise ToolError(f"{tool}: duplicate targeted options for '{name}'")
+            per_target[name] = parse_extra_opts(rest, protected, tool)
+        else:
+            toks = parse_extra_opts(spec, protected, tool)
+            if "=" in toks:
+                raise ToolError(
+                    f"{tool}: stray '=' in extra options '{spec}' — a targeted "
+                    f"override must be written as NAME=flags with no space "
+                    f"around '='")
+            global_flags += toks
+    return ToolOpts(global_flags, per_target)
 
 
 def which(tool: str) -> str:

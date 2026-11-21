@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pysam
 
-from ..utils import ensure_dir, lazy, run, tracker, which
+from ..utils import ToolError, ToolOpts, ensure_dir, lazy, run, tracker, which
 from .validate import ValidatedInputs
 
 log = logging.getLogger("annomerge")
@@ -195,7 +195,7 @@ def _gtf_has_transcripts(gtf: Path) -> bool:
 
 
 def assemble(units: list[dict], gtf_out: Path, threads: int,
-             extra_opts: list[str] | None = None) -> Path:
+             extra_opts: ToolOpts | list | None = None) -> Path:
     """StringTie per sample, then stringtie --merge.
 
     units: [{"name": str, "bams": [Path], "mode": str, "opts": [str]?}]
@@ -234,7 +234,10 @@ def assemble(units: list[dict], gtf_out: Path, threads: int,
                 if u["mode"] == "longread":
                     cmd.append("-L")
                 cmd += list(u.get("opts") or [])
-            cmd += list(extra_opts or [])
+            if extra_opts is not None:
+                opts = (extra_opts if isinstance(extra_opts, ToolOpts)
+                        else ToolOpts(extra_opts, {}))
+                cmd += opts.for_target(u["name"])
             run(cmd, log_file=sd / f"{u['name']}.stringtie.log",
                 desc=f"stringtie {u['name']}")
         if _gtf_has_transcripts(g):
@@ -257,10 +260,26 @@ def assemble(units: list[dict], gtf_out: Path, threads: int,
     return gtf_out
 
 
+def _coerce_opts(v) -> ToolOpts:
+    """Accept a ToolOpts (CLI path), a plain flag list, or None."""
+    if v is None:
+        return ToolOpts([], {})
+    return v if isinstance(v, ToolOpts) else ToolOpts(list(v), {})
+
+
+def _check_targets(opts: ToolOpts, valid: set[str], tool: str) -> None:
+    """Reject targeted names that no invocation of this tool will see."""
+    bad = sorted(set(opts.per_target) - valid)
+    if bad:
+        raise ToolError(
+            f"{tool}: targeted option(s) for unknown sample(s) "
+            f"{bad}; samples this tool runs on: {sorted(valid)}")
+
+
 def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
-                   hisat2_opts: list[str] | None = None,
-                   stringtie_opts: list[str] | None = None,
-                   minimap2_opts: list[str] | None = None,
+                   hisat2_opts: ToolOpts | list | None = None,
+                   stringtie_opts: ToolOpts | list | None = None,
+                   minimap2_opts: ToolOpts | list | None = None,
                    max_intron: int = 500000,
                    min_intron: int = 20) -> dict:
     """Execute the RNA branch. Returns dict of key outputs.
@@ -274,6 +293,23 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
     tracker.note("rna inputs: %d to align + %d pre-aligned + %d gtf",
              len(vi.rna_fastqs), len(vi.rna_bams), len(vi.rna_gtfs))
 
+    hisat2_opts = _coerce_opts(hisat2_opts)
+    stringtie_opts = _coerce_opts(stringtie_opts)
+    minimap2_opts = _coerce_opts(minimap2_opts)
+    # targeted-option sanity: a NAME=flags entry must point at a sample this
+    # tool actually runs on (mix counts for both hisat2 and minimap2; stringtie
+    # units exist for every fastq/bam sample)
+    fq = {s.name: s for s in vi.rna_fastqs}
+    _check_targets(hisat2_opts,
+                   {n for n, s in fq.items() if s.tag in ("fastq", "fasta", "mix")},
+                   "hisat2")
+    _check_targets(minimap2_opts,
+                   {n for n, s in fq.items() if s.use_minimap2 or s.tag == "mix"},
+                   "minimap2")
+    _check_targets(stringtie_opts,
+                   set(fq) | {s.name for s in vi.rna_bams},
+                   "stringtie")
+
     bams: list[Path] = []
     coverage_bams: list[Path] = []
     units: list[dict] = []
@@ -285,14 +321,16 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
 
     for s in vi.rna_fastqs:
         if s.tag in ("fastq", "fasta"):
-            b = align_sample(s, idx, bam_dir, threads, extra_opts=hisat2_opts,
+            b = align_sample(s, idx, bam_dir, threads,
+                             extra_opts=hisat2_opts.for_target(s.name),
                              max_intron=max_intron, min_intron=min_intron)
             bams.append(b)
             coverage_bams.append(b)
             units.append({"name": s.name, "bams": [b], "mode": "default"})
         elif s.use_minimap2:
             b = align_minimap2(s, vi.genome, bam_dir, threads,
-                               max_intron=max_intron, extra_opts=minimap2_opts)
+                               max_intron=max_intron,
+                               extra_opts=minimap2_opts.for_target(s.name))
             bams.append(b)
             if s.tag == "transcripts":
                 # assembled transcripts: 1x coverage per isoform by nature —
@@ -304,11 +342,13 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                 units.append({"name": s.name, "bams": [b], "mode": "longread"})
                 coverage_bams.append(b)   # real reads: depth is meaningful
         elif s.tag == "mix":
-            b1 = align_sample(s, idx, bam_dir, threads, extra_opts=hisat2_opts,
+            b1 = align_sample(s, idx, bam_dir, threads,
+                              extra_opts=hisat2_opts.for_target(s.name),
                               max_intron=max_intron, min_intron=min_intron,
                               files=s.illumina_files, name=f"{s.name}.ilmn")
             b2 = align_minimap2(s, vi.genome, bam_dir, threads,
-                                max_intron=max_intron, extra_opts=minimap2_opts,
+                                max_intron=max_intron,
+                                extra_opts=minimap2_opts.for_target(s.name),
                                 files=s.longread_files, name=f"{s.name}.lr",
                                 preset="splice")
             bams += [b1, b2]
