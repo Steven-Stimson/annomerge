@@ -138,3 +138,11 @@ ede75ef step 5: cli merge/evaluate params + -r help
 98e0c1e step 1: RnaSample tag model in validate.py
 ```
 （以实际 git log 为准；以上为本次改造的全部 commit）
+
+### 8b. 修复：resolved_params.yaml 写出崩溃（启动即死）
+`merge`/`evaluate` 在 dump_params 前 `from .utils import ToolOpts as _ToolOpts`，
+导入的**类对象**进入 `locals()`，`yaml.safe_dump` 无法序列化 →
+`RepresenterError: cannot represent an object <class ToolOpts>`，run 在
+01.validate 起步即崩（resolved_params.yaml 0 字节）。50167cd 引入。
+修复：locals 过滤加入 `"_ToolOpts"`。回归测试 T4（CliRunner 冒烟：两个
+子命令都必须越过 dump 才允许报 input error）。

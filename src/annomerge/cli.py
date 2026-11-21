@@ -654,7 +654,7 @@ def merge(
     out = _prepare(outdir, verbose)
     from .utils import ToolOpts as _ToolOpts
     params = {(_yamlable_key(k) if isinstance(v, _ToolOpts) else k): _yamlable(v)
-              for k, v in locals().items() if k not in ("out",)}
+              for k, v in locals().items() if k not in ("out", "_ToolOpts")}
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
         results, vi = _run_evidence_pipeline(
@@ -1194,7 +1194,7 @@ def evaluate(
     out = _prepare(outdir, verbose)
     from .utils import ToolOpts as _ToolOpts
     params = {(_yamlable_key(k) if isinstance(v, _ToolOpts) else k): _yamlable(v)
-              for k, v in locals().items() if k not in ("out",)}
+              for k, v in locals().items() if k not in ("out", "_ToolOpts")}
     dump_params(params, ensure_dir(out / "01.validate"))
     try:
         results, vi = _run_evidence_pipeline(
