@@ -47,6 +47,7 @@ _NOTE_MAP = {
     "no_stop": "no-stop",
     "non_atg_start": "non-ATG-start",
     "extended_stop": "extended-stop",
+    "ambiguous_cds": "ambiguous-cds",
 }
 
 

@@ -69,6 +69,19 @@ per-unit 阈值如 transcripts 的 -c 1 -j 1 始终在最前、受 first-occurre
 mix 样本名同时定向 hisat2（.ilmn 侧）与 minimap2（.lr 侧）。
 resolved_params.yaml 同时记录原始 *_options 与解析后 *_resolved（global/targeted）。
 
+### 4c. ambiguous_cds 标签：蛋白含 X（CDS 带 N/简并碱基）
+sanity 过滤器新增 X 检查（sanity.py `_process_one`）：翻译后蛋白含 X 的转录本
+记录 `kept/ambiguous_cds`，**tag-only 永不删除**——N 来自基因组组装（gap），
+不是基因模型的错。呈现三层一致：
+- sanity 输出 GFF：mRNA 属性 `ambiguous_cds=true`（与 `partial=true` 对称，
+  独立于 --partial 策略；partial=0 移除的转录本不会在 tsv 残留 kept 行）
+- 最终 GFF：经 confidence → annotate_support 链呈现为 `Flags=ambiguous-cds`
+  （mRNA + gene 并集），报告 FLAG_DESCRIPTIONS 有对应描述
+- 证据浏览器卡片措辞同为 `ambiguous-cds`
+ath 真实数据（out_targeted/07.augment 独立复跑）：ambiguous_cds=3，
+与既有 annomerge.pep 中含 X 的 3 条蛋白一一对应；其中 AUG.g11796.t1
+（终版 NC_003070.9.g3443.t1）此前完全无标签，现已标记。其余 sanity 统计
+与旧跑字节级一致，无回归。
 ### 5. 本步（e2e）新增修复
 
 - **diamond 死锁修复**（scoring.py `_sanitize_faa`）：diamond 2.2 对含 `.` 残基的
@@ -79,8 +92,9 @@ resolved_params.yaml 同时记录原始 *_options 与解析后 *_resolved（glob
   （默认 768MB/线程在小内存容器会把 hisat2/minimap2 挤到 OOM）。
 
 ## 验证
-
 - 解析单测 tag_test/test_parse.py 20 项 PASS；--partial 单测 test_partial.py 6 项 PASS。
+- ambiguous_cds 单测 tag_test/test_ambiguous.py 18 项 PASS：+/− 链、多外显子、
+  X+no_stop 双标签、partial=0 无残留、X+extended_stop、keep_only、多进程一致。
 - toy 基因组 e2e（test_rna_e2e.py）12 项 PASS：11 个 tag 路径全覆盖。
 - ath 真实数据：merge_multipool 全量（21953 基因，P=0.8321）+ ath_eval evaluate
   （isoseq :isoseq 路径，全链路到 report + 89MB 证据浏览器）；上游产物 md5 回归一致。

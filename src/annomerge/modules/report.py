@@ -893,6 +893,8 @@ FLAG_DESCRIPTIONS = {
     "noncanonical-splice": "non-canonical splice junction (not GT-AG etc.)",
     "neighbour-overlap": "CDS overlaps a neighbouring gene model",
     "short-ORF": "unusually short ORF / CDS",
+    "ambiguous-cds": "protein contains X (CDS codons with N / ambiguous "
+                     "bases; assembly ambiguity, not a model error)",
 }
 
 

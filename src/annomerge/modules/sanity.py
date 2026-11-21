@@ -17,6 +17,11 @@ Port of Paludamentum's sanity_filter_gff3.py rules (design doc v2.2 §2.2):
                       extend last CDS segment (and its exon) by 3 bp
     no_stop           CDS ends without stop codon (3' partial)
     non_atg_start     first codon is not ATG
+    ambiguous_cds     translated protein contains X (CDS codons with N /
+                      IUPAC ambiguity bases): tag-only, never removed — the
+                      ambiguity comes from the assembly, not the gene model;
+                      the mRNA is tagged ambiguous_cds=true and the note is
+                      surfaced downstream as Flags=ambiguous-cds
   --partial policy (sanity_filter(partial=...)):
     0               no_stop / non_atg_start transcripts are discarded
                     (reported as partial_cds(...) in the tsv)
@@ -259,6 +264,11 @@ def _process_one(tx: Tx):
     if "*" in prot[:-1]:
         return (tid, acts + [(tx.gid, tid, "removed", "internal_stop")],
                 True, tx, False, [])
+    # X in the protein: CDS codons carrying N / IUPAC ambiguity bases.
+    # Tag-only (never removed): the ambiguity is an assembly property,
+    # not a gene-model error; surfaced downstream as Flags=ambiguous-cds.
+    if "X" in prot:
+        acts.append((tx.gid, tid, "kept", "ambiguous_cds"))
     is_extended = False
     partial_reasons: list[str] = []   # incomplete-CDS flags (see --partial)
     if prot and prot[-1] == "*":
@@ -361,7 +371,8 @@ def sanity_filter(gff_in: Path, genome_fa: Path, gff_out: Path,
         flip = set(partial_map)
         actions[:] = [a for a in actions
                       if not (a[1] in flip and a[2] == "kept"
-                              and a[3] in ("no_stop", "non_atg_start"))]
+                              and a[3] in ("no_stop", "non_atg_start",
+                                           "ambiguous_cds"))]
         for tid, reasons in partial_map.items():
             removed.add(tid)
             actions.append((txs[tid].gid, tid, "removed",
@@ -373,6 +384,17 @@ def sanity_filter(gff_in: Path, genome_fa: Path, gff_out: Path,
             if "partial=" not in mrna.attrs:
                 sep = "" if mrna.attrs.endswith(";") else ";"
                 mrna.attrs = f"{mrna.attrs}{sep}partial=true"
+
+    # ambiguous_cds tag on the mRNA feature: tag-only, always applied to
+    # surviving transcripts (independent of the --partial policy, which
+    # governs incomplete CDS only); also reported as kept/ambiguous_cds
+    # in the tsv and surfaced downstream as Flags=ambiguous-cds
+    for tid in {a[1] for a in actions
+                if a[2] == "kept" and a[3] == "ambiguous_cds"} - removed:
+        mrna = txs[tid].mrna
+        if "ambiguous_cds=" not in mrna.attrs:
+            sep = "" if mrna.attrs.endswith(";") else ";"
+            mrna.attrs = f"{mrna.attrs}{sep}ambiguous_cds=true"
 
     # recompute spans; drop genes without surviving transcripts
     gene_has_tx: dict[str, list[str]] = {}

@@ -25,8 +25,8 @@ Tiers:
   uncalibrated  evidence did not reach (neutral; source predictor annotated
                 by the caller/report, score NA)
   flagged       transcript carries a sanity-filter note (no_stop /
-                non_atg_start / extended_stop) — independent column, not a
-                tier override
+                non_atg_start / extended_stop / ambiguous_cds) —
+                independent column, not a tier override
 
 RNA support definition: introns all matched (multi-exon) or CDS coverage
 fraction >= cov_support_min (single-exon). Protein support: >= prot_support_min
@@ -458,6 +458,7 @@ _TAG_NOTE_MAP = {
     "no_stop": "no-stop",
     "non_atg_start": "non-ATG-start",
     "extended_stop": "extended-stop",
+    "ambiguous_cds": "ambiguous-cds",
 }
 _TAG_KEYS = ("Tier", "RNA_support", "Protein_support", "denovo_support",
              "Flags")
