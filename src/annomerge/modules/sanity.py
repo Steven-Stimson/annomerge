@@ -18,9 +18,9 @@ Port of Paludamentum's sanity_filter_gff3.py rules (design doc v2.2 §2.2):
     no_stop           CDS ends without stop codon (3' partial)
     non_atg_start     first codon is not ATG
   --partial policy (sanity_filter(partial=...)):
-    0 (default)     no_stop / non_atg_start transcripts are discarded
+    0               no_stop / non_atg_start transcripts are discarded
                     (reported as partial_cds(...) in the tsv)
-    1               kept, and the mRNA feature is tagged partial=true
+    1 (default)     kept, and the mRNA feature is tagged partial=true
 
 Genes whose transcripts are all removed are removed. Gene/transcript spans are
 recomputed from children after edits. Output: filtered GFF3 + sanity_filter.tsv
@@ -288,14 +288,14 @@ def _process_one(tx: Tx):
 
 def sanity_filter(gff_in: Path, genome_fa: Path, gff_out: Path,
                   report_tsv: Path, keep_only: bool = False,
-                  threads: int = 1, partial: int = 0) -> dict:
+                  threads: int = 1, partial: int = 1) -> dict:
     """Filter the annotation. Returns stats dict. Idempotent via lazy().
-
     partial: incomplete-CDS policy (--partial):
-      0  (default) discard transcripts whose CDS is incomplete (no terminal
+      0  discard transcripts whose CDS is incomplete (no terminal
          stop after the extension attempt, and/or a non-ATG start); the
          removal is reported as partial_cds(<reasons>) in the tsv
-      1  keep them and tag the mRNA feature with partial=true in the output
+      1  (default) keep them and tag the mRNA feature with partial=true in
+         the output
     """
     if lazy([gff_out, report_tsv], desc="sanity filter"):
         return {}
@@ -355,7 +355,7 @@ def sanity_filter(gff_in: Path, genome_fa: Path, gff_out: Path,
 
     # --partial policy for incomplete-CDS transcripts
     if partial == 0:
-        # default: discard (reported as partial_cds(...) in the tsv); the
+        # discard (reported as partial_cds(...) in the tsv); the
         # worker's earlier kept/no_stop|non_atg_start notes for these
         # transcripts are superseded and dropped to keep the tsv consistent
         flip = set(partial_map)

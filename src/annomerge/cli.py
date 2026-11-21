@@ -147,7 +147,7 @@ def _run_evidence_pipeline(
     minimap2_opts: Optional[List[str]] = None,
     max_intron: int = 500000,
     min_intron: int = 20,
-    partial: int = 0,
+    partial: int = 1,
 ):
     tracker.big("01", "validate", "validate inputs (genome, predictions, evidence)")
     vi = validate(
@@ -536,10 +536,12 @@ def merge(
              "(500000*2/ploidy). Ignored when --max-intron is given.",
         rich_help_panel="Advanced"),
     partial: int = typer.Option(
-        0, "--partial",
+        1, "--partial",
         help="\b\nIncomplete-CDS transcripts in the final annotation:\n"
-             "  [cyan]0[/cyan]  (default) discard\n"
-             "  [cyan]1[/cyan]  keep and tag (partial=true)",
+             "  [cyan]0[/cyan]  discard\n"
+             "  [cyan]1[/cyan]  (default) keep and tag (partial=true)\n"
+             "Keep is the default because --augment isoforms otherwise lose\n"
+             "their incomplete-ORF variants (AS structure collapses).",
         rich_help_panel="Advanced"),
     minimap2_options: Optional[str] = typer.Option(
         None, "--minimap2-options",

@@ -42,9 +42,11 @@ tag 一览（`annomerge merge --help` 的 `-r` 帮助有完整表）：
 - `--min-intron INT`（Advanced，默认 20）：落 hisat2 --min-intronlen 与 EVM
   --min_intron_length。**注意 StringTie 没有 intron 长度参数，此参数不落 StringTie。**
 - `--minimap2-options STR`（Advanced）：保护 -t/-a/-G/-u（管道管理，用户不可覆盖）。
-- `--partial {0,1}`（merge 独有，默认 0）：不完整 CDS（no_stop / non_atg_start）处理。
-  0=丢弃（记 tsv 的 removed/partial_cds(<原因>)）；1=保留并在 mRNA 打 `partial=true`。
+- `--partial {0,1}`（merge 独有，**默认 1**）：不完整 CDS（no_stop / non_atg_start）处理。
+  1=保留并在 mRNA 打 `partial=true`；0=丢弃（记 tsv 的 removed/partial_cds(<原因>)）。
   extended_stop 修复成功不算 partial。evaluate 无此参数（read-only）。
+  **默认从 0 改为 1**：augment 模式下丢弃会把 incomplete-ORF isoform 大量移除、
+  AS 结构塌缩（ath 实测多 isoform 基因 4,679 → 193），保留 + 打标是更安全的默认。
 - 删除 `--evm-options`（原白名单仅 min_intron 一个 key，已提升为 --min-intron）。
 
 ### 4. coverage 语义
