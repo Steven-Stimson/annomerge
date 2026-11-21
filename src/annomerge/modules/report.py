@@ -634,14 +634,48 @@ def svg_density_marginal(xs: list, ys: list, x_label: str, y_label: str,
 
 # ------------------------------------------------- workflow evidence figures
 def rna_alignment_stats(out: Path) -> list:
-    """Per-sample HISAT2 overall alignment rate from 02.rnaseq/bam/*.hisat2.log."""
+    """Per-sample RNA alignment rate for report section 2.1.
+
+    HISAT2 samples: overall alignment rate parsed from
+    02.rnaseq/bam/<name>.hisat2.log. minimap2 samples (long-read /
+    transcripts / mix long-read side): the minimap2 log carries no rate,
+    so compute the PRIMARY alignment rate from the sorted BAM:
+    primary mapped / primary total. Supplementary and secondary records
+    are excluded from both counts (-F 2308 = -F unmapped,secondary,
+    supplementary; -F 2304 = -F secondary,supplementary) so split
+    long-read alignments cannot inflate the rate past 100%.
+    Rows: {sample, rate, aligner}. Missing samtools/BAM -> sample skipped.
+    """
+    import shutil, subprocess
     rows = []
-    for logf in sorted(Path(out).glob("02.rnaseq/bam/*.hisat2.log")):
+    bam_dir = Path(out) / "02.rnaseq" / "bam"
+    for logf in sorted(bam_dir.glob("*.hisat2.log")):
         m = re.search(r"([\d.]+)% overall alignment rate",
                       logf.read_text(errors="ignore"))
         if m:
             rows.append({"sample": logf.name.replace(".hisat2.log", ""),
-                         "rate": float(m.group(1))})
+                         "rate": float(m.group(1)), "aligner": "hisat2"})
+    samtools = shutil.which("samtools")
+    for logf in sorted(bam_dir.glob("*.minimap2.log")):
+        name = logf.name.replace(".minimap2.log", "")
+        bam = bam_dir / f"{name}.sorted.bam"
+        if not samtools or not bam.exists():
+            log.info("rna alignment rate skipped for %s (%s)", name,
+                     "no samtools" if not samtools else "BAM not found")
+            continue
+        def _count(*flags):
+            p = subprocess.run([samtools, "view", "-c", *flags, str(bam)],
+                               capture_output=True, text=True)
+            return int(p.stdout.strip()) if p.returncode == 0 else None
+        mapped = _count("-F", "2308")     # primary + mapped
+        total = _count("-F", "2304")      # primary, all
+        if mapped is not None and total:
+            rows.append({"sample": name,
+                         "rate": round(100.0 * mapped / total, 2),
+                         "aligner": "minimap2"})
+        else:
+            log.info("rna alignment rate skipped for %s "
+                     "(samtools count failed or 0 reads)", name)
     return rows
 
 
@@ -1160,7 +1194,9 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
     }
     from markupsafe import Markup
     wf["rna_chart"] = Markup(svg_bars(
-        [(r["sample"], r["rate"]) for r in wf["rna_align"]]))
+        [(r["sample"] if r.get("aligner") == "hisat2"
+          else f"{r['sample']} ({r.get('aligner', '?')})",
+          r["rate"]) for r in wf["rna_align"]]))
     wf["qcov_hist"] = Markup(svg_histogram(
         wf["protein"].get("qcov") or [], title="Query coverage (fraction of protein aligned)"))
     wf["ident_hist"] = Markup(svg_histogram(

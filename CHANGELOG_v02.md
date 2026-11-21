@@ -82,6 +82,17 @@ ath 真实数据（out_targeted/07.augment 独立复跑）：ambiguous_cds=3，
 与既有 annomerge.pep 中含 X 的 3 条蛋白一一对应；其中 AUG.g11796.t1
 （终版 NC_003070.9.g3443.t1）此前完全无标签，现已标记。其余 sanity 统计
 与旧跑字节级一致，无回归。
+### 4d. report 2.1：minimap2 样本比对率
+原 rna_alignment_stats 只解析 hisat2 日志，isoseq/ont/transcripts/mix 长读侧
+（minimap2 比对）的样本在 2.1 节完全缺失。现扩展为：
+- hisat2 样本照旧解析 `02.rnaseq/bam/<name>.hisat2.log`
+- minimap2 样本从对应 `<name>.sorted.bam` 用 samtools 计算 **primary 比对率**
+  （-F 2308 mapped / -F 2304 total；排除 secondary+supplementary，
+  split 长读比对不会把比率顶过 100%）
+- 每行带 aligner 字段；表格加 Aligner 列；条形图 minimap2 样本加
+  " (minimap2)" 后缀；mix 样本 .ilmn/.lr 两侧各成一行
+- BAM/samtools 缺失、0 reads、计数失败均跳过并 log 说明
+ath_eval 实测：DRR070507_sub=92.24%(hisat2) + isoseq_sub=82.30%(minimap2)。
 ### 5. 本步（e2e）新增修复
 
 - **diamond 死锁修复**（scoring.py `_sanitize_faa`）：diamond 2.2 对含 `.` 残基的
@@ -95,6 +106,8 @@ ath 真实数据（out_targeted/07.augment 独立复跑）：ambiguous_cds=3，
 - 解析单测 tag_test/test_parse.py 20 项 PASS；--partial 单测 test_partial.py 6 项 PASS。
 - ambiguous_cds 单测 tag_test/test_ambiguous.py 18 项 PASS：+/− 链、多外显子、
   X+no_stop 双标签、partial=0 无残留、X+extended_stop、keep_only、多进程一致。
+- minimap2 比对率单测 tag_test/test_mm2_rate.py 4 项 PASS：hisat2-only /
+  minimap2-only（含 supplementary 不膨胀哨兵）/ 混合 / BAM 缺失。
 - toy 基因组 e2e（test_rna_e2e.py）12 项 PASS：11 个 tag 路径全覆盖。
 - ath 真实数据：merge_multipool 全量（21953 基因，P=0.8321）+ ath_eval evaluate
   （isoseq :isoseq 路径，全链路到 report + 89MB 证据浏览器）；上游产物 md5 回归一致。
