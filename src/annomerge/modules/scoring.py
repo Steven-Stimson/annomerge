@@ -126,7 +126,18 @@ def exon_precision(pred_gff: Path, ref_gtf: Path, out_dir: Path) -> tuple[float 
     prefix = out_dir / "gffcmp"
     stats = Path(str(prefix) + ".stats")
     if not lazy([stats], desc="gffcompare"):
-        run([which("gffcompare"), "-r", str(ref_gtf), "-o", str(prefix), str(pred_gff)],
+        # gffcompare 0.12.x writes the per-input .tmap next to the INPUT file
+        # (out-prefix basename + input name), not under -o: feed it a symlink
+        # inside the writable out_dir so read-only input dirs (e.g. /Files)
+        # cannot break the run.
+        local_in = out_dir / ("gffcmp_in__" + Path(pred_gff).name)
+        if not local_in.exists():
+            try:
+                local_in.symlink_to(Path(pred_gff).resolve())
+            except OSError:
+                import shutil as _sh
+                _sh.copy2(pred_gff, local_in)
+        run([which("gffcompare"), "-r", str(ref_gtf), "-o", str(prefix), str(local_in)],
             log_file=out_dir / "gffcompare.log", desc="gffcompare")
 
     pred = parse_gff(pred_gff)
