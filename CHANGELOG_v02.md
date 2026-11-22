@@ -163,3 +163,11 @@ original→link 留痕；resolved_params.yaml 仍记录用户原始路径。
 验证：tag_test T5 回归（只读 fixture 含 busco/omark + 真实 gffcompare）；
 E2E 只读双模式（input_layer_test/）：merge --augment rc=0、evaluate rc=0，
 ro/ 树零写入，.tmap 落在 input/denovo/。
+### 8d. 修复：相对 --outdir 使 EVM partition 崩溃
+`--outdir output`（相对路径）时，EVM 阶段 chdir 进 06.merge 后以同样的相对
+`--partition_dir` 调 perl，partition_EVM_inputs.pl 找不到父目录报
+"cannot mkdir output/06.merge/part01"（整条管线只有 EVM 切工作目录，所以
+问题精确爆在这里）。修复：cli.py `_prepare()` 统一把 outdir 规范为绝对路径
+（expanduser().resolve()），所有模块拿到的都是绝对路径。回归测试 T6
+（_prepare 绝对化断言 + 迷你基因组 run_evm partition/execute/convert 冒烟）。
+用户断点续跑无需清理：evm.py 已有 stale partition 清理逻辑。

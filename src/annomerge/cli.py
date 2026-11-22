@@ -109,7 +109,10 @@ def _main(
 
 def _prepare(outdir: str, verbose: bool) -> Path:
     setup_logging(verbose)
-    out = ensure_dir(Path(outdir))
+    # normalize to an absolute path: the EVM stage chdir()s into 06.merge and
+    # passes --partition_dir to perl — a RELATIVE --outdir breaks there
+    # (partition_EVM_inputs.pl cannot mkdir output/06.merge/part01).
+    out = ensure_dir(Path(outdir).expanduser().resolve())
     set_run_log_dir(out / "logs" / "run")
     return out
 
