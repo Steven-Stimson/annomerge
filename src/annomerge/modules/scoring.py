@@ -127,17 +127,9 @@ def exon_precision(pred_gff: Path, ref_gtf: Path, out_dir: Path) -> tuple[float 
     stats = Path(str(prefix) + ".stats")
     if not lazy([stats], desc="gffcompare"):
         # gffcompare 0.12.x writes the per-input .tmap next to the INPUT file
-        # (out-prefix basename + input name), not under -o: feed it a symlink
-        # inside the writable out_dir so read-only input dirs (e.g. /Files)
-        # cannot break the run.
-        local_in = out_dir / ("gffcmp_in__" + Path(pred_gff).name)
-        if not local_in.exists():
-            try:
-                local_in.symlink_to(Path(pred_gff).resolve())
-            except OSError:
-                import shutil as _sh
-                _sh.copy2(pred_gff, local_in)
-        run([which("gffcompare"), "-r", str(ref_gtf), "-o", str(prefix), str(local_in)],
+        # (out-prefix basename + input name); safe because validate() links
+        # every predictor GFF into the writable 01.validate/input/denovo/.
+        run([which("gffcompare"), "-r", str(ref_gtf), "-o", str(prefix), str(pred_gff)],
             log_file=out_dir / "gffcompare.log", desc="gffcompare")
 
     pred = parse_gff(pred_gff)
@@ -225,7 +217,8 @@ def extract_referee_faa(homologs: Path, referee_ids: Path, out_faa: Path) -> Pat
     ensure_dir(out_faa.parent)
     keep = set(l.strip() for l in open(referee_ids) if l.strip())
     n = 0
-    with open(homologs) as fh, open(out_faa, "w") as out:
+    from .validate import _open as _open_maybe_gz   # homolog pool may be .gz
+    with _open_maybe_gz(homologs) as fh, open(out_faa, "w") as out:
         write = False
         for line in fh:
             if line.startswith(">"):

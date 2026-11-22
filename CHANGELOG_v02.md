@@ -146,3 +146,20 @@ ede75ef step 5: cli merge/evaluate params + -r help
 01.validate 起步即崩（resolved_params.yaml 0 字节）。50167cd 引入。
 修复：locals 过滤加入 `"_ToolOpts"`。回归测试 T4（CliRunner 冒烟：两个
 子命令都必须越过 dump 才允许报 input error）。
+
+### 8c. 输入物化层：所有用户输入统一软链进 01.validate/input/
+动机：用户输入常位于只读挂载（/Files），而部分工具会向输入文件旁写 sidecar
+（gffcompare 0.12.x 的 .tmap/.refmap、samtools 的 .fai/.bai），直接崩
+'Error creating file'。现在 validate() 把所有输入链接到
+01.validate/input/{genome,denovo,proteins,rna/<sample>,busco,omark,annotation}/，
+下游模块（含 merge 的 preds=vi.predictors）一律使用链接；sidecar
+（.fai/.gzi/.csi，.bam.bai/.bai 双约定）随链；manifest.tsv 记录
+original→link 留痕；resolved_params.yaml 仍记录用户原始路径。
+细节：软链失败回退 copy2/copytree 并写 .src 记录（幂等复用）；已有正确
+链接复用、stale 替换；同一样本内同名文件 fail-fast；homolog_set/gtf 合并
+缓存按源 mtime+size 失效重建（_cache_stale）；.gz 输入保留复合扩展名
+（_fmt_suffix）；validate(workdir=None) 降级时 warning。gffcompare 的
+30be926 局部补丁随之回退（统一由 input 层承接）。
+验证：tag_test T5 回归（只读 fixture 含 busco/omark + 真实 gffcompare）；
+E2E 只读双模式（input_layer_test/）：merge --augment rc=0、evaluate rc=0，
+ro/ 树零写入，.tmap 落在 input/denovo/。

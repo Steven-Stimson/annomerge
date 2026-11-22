@@ -22,6 +22,93 @@ class InputError(ValueError):
     """Fatal input validation error (fail-fast)."""
 
 
+# ------------------------------------------------------- input materialization
+# Every user-supplied file/dir is linked under <workdir>/01.validate/input/
+# (genome/, denovo/, proteins/, rna/<sample>/, busco/, omark/, annotation/)
+# and every downstream module uses the LINKS. User input dirs may live on a
+# read-only mount (e.g. /Files); tools that drop sidecar files next to their
+# input (gffcompare .tmap, samtools .fai/.bai) then write into our writable
+# tree instead of dying with 'Error creating file'. input/manifest.tsv records
+# original -> link for provenance.
+_SIDECAR_SUF = (".fai", ".gzi", ".csi")
+
+
+def _cache_stale(cache: Path, srcs) -> bool:
+    """Rebuild a concatenation cache when any source is newer than it, or when
+    the sizes stop adding up (catches mtime-preserving replacements such as
+    rsync -a)."""
+    if not cache.exists():
+        return True
+    cm = cache.stat()
+    if any(s.stat().st_mtime > cm.st_mtime for s in srcs):
+        return True
+    return sum(s.stat().st_size for s in srcs) != cm.st_size
+
+
+def _fmt_suffix(p: Path) -> str:
+    """Suffix used when naming a materialized link: keep compound extensions
+    for gzipped inputs (x.gff3.gz -> .gff3.gz, not bare .gz)."""
+    return "".join(p.suffixes[-2:]) if p.suffix == ".gz" else p.suffix
+
+
+def _materialize(src: Path, dst: Path, manifest: list, kind: str) -> Path:
+    """Symlink src -> dst (absolute target); copy when symlinks are unsupported.
+    Reuse rules: an existing symlink resolving to src is kept; a regular copy
+    from an earlier run is kept when its <dst>.src record (target path + mtime
+    + size) still matches; anything else is replaced. Index sidecars
+    (.fai/.gzi/.csi, and both .bam.bai/.bai conventions) ride along so tools
+    needing an index can read (or rebuild) it in our tree."""
+    import shutil
+    src, dst = Path(src), Path(dst)
+    target = src.resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src_rec = dst.with_name(dst.name + ".src")
+    reuse = False
+    if dst.is_symlink():
+        reuse = dst.exists() and dst.resolve() == target
+    elif dst.exists():
+        # copy fallback from an earlier run: reuse when the recorded source
+        # (path + mtime + size) is unchanged
+        try:
+            t, mt, sz = src_rec.read_text().rstrip("\n").split("\t")
+            st = target.stat()
+            reuse = (t == str(target)
+                     and float(mt) == st.st_mtime and int(sz) == st.st_size)
+        except (OSError, ValueError):
+            reuse = False
+    if not reuse:
+        if dst.is_symlink() or dst.is_file():
+            dst.unlink()
+        elif dst.is_dir():
+            shutil.rmtree(dst)
+        try:
+            dst.symlink_to(target, target_is_directory=target.is_dir())
+            src_rec.unlink(missing_ok=True)
+        except OSError:
+            if target.is_dir():
+                shutil.copytree(target, dst)
+            else:
+                shutil.copy2(target, dst)
+            st = target.stat()
+            src_rec.write_text(f"{target}\t{st.st_mtime}\t{st.st_size}\n")
+    manifest.append((str(target), str(dst), kind))
+    if target.is_file():
+        for suf in _SIDECAR_SUF:
+            side = target.with_name(target.name + suf)
+            if side.exists():
+                _materialize(side, dst.with_name(dst.name + suf),
+                             manifest, "sidecar")
+        if target.suffix == ".bam":
+            for side, dsuf in ((target.with_name(target.name + ".bai"), ".bai"),
+                               (target.with_suffix(".bai"), ".bai")):
+                if side.exists():
+                    d = (dst.with_name(dst.name + dsuf)
+                         if side.name.endswith(".bam.bai")
+                         else dst.with_suffix(dsuf))
+                    _materialize(side, d, manifest, "sidecar")
+    return dst
+
+
 def _open(path: Path):
     return gzip.open(path, "rt") if path.suffix == ".gz" else open(path)
 
@@ -164,6 +251,12 @@ def _sample_from_files(raw_files: list[str], name: str | None,
     files = [_require(f.strip(), f"RNA file ({ln_tag})") for f in raw_files if f.strip()]
     if not files:
         raise InputError(f"{ln_tag}: no input files given")
+    if len({f.name for f in files}) != len(files):
+        raise InputError(
+            f"{ln_tag}: duplicate file NAME within one sample "
+            f"({sorted(f.name for f in files)}): files are materialized under "
+            "input/rna/<sample>/ by name, so same-named files from different "
+            "directories would silently overwrite each other — rename one of them")
     if tag is None:
         # inference: a lone fastq/fasta is Illumina SE (long-read types must
         # be requested with an explicit tag)
@@ -437,6 +530,8 @@ class ValidatedInputs:
     rna_samples: list[RnaSample] = field(default_factory=list)
     transcripts: Path | None = None         # precomputed StringTie GTF
     busco: Path | None = None
+    omark: Path | None = None               # OMAmer .h5 (linked into input/)
+    input_dir: Path | None = None           # <outdir>/01.validate/input
 
     @property
     def has_rna(self) -> bool:
@@ -465,6 +560,7 @@ def validate(
     annotation: str | None = None,
     rna: list[str] | None = None,
     busco: str | None = None,
+    omark_db: str | None = None,
     workdir: str | None = None,
 ) -> ValidatedInputs:
     """Fail-fast validation shared by merge and evaluate.
@@ -472,10 +568,23 @@ def validate(
     -p accepts 'label=path' items or plain paths, comma-separated
     ('-p scer=scer.pep,sklu=sklu.pep'); plain items take their filename stem.
     Multiple files are header-checked individually and concatenated (cached
-    under workdir/input/) so every downstream consumer keeps seeing one
+    under the input dir) so every downstream consumer keeps seeing one
     transparent FASTA; a protein->set membership table is kept alongside.
+
+    Input materialization: with a workdir, every user-supplied file/dir is
+    linked into <workdir>/01.validate/input/ (genome/, denovo/, proteins/,
+    rna/<sample>/, busco/, omark/, annotation/) and ALL ValidatedInputs paths
+    point at those links — user input dirs may be read-only mounts; tools
+    that drop sidecars next to their input (gffcompare .tmap, samtools
+    .fai/.bai) then write into our writable tree. input/manifest.tsv records
+    original -> link.
     """
     tracker.note("input validation")
+    inroot = Path(workdir) / "01.validate" / "input" if workdir else None
+    if inroot is None:
+        log.warning("no workdir: inputs not materialized — read-only input "
+                    "dirs may break tools that write sidecars next to inputs")
+    manifest: list = []
 
     g = _require(genome, "genome FASTA (-g)")
     gids = set(fasta_seqids(g))
@@ -489,16 +598,18 @@ def validate(
         if len(_paths) == 1:
             h_sets[_lab] = _paths[0]
         else:
-            if not workdir:
+            if not inroot:
                 raise InputError(
                     "multi-file homolog sets require workdir to cache the merged file"
                 )
-            _mp = Path(workdir) / "input" / f"homolog_set.{_lab}.faa"
-            if not _mp.exists():
+            _mp = inroot / "proteins" / f"homolog_set.{_lab}.faa"
+            if _cache_stale(_mp, _paths):
                 _mp.parent.mkdir(parents=True, exist_ok=True)
                 with open(_mp, "w") as _out:
                     for _p in _paths:
                         _out.write(_p.read_text())
+            manifest.append(("+".join(str(_p.resolve()) for _p in _paths),
+                             str(_mp), "generated(proteins-merge)"))
             log.info("homolog set %s: %d files merged -> %s",
                      _lab, len(_paths), _mp.name)
             h_sets[_lab] = _mp
@@ -511,41 +622,44 @@ def validate(
         label, hp = next(iter(h_sets.items()))
         check_homolog_headers(hp)
     elif not labeled:
-        if not workdir:
+        if not inroot:
             raise InputError(
                 "multiple homolog FASTAs require workdir to cache the merged file"
             )
-        hp = Path(workdir) / "input" / "homologs.merged.faa"
+        hp = inroot / "proteins" / "homologs.merged.faa"
         merge_homolog_fastas(h_sets, hp)
         h_sets = {"all": hp}
         log.info("homologs: %d unlabeled file(s) merged into one pool (%s)",
                  len(homologs.split(",")), hp.name)
     else:
-        if not workdir:
+        if not inroot:
             raise InputError(
                 "multiple homolog FASTAs require workdir to cache the merged file"
             )
-        hp = Path(workdir) / "input" / "homologs.merged.faa"
+        hp = inroot / "proteins" / "homologs.merged.faa"
         _, membership = merge_homolog_fastas(h_sets, hp)
 
     if busco:
         busco_p = _require(busco, "BUSCO lineage (--busco-lineage)")
     else:
         busco_p = None
+    omark_p = _require(omark_db, "OMAmer DB (--omark-db)") if omark_db else None
 
     samples: list[RnaSample] = parse_rna_entries(rna)
     # a gtf sample may carry several transcript files (ID=a.gtf,b.gtf): merge
     # them into one cached GTF per sample so downstream sees a single file
     for s in samples:
         if s.tag == "gtf" and len(s.files) > 1:
-            if not workdir:
+            if not inroot:
                 raise InputError("multi-GTF RNA samples require workdir")
-            merged = Path(workdir) / "input" / f"{s.name}.gtf"
+            merged = inroot / "rna" / s.name / f"{s.name}.gtf"
             merged.parent.mkdir(parents=True, exist_ok=True)
-            if not merged.exists():
+            if _cache_stale(merged, s.files):
                 with open(merged, "w") as out:
                     for f in s.files:
                         out.write(f.read_text())
+            manifest.append(("+".join(str(f.resolve()) for f in s.files),
+                             str(merged), "generated(rna-gtf-merge)"))
             log.info("rna sample %s: %d GTF(s) merged -> %s",
                      s.name, len(s.files), merged.name)
             s.files = [merged]
@@ -560,12 +674,50 @@ def validate(
         anno_p = _require(annotation, "annotation GFF3 (-a)")
         check_gff_seqids(anno_p, gids, "annotation (-a)")
 
+    # ---- materialize every user input under 01.validate/input/ ------------
+    if inroot:
+        g = _materialize(g, inroot / "genome" / g.name, manifest, "genome")
+        preds = {n: _materialize(p, inroot / "denovo" / f"{n}{_fmt_suffix(p)}",
+                                 manifest, "denovo")
+                 for n, p in preds.items()}
+        h_sets = {lab: (p if str(p).startswith(str(inroot))
+                        else _materialize(p, inroot / "proteins" / f"{lab}{_fmt_suffix(p)}",
+                                          manifest, "proteins"))
+                  for lab, p in h_sets.items()}
+        # single-set hp IS h_sets' only value (already materialized above);
+        # merged pools were generated under inroot and pass through
+        hp = next(iter(h_sets.values())) if len(h_sets) == 1 else hp
+        for s in samples:
+            s.files = [(f if str(f).startswith(str(inroot))
+                        else _materialize(f, inroot / "rna" / s.name / f.name,
+                                          manifest, "rna"))
+                       for f in s.files]
+        if busco_p:
+            busco_p = _materialize(busco_p, inroot / "busco" / busco_p.name,
+                                   manifest, "busco")
+        if omark_p:
+            omark_p = _materialize(omark_p, inroot / "omark" / omark_p.name,
+                                   manifest, "omark")
+        if anno_p:
+            anno_p = _materialize(anno_p, inroot / "annotation" / anno_p.name,
+                                  manifest, "annotation")
+        with open(inroot / "manifest.tsv", "w") as mf:
+            mf.write("original\tinput_link\tkind\n")
+            seen = set()
+            for orig, link, kind in manifest:
+                if (orig, link) in seen:
+                    continue
+                seen.add((orig, link))
+                mf.write(f"{orig}\t{link}\t{kind}\n")
+        log.info("inputs materialized under %s (%d entries)",
+                 inroot, len(manifest))
+
     vi = ValidatedInputs(
         genome=g, genome_ids=gids, homologs=hp,
         homolog_sets=h_sets, homolog_membership=membership,
         predictors=preds,
         annotation=anno_p, rna_samples=samples, transcripts=tr,
-        busco=busco_p,
+        busco=busco_p, omark=omark_p, input_dir=inroot,
     )
     log.info(
         "validation OK: predictors=%d rna_samples=%d transcripts=%s busco=%s",

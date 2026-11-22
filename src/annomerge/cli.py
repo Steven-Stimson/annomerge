@@ -158,6 +158,7 @@ def _run_evidence_pipeline(
     out: Path, genome: str, homologs: str, rna: Optional[List[str]],
     busco: Optional[str], threads: int,
     goldset_min_orf: int,
+    omark_db: Optional[str] = None,
     predictors: Optional[str] = None, annotation: Optional[str] = None,
     mnp_filter: str = "",
     miniprot_opts: Optional[List[str]] = None,
@@ -172,7 +173,7 @@ def _run_evidence_pipeline(
     tracker.big("01", "validate", "validate inputs (genome, predictions, evidence)")
     vi = validate(
         genome=genome, homologs=homologs, predictors=predictors,
-        annotation=annotation, rna=rna, busco=busco,
+        annotation=annotation, rna=rna, busco=busco, omark_db=omark_db,
         workdir=str(out),
     )
     tracker.big_done()
@@ -659,7 +660,7 @@ def merge(
     try:
         results, vi = _run_evidence_pipeline(
             out, genome, homologs, rna, busco, threads,
-            goldset_min_orf,
+            goldset_min_orf, omark_db=omark_db,
             predictors=predictors, mnp_filter=_norm_mnp(mnp_filter),
             miniprot_opts=miniprot_opts, hisat2_opts=hisat2_opts,
             stringtie_opts=stringtie_opts, td_opts=td_opts,
@@ -673,13 +674,12 @@ def merge(
     # module 3: predictor scoring + weight mapping
     tracker.big("05", "score", "predictor scoring + EVM weight calibration")
     from .modules.scoring import score_one_predictor, map_weights
-    from .modules.validate import parse_predictors
 
     a, b_, g_ = map(float, rna_weights.split(","))
     cfg = dict(rna_alpha=a, rna_beta=b_, rna_gamma=g_,
                w_rna=w_rna, w_homolog=w_homolog,
                w_busco=w_busco, w_omark=w_omark,
-               omark_db=omark_db,
+               omark_db=str(vi.omark) if vi.omark else omark_db,
                omark_options=omark_options,
                fulllength_cov=fulllength_cov,
                hs_gold_weight=hs_gold_weight,
@@ -687,7 +687,7 @@ def merge(
                hs_referee_min=hs_referee_min,
                weight_mode=weight_mode,
                ablate=(ablate.split(",") if ablate else []))
-    preds = parse_predictors(predictors)
+    preds = vi.predictors   # materialized links under 01.validate/input/denovo/
     score_dir = ensure_dir(out / "05.score")
     details, p_scores = {}, {}
     # prefetch OMArk for every predictor in parallel (each omamer gets an even
@@ -872,7 +872,7 @@ def merge(
     rep = run_report(
         out, final_gff3, vi.genome, final_d,
         busco_lineage=vi.busco, threads=threads,
-        omark_db=Path(omark_db) if omark_db else None,
+        omark_db=vi.omark if vi.omark else (Path(omark_db) if omark_db else None),
         omark_options=omark_options,
         rna_junctions=rna_res.get("junctions_bed"),
         stringtie_gtf=stringtie_gtf,
@@ -1199,7 +1199,7 @@ def evaluate(
     try:
         results, vi = _run_evidence_pipeline(
             out, genome, homologs, rna, busco, threads,
-            goldset_min_orf,
+            goldset_min_orf, omark_db=omark_db,
             predictors=predictors, annotation=annotation,
             mnp_filter=_norm_mnp(mnp_filter),
             miniprot_opts=miniprot_opts, hisat2_opts=hisat2_opts,
@@ -1263,7 +1263,7 @@ def evaluate(
     rep = run_report(
         out, final_gff3, vi.genome, eval_d,
         busco_lineage=vi.busco, threads=threads,
-        omark_db=Path(omark_db) if omark_db else None,
+        omark_db=vi.omark if vi.omark else (Path(omark_db) if omark_db else None),
         omark_options=omark_options,
         rna_junctions=rna_res.get("junctions_bed"),
         stringtie_gtf=rna_res.get("stringtie_gtf"),
