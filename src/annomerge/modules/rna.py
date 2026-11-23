@@ -14,12 +14,18 @@ Outputs (under <outdir>/02.rnaseq/):
   hisat2_index/            HISAT2 index
   bam/<sample>.sorted.bam  sorted+indexed BAM per sample (mix: .ilmn/.lr)
   stringtie/stringtie.gtf  merged assembly (all samples)
+  stringtie/isoseq.stringtie.gtf  Iso-Seq-only merged assembly (when any
+                           isoseq/ont/bam_isoseq sample exists; augment
+                           tier0 donor pool)
+  stringtie/short.stringtie.gtf   short-read-only merged assembly (same
+                           condition; augment tier1 donor pool)
   junctions.bed            per-junction read support, merged over samples
 """
 from __future__ import annotations
 
 import logging
 import shlex
+import shutil
 from collections import defaultdict
 from pathlib import Path
 
@@ -198,11 +204,16 @@ def assemble(units: list[dict], gtf_out: Path, threads: int,
              extra_opts: ToolOpts | list | None = None) -> Path:
     """StringTie per sample, then stringtie --merge.
 
-    units: [{"name": str, "bams": [Path], "mode": str, "opts": [str]?}]
+    units: [{"name": str, "bams": [Path], "mode": str, "opts": [str]?,
+             "platform": str?, "lr_preset": str?}]
     with mode
       default   one BAM, plain stringtie
       longread  one BAM, stringtie -L
       mix       two BAMs (Illumina, long-read): stringtie --mix b1 b2
+    "platform" is informational only here ("short" / "isoseq"); run_rna_branch
+    uses it to build per-platform merged GTFs for the augment donor pools.
+    "lr_preset" records the minimap2 splice preset of a long-read unit
+    (splice:hq = HiFi, splice = CLR/ONT) for downstream boundary tolerance.
     optional "opts" are per-unit, pipeline-managed StringTie flags (e.g.
     transcripts units get relaxed thresholds: single-copy transcripts are
     1x coverage by nature and stringtie -L assembles nothing from them).
@@ -251,7 +262,9 @@ def assemble(units: list[dict], gtf_out: Path, threads: int,
         gtf_out.write_text("##gff-version 3\n")
         return gtf_out
     if len(per_sample) == 1:
-        per_sample[0].rename(gtf_out)
+        # copy, not rename: per-sample GTFs are shared cache for the
+        # per-platform merges run_rna_branch may trigger afterwards
+        shutil.copy(per_sample[0], gtf_out)
     else:
         lst = sd / "gtf_list.txt"
         lst.write_text("\n".join(map(str, per_sample)) + "\n")
@@ -326,7 +339,8 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                              max_intron=max_intron, min_intron=min_intron)
             bams.append(b)
             coverage_bams.append(b)
-            units.append({"name": s.name, "bams": [b], "mode": "default"})
+            units.append({"name": s.name, "bams": [b], "mode": "default",
+                          "platform": "short"})
         elif s.use_minimap2:
             b = align_minimap2(s, vi.genome, bam_dir, threads,
                                max_intron=max_intron,
@@ -337,9 +351,12 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                 # stringtie -L assembles nothing from them; use the default
                 # (short-read) mode with relaxed thresholds instead
                 units.append({"name": s.name, "bams": [b], "mode": "default",
-                              "opts": ["-c", "1", "-j", "1"]})
+                              "opts": ["-c", "1", "-j", "1"],
+                              "platform": "short"})
             else:
-                units.append({"name": s.name, "bams": [b], "mode": "longread"})
+                units.append({"name": s.name, "bams": [b], "mode": "longread",
+                              "platform": "isoseq",
+                              "lr_preset": s.mm2_preset or "splice:hq"})
                 coverage_bams.append(b)   # real reads: depth is meaningful
         elif s.tag == "mix":
             b1 = align_sample(s, idx, bam_dir, threads,
@@ -353,18 +370,25 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                                 preset="splice")
             bams += [b1, b2]
             coverage_bams.append(b1)         # long-read part stays out of coverage
-            units.append({"name": s.name, "bams": [b1, b2], "mode": "mix"})
+            units.append({"name": s.name, "bams": [b1, b2], "mode": "mix",
+                          "platform": "short"})
 
     for s in vi.rna_bams:
         if s.tag == "bam_mix":
             bams += list(s.files)
             coverage_bams.append(s.files[0])
-            units.append({"name": s.name, "bams": list(s.files), "mode": "mix"})
+            units.append({"name": s.name, "bams": list(s.files), "mode": "mix",
+                          "platform": "short"})
         else:
             bams.append(s.files[0])
             coverage_bams.append(s.files[0])
+            is_lr = s.stringtie_longread
             units.append({"name": s.name, "bams": [s.files[0]],
-                          "mode": "longread" if s.stringtie_longread else "default"})
+                          "mode": "longread" if is_lr else "default",
+                          # bam_isoseq carries no preset info; 'splice'
+                          # (CLR/ONT, wider tolerance) is the safe default
+                          "platform": "isoseq" if is_lr else "short",
+                          "lr_preset": "splice" if is_lr else None})
 
     beds = []
     for bam in bams:
@@ -372,14 +396,39 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
     merged_bed = merge_junctions(beds, rdir / "junctions.bed") if beds else None
 
     gtf = None
+    isoseq_gtf = None
+    short_gtf = None
     if units:
-        gtf = assemble(units, rdir / "stringtie" / "stringtie.gtf", threads,
+        st_dir = rdir / "stringtie"
+        gtf = assemble(units, st_dir / "stringtie.gtf", threads,
                        extra_opts=stringtie_opts)
+        # per-platform merged GTFs for the augment donor pools: Iso-Seq
+        # assemblies keep their identity (full-length boundary evidence)
+        # instead of being dissolved into the pooled merge.  The combined
+        # stringtie.gtf above is untouched — EVM/goldset/report/viewer see
+        # exactly what they saw before.  When no Iso-Seq platform sample
+        # exists both stay None and augment falls back to stringtie.gtf.
+        iso_units = [u for u in units if u.get("platform") == "isoseq"]
+        short_units = [u for u in units if u.get("platform") != "isoseq"]
+        if iso_units:
+            isoseq_gtf = assemble(iso_units, st_dir / "isoseq.stringtie.gtf",
+                                  threads, extra_opts=stringtie_opts)
+            if short_units:
+                short_gtf = assemble(short_units,
+                                     st_dir / "short.stringtie.gtf",
+                                     threads, extra_opts=stringtie_opts)
+            lr_presets = sorted({u.get("lr_preset") or "splice"
+                                 for u in iso_units})
+            tracker.note("isoseq donor pool: %d sample(s) -> %s "
+                         "(presets: %s); short pool: %s",
+                         len(iso_units), isoseq_gtf, ",".join(lr_presets),
+                         short_gtf or "none")
     elif vi.rna_gtfs:
         gtf = vi.rna_gtfs[0]  # precomputed transcripts passed through
 
     result = {"bams": bams, "coverage_bams": coverage_bams,
-              "junctions_bed": merged_bed, "stringtie_gtf": gtf}
+              "junctions_bed": merged_bed, "stringtie_gtf": gtf,
+              "isoseq_gtf": isoseq_gtf, "short_gtf": short_gtf}
     tracker.note("rna done: bams=%d (coverage=%d), splice_junctions=%s, stringtie=%s",
              len(bams), len(coverage_bams), merged_bed, gtf)
     return result
