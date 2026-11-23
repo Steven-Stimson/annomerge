@@ -151,6 +151,11 @@ def run_omark(faa: Path, db: Path, out_dir: Path, threads: int,
         return {"ok": False,
                 "error": "omark/omamer not found (install: conda install -c "
                          "bioconda omark, or pip install omark omamer)"}
+    # Run with a sanitized interpreter environment: conda console scripts use
+    # an absolute-shebang python, but a PYTHONPATH/PYTHONHOME leaked from the
+    # caller's activated env would still shadow the target env's packages
+    # (the same trap that made the busco wrapper fail under a foreign env).
+    pyenv = ["env", "-u", "PYTHONPATH", "-u", "PYTHONHOME"]
     bdir = ensure_dir(out_dir)
     # omark 0.3.x 的汇总文件是 <prefix>.sum（不是 *.omark）
     summaries = list(bdir.glob("*.sum"))
@@ -174,12 +179,12 @@ def run_omark(faa: Path, db: Path, out_dir: Path, threads: int,
         try:
             if not tsv.exists():
                 # omamer 2.x CLI: -o/--out 无长形式, 线程参数是 -t (0..48)
-                run([omamer_exe, "search", "-d", str(db),
+                run(pyenv + [omamer_exe, "search", "-d", str(db),
                      "-q", str(faa), "-o", str(tsv),
                      "-t", str(threads)],
                     desc="omamer search (OMArk)")
             # omark 0.3.x CLI: -o 是输出目录(非文件前缀), 无线程参数(-t 是 TAXID)
-            cmd = [omark_exe, "-f", str(tsv), "-d", str(db), "-o", str(bdir)]
+            cmd = pyenv + [omark_exe, "-f", str(tsv), "-d", str(db), "-o", str(bdir)]
             if isoform_file:
                 cmd += ["-i", str(isoform_file)]
             if extra_opts:
