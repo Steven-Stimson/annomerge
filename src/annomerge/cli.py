@@ -521,6 +521,28 @@ def merge(
              "this many bp with an identical intron chain on the same strand count as "
              "one structure (representative = longest total UTR; 0 = exact).",
         rich_help_panel="Augment"),
+    isoseq_priority: bool = typer.Option(
+        True, "--isoseq-priority/--no-isoseq-priority",
+        help="Iso-Seq platform awareness in augment: full-length assemblies "
+             "(isoseq*/ont/bam_isoseq samples) form a separate tier0 donor pool — "
+             "they are tried first in UTR backfill, win donor-cluster "
+             "representatives by structure (never by TPM), corroborate AS "
+             "isoforms as fl_support=FSM(n), and pass an internal-priming + "
+             "Illumina-coverage artifact screen before admission.  "
+             "--no-isoseq-priority restores the platform-blind behaviour.",
+        rich_help_panel="Augment"),
+    isoseq_fl_min: float = typer.Option(
+        2.0, "--isoseq-fl-min",
+        help="Minimum stringtie -L cov (full-length read-count proxy) for an "
+             "Iso-Seq donor to act as STRONG evidence (junction-vote waiver "
+             "in UTR-donor dedup and AS FSM adoption).",
+        rich_help_panel="Augment"),
+    isoseq_cov_cliff: float = typer.Option(
+        0.5, "--isoseq-cov-cliff",
+        help="Illumina coverage cliff ratio for the truncation screen: an "
+             "Iso-Seq boundary whose outside/inside mean-depth ratio >= this "
+             "value is demoted (coverage continues past the claimed end).",
+        rich_help_panel="Augment"),
     # ----------------------------------------------- assessment & report
     viewer: str = typer.Option(
         "lite", "--viewer",
@@ -827,7 +849,14 @@ def merge(
             min_tpm=aug_min_tpm,
             junc_min_reads=aug_junc_reads,
             pwm_gate=aug_pwm_gate,
-            collapse_tol_bp=aug_collapse_tol)
+            collapse_tol_bp=aug_collapse_tol,
+            isoseq_gtf=rna_res.get("isoseq_gtf"),
+            isoseq_tol_bp=rna_res.get("isoseq_tol_bp", 25),
+            isoseq_priority=isoseq_priority,
+            coverage_bams=(rna_res.get("short_coverage_bams")
+                           or rna_res.get("coverage_bams")),
+            isoseq_fl_min=isoseq_fl_min,
+            isoseq_cov_cliff=isoseq_cov_cliff)
         typer.secho(f"augment output: {aug['augment_gff3']}", fg="green")
         aug_sanity = sanity_filter(
             aug["augment_gff3"], vi.genome,

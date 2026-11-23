@@ -325,6 +325,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
 
     bams: list[Path] = []
     coverage_bams: list[Path] = []
+    short_cov_bams: list[Path] = []   # Illumina-only subset of coverage_bams
     units: list[dict] = []
     idx = None
     bam_dir = rdir / "bam"
@@ -339,6 +340,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                              max_intron=max_intron, min_intron=min_intron)
             bams.append(b)
             coverage_bams.append(b)
+            short_cov_bams.append(b)
             units.append({"name": s.name, "bams": [b], "mode": "default",
                           "platform": "short"})
         elif s.use_minimap2:
@@ -370,6 +372,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                                 preset="splice")
             bams += [b1, b2]
             coverage_bams.append(b1)         # long-read part stays out of coverage
+            short_cov_bams.append(b1)
             units.append({"name": s.name, "bams": [b1, b2], "mode": "mix",
                           "platform": "short"})
 
@@ -377,12 +380,15 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
         if s.tag == "bam_mix":
             bams += list(s.files)
             coverage_bams.append(s.files[0])
+            short_cov_bams.append(s.files[0])
             units.append({"name": s.name, "bams": list(s.files), "mode": "mix",
                           "platform": "short"})
         else:
             bams.append(s.files[0])
             coverage_bams.append(s.files[0])
             is_lr = s.stringtie_longread
+            if not is_lr:
+                short_cov_bams.append(s.files[0])
             units.append({"name": s.name, "bams": [s.files[0]],
                           "mode": "longread" if is_lr else "default",
                           # bam_isoseq carries no preset info; 'splice'
@@ -398,6 +404,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
     gtf = None
     isoseq_gtf = None
     short_gtf = None
+    iso_units: list = []
     if units:
         st_dir = rdir / "stringtie"
         gtf = assemble(units, st_dir / "stringtie.gtf", threads,
@@ -428,7 +435,14 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
 
     result = {"bams": bams, "coverage_bams": coverage_bams,
               "junctions_bed": merged_bed, "stringtie_gtf": gtf,
-              "isoseq_gtf": isoseq_gtf, "short_gtf": short_gtf}
+              "isoseq_gtf": isoseq_gtf, "short_gtf": short_gtf,
+              "short_coverage_bams": short_cov_bams,
+              # boundary tolerance for Iso-Seq full-length ends:
+              # HiFi (splice:hq) endpoints are near-exact (±10bp); CLR/ONT
+              # or unknown (bam_isoseq) get the wider ±25bp
+              "isoseq_tol_bp": (10 if iso_units and all(
+                  (u.get("lr_preset") or "splice") == "splice:hq"
+                  for u in iso_units) else 25) if isoseq_gtf else 25}
     tracker.note("rna done: bams=%d (coverage=%d), splice_junctions=%s, stringtie=%s",
              len(bams), len(coverage_bams), merged_bed, gtf)
     return result

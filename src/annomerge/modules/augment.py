@@ -398,10 +398,28 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
             if clash:
                 stats["as_core_clash_skip"] += 1
                 continue
-            if dedup_mode == "evidence" and not _donor_gates_pass(
-                    g, din, ai, cs, ce, genome, pwm, pwm_gate, junc, stats, "as"):
-                continue
-            orf.mrna.attrs = f"donor_tpm={st_tpms.get(key, 0.0)}"
+            # FSM: the donor's complete intron chain is exactly matched by a
+            # (screened) Iso-Seq transcript — full-length confirmation of the
+            # alternative splicing pattern.  cov >= fl_min (multi-read) makes
+            # it STRONG evidence: the junction vote is waived (the molecule
+            # itself corroborates every novel intron); the PWM gate always
+            # applies.  Single-read FSM still needs all gates.
+            iso = g.get("iso")
+            fsm_strong = iso is not None and iso.cov >= isoseq_fl_min
+            if dedup_mode == "evidence":
+                jj = None if fsm_strong else junc
+                if not _donor_gates_pass(
+                        g, din, ai, cs, ce, genome, pwm, pwm_gate, jj,
+                        stats, "as"):
+                    continue
+            plat = g.get("platform", "short")
+            attrs = f"donor_tpm={st_tpms.get(key, 0.0)};donor_platform={plat}"
+            if iso is not None:
+                attrs += f";fl_support=FSM({iso.cov:g})"
+                stats["as_fsm_supported"] += 1
+                if fsm_strong:
+                    stats["as_fsm_strong"] += 1
+            orf.mrna.attrs = attrs
             gene.isoforms.append(orf)
             used_donors.add(key)
             stats["isoform_as"] += 1
@@ -1232,7 +1250,9 @@ def _write(out: Path, genes: list, stats: Counter) -> None:
             for j, tx in enumerate(gene.isoforms, 1):
                 tid = f"{gid}.t{j}"
                 src = (getattr(tx.mrna, "attrs", "") or "")
-                extra = f";{src}" if "utr_source" in src else ""
+                extra = f";{src}" if any(
+                    k in src for k in ("utr_source", "donor_platform",
+                                       "fl_support", "corroborated_by")) else ""
                 fh.write(f"{tx.mrna.seqid}\tAnnoMerge\tmRNA\t{tx.mrna.start}\t{tx.mrna.end}\t.\t"
                          f"{tx.mrna.strand}\t.\tID={tid};Parent={gid}{extra}\n")
                 for k, x in enumerate(sorted(tx.exons, key=lambda f: f.start), 1):
