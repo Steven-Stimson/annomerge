@@ -170,11 +170,25 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
                 min_tpm: float = 0.1,
                 junc_min_reads: int = 3,
                 pwm_gate: float | None = None,
-                collapse_tol_bp: int = 5) -> dict:
+                collapse_tol_bp: int = 5,
+                isoseq_gtf: Path | None = None,
+                isoseq_tol_bp: int = 25,
+                isoseq_priority: bool = True,
+                coverage_bams: list | None = None,
+                isoseq_fl_min: float = 2.0,
+                isoseq_cov_cliff: float = 0.5) -> dict:
     """dedup_mode: geometric = legacy ±jitter_merge_bp span clustering;
     evidence = EviAnn-style voting — splice-PWM gate on non-anchor introns,
     junction-read corroboration of unique UTR introns, and TPM-ratio test
-    for terminal-span duplicates (no bp-distance threshold anywhere)."""
+    for terminal-span duplicates (no bp-distance threshold anywhere).
+
+    Iso-Seq platform awareness (isoseq_gtf given + isoseq_priority):
+    donors structurally matched to the Iso-Seq-only merged assembly carry
+    platform='isoseq' with an FL-count proxy (stringtie -L cov).  TPM is
+    only ever compared WITHIN one platform; cross-platform duplicate
+    resolution uses boundary tolerance (isoseq_tol_bp) instead of abundance.
+    Without isoseq_gtf everything degrades to the pre-platform behaviour
+    (all donors platform='short', byte-identical output)."""
     from .splicepwm import train_from_transcripts, DEFAULT_GATE
     if pwm_gate is None:
         pwm_gate = DEFAULT_GATE
@@ -190,6 +204,26 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     groups = _group_goldset(goldset_gff)
     genome = _read_genome(vi.genome)
     st_tpms = _parse_stringtie_tpm(stringtie_gtf)
+    # ---- Iso-Seq platform layer -----------------------------------------
+    iso_donors = _parse_isoseq_gtf(isoseq_gtf) \
+        if (isoseq_priority and isoseq_gtf) else []
+    iso_idx = _iso_index(iso_donors) if iso_donors else {}
+    if iso_donors:
+        stats["isoseq_donors"] = len(iso_donors)
+        stats["isoseq_tol_bp"] = isoseq_tol_bp
+    for key, g in groups.items():
+        g["platform"] = "short"
+        g["iso"] = None
+    if iso_donors:
+        for key, g in groups.items():
+            span = (min(x.start for x in g["exons"]),
+                    max(x.end for x in g["exons"]))
+            m = _iso_match(iso_idx, g["seqid"], g["strand"],
+                           _chain_introns(g["exons"]), span, isoseq_tol_bp)
+            if m is not None:
+                g["platform"] = "isoseq"
+                g["iso"] = m
+                stats["isoseq_goldset_groups"] += 1
     # evidence-mode machinery (built lazily; cheap when geometric)
     pwm = train_from_transcripts(genome, [g["orfs"][n] for g in groups.values()
                                           for n in g["orfs"]]) \
@@ -291,7 +325,11 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
         _add_core(gene)
 
     # ============ Phase 4: L1 isoform adoption (complete core index)
-    gene_donor_tpm_max: dict = {}     # gid -> max TPM over all donors evaluated
+    # TPM is only compared WITHIN one platform: the short-pool max drives the
+    # TPM-ratio fold of short-read donors exactly as before; the Iso-Seq pool
+    # tracks max cov (FL-count proxy) separately.
+    gene_donor_tpm_max: dict = {}     # gid -> max TPM over SHORT donors
+    gene_donor_iso_max: dict = {}     # gid -> max cov over ISOSEQ donors
     # Donor span index: (seqid, strand) -> [(start, end, seq, key)] sorted by
     # start. The old code scanned ALL goldset groups for EVERY L1 gene
     # (n_genes x n_donors span tests — hours on large genomes); the index
@@ -370,8 +408,13 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
         else:
             kept, n_merged = _merge_jitter(utr_cands, st_tpms, jitter_merge_bp)
         stats["donor_jitter_merged"] += n_merged
-        gene_donor_tpm_max[gid] = max((st_tpms.get(k, 0.0) for k in gene_donor_keys),
-                                      default=0.0)
+        gene_donor_tpm_max[gid] = max(
+            (st_tpms.get(k, 0.0) for k in gene_donor_keys
+             if groups[k]["platform"] == "short"), default=0.0)
+        gene_donor_iso_max[gid] = max(
+            (groups[k]["iso"].cov for k in gene_donor_keys
+             if groups[k]["platform"] == "isoseq" and groups[k]["iso"]),
+            default=0.0)
         lo, hi = _neighbor_window(cores, anc.mrna.seqid, cs, ce, max_extend)
         for key, g, _, _ in kept:
             iso = _build_utr_isoform(anc, g, lo, hi, tpm=st_tpms.get(key, 0.0))
@@ -519,6 +562,96 @@ def _parse_stringtie_chains(gtf: Path) -> dict:
         if m:
             chains.setdefault(m.group(1), (f[0], f[6], []))[2].append((int(f[3]), int(f[4])))
     return chains
+class IsoDonor:
+    """One Iso-Seq assembled transcript: full-length boundary evidence.
+    cov is stringtie -L per-transcript coverage (~ number of long reads),
+    used as the FL-count proxy; tpm is the within-platform expression."""
+    __slots__ = ("tid", "seqid", "strand", "chain", "introns", "span",
+                 "cov", "tpm")
+    def __init__(self, tid, seqid, strand, chain, cov, tpm):
+        self.tid = tid
+        self.seqid = seqid
+        self.strand = strand
+        self.chain = chain            # [(s,e), ...] sorted
+        self.introns = tuple((chain[i][1] + 1, chain[i + 1][0] - 1)
+                             for i in range(len(chain) - 1))
+        self.span = (chain[0][0], chain[-1][1]) if chain else (0, -1)
+        self.cov = cov
+        self.tpm = tpm
+def _parse_isoseq_gtf(gtf: Path) -> list:
+    """isoseq.stringtie.gtf -> [IsoDonor].  Reads transcript lines for
+    cov/TPM first, then attaches exon chains."""
+    import re as _re
+    meta: dict = {}
+    chains: dict = {}
+    for line in open(gtf):
+        if line.startswith("#"):
+            continue
+        f = line.rstrip("\n").split("\t")
+        if len(f) < 9:
+            continue
+        m = _re.search(r'transcript_id "([^"]+)"', f[8])
+        if not m:
+            continue
+        tid = m.group(1)
+        if f[2] == "transcript":
+            cov = _re.search(r'cov "([^"]+)"', f[8])
+            tpm = _re.search(r'TPM "([^"]+)"', f[8])
+            try:
+                c = float(cov.group(1)) if cov else 1.0
+            except ValueError:
+                c = 1.0
+            try:
+                t = float(tpm.group(1)) if tpm else 0.0
+            except ValueError:
+                t = 0.0
+            meta[tid] = (c, t)
+        elif f[2] == "exon":
+            chains.setdefault(tid, (f[0], f[6], []))[2].append(
+                (int(f[3]), int(f[4])))
+    donors = []
+    for tid, (sq, st, ch) in chains.items():
+        ch.sort()
+        cov, tpm = meta.get(tid, (1.0, 0.0))
+        donors.append(IsoDonor(tid, sq, st, ch, cov, tpm))
+    return donors
+def _iso_index(donors: list) -> dict:
+    """{(seqid, strand): [(intron_chain, start, end, IsoDonor)]} sorted by start."""
+    idx: dict = {}
+    for d in donors:
+        idx.setdefault((d.seqid, d.strand), []).append(
+            (d.introns, d.span[0], d.span[1], d))
+    for v in idx.values():
+        v.sort(key=lambda r: r[1])
+    return idx
+def _iso_match(idx: dict, seqid: str, strand: str, introns: tuple,
+               span: tuple, tol_bp: int):
+    """Find the Iso-Seq transcript supporting this structure.
+    FSM-style: identical intron chain with overlapping span (boundaries may
+    differ — that is exactly what tier0 rescues); single-exon structures
+    (empty intron chain) require >=80% mutual overlap of the shorter span
+    to avoid swallowing unrelated single-exon transcripts.
+    Returns the best (highest-cov) matching IsoDonor or None."""
+    best = None
+    for key in ((seqid, strand), (seqid, ".")):
+        for iv, s, e, d in idx.get(key, []):
+            if e < span[0] - tol_bp:
+                continue
+            if s > span[1] + tol_bp:
+                break
+            if iv != introns:
+                continue
+            if not introns:           # single-exon: demand strong overlap
+                lo = max(s, span[0])
+                hi = min(e, span[1])
+                if hi < lo:
+                    continue
+                shorter = min(e - s, span[1] - span[0]) + 1
+                if (hi - lo + 1) < 0.8 * shorter:
+                    continue
+            if best is None or d.cov > best.cov:
+                best = d
+    return best
 
 
 def _parse_stringtie_tpm(gtf: Path) -> dict:
