@@ -205,6 +205,17 @@ def which(tool: str) -> str:
     return _deps_which(tool)
 
 
+def env_bin_shell_prefix(exe: str) -> str:
+    """Shell prefix pinning a possibly env-dependent wrapper to its own conda
+    env: prepend the exe's bin dir to PATH (so a wrapper that runs
+    ``python -m <pkg>`` picks its own interpreter) and clear PYTHONPATH /
+    PYTHONHOME leaked from the caller's activated env.  Use for shell=True
+    invocations of python-based wrappers like the bioconda busco script."""
+    import shlex
+    b = shlex.quote(str(Path(exe).resolve().parent))
+    return f"PATH={b}:$PATH PYTHONPATH= PYTHONHOME= "
+
+
 def run(cmd: list[str] | str, *, shell: bool = False, log_file: Path | None = None,
         desc: str = "", cwd: Path | str | None = None, track: bool = True) -> None:
     """Run a command, raising ToolError on non-zero exit.

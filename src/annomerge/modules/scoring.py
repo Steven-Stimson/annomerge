@@ -31,7 +31,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..utils import ensure_dir, lazy, run, tracker, which
+from ..utils import ensure_dir, env_bin_shell_prefix, lazy, run, tracker, which
 
 log = logging.getLogger("annomerge")
 
@@ -331,7 +331,10 @@ def compute_bc(pred_faa: Path, busco_path: Path, out_dir: Path, threads: int) ->
     bdir = ensure_dir(out_dir)
     summary_candidates = list(bdir.glob("busco_out/short_summary*.txt"))
     if not summary_candidates:
-        run(f"cd {bdir} && PYTHONPATH= {which('busco')} -i {Path(pred_faa).resolve()} -m proteins "
+        busco = which("busco")
+        # pin the env-dependent busco wrapper to its own conda env (see
+        # utils.env_bin_shell_prefix)
+        run(f"cd {bdir} && {env_bin_shell_prefix(busco)}{busco} -i {Path(pred_faa).resolve()} -m proteins "
             f"-l {Path(busco_path).resolve()} -o busco_out --offline -c {threads} -f",
             shell=True, log_file=bdir / "busco.log", desc="busco (proteins)")
         summary_candidates = list(bdir.glob("busco_out/short_summary*.txt"))

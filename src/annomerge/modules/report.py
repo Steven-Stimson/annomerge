@@ -19,7 +19,7 @@ import shutil
 from collections import Counter
 from pathlib import Path
 
-from ..utils import ensure_dir, lazy, run, tracker, which
+from ..utils import ensure_dir, env_bin_shell_prefix, lazy, run, tracker, which
 from .sanity import _parse_gff3, _read_genome
 
 log = logging.getLogger("annomerge")
@@ -130,7 +130,11 @@ def busco_proteins(faa: Path, lineage: Path, out_dir: Path,
     # BUSCO -o <name> writes <name>/short_summary.*.txt under the run dir
     summaries = list(bdir.glob("busco_run/short_summary*.txt"))
     if not summaries:
-        run(f"cd {bdir} && PYTHONPATH= {which('busco')} -i {Path(faa).resolve()} -m proteins "
+        busco = which("busco")
+        # the bioconda busco wrapper resolves `python` via PATH: pin it to its
+        # own env's bin dir, otherwise a foreign activated env breaks it
+        # ("No module named 'busco'")
+        run(f"cd {bdir} && {env_bin_shell_prefix(busco)}{busco} -i {Path(faa).resolve()} -m proteins "
             f"-l {Path(lineage).resolve()} -o busco_run --offline -c {threads} -f",
             shell=True, log_file=bdir / "busco.log", desc="busco (report)")
         summaries = list(bdir.glob("busco_run/short_summary*.txt"))
