@@ -157,6 +157,310 @@ def _best_orf(group) -> object | None:
 def _chain_introns(exons) -> tuple:
     ex = sorted(exons, key=lambda x: x.start)
     return tuple((ex[i].end + 1, ex[i + 1].start - 1) for i in range(len(ex) - 1))
+# ------------------------------------------------- fork-parallel machinery
+# A single module-global context: children inherit it via fork (no pickling
+# of the genome dict / donor indexes).  Workers are module-level functions
+# that read _PAR_CTX; results (plain picklable records) travel back through
+# pool.map.  All parallel stages return CHANGES that the parent applies to
+# the live objects, so mutation never crosses process boundaries.
+_PAR_CTX: dict | None = None
+def _fork_map(tasks: list, worker, ctx: dict, threads: int) -> list:
+    """map worker over tasks in a fork pool (serial fallback in-process).
+    Task order is preserved (pool.map), so downstream assembly order is
+    identical to the serial implementation."""
+    global _PAR_CTX
+    if threads <= 1 or len(tasks) <= 1:
+        _PAR_CTX = ctx
+        try:
+            return [worker(t) for t in tasks]
+        finally:
+            _PAR_CTX = None
+    import multiprocessing as mp
+    _PAR_CTX = ctx
+    try:
+        mctx = mp.get_context("fork")
+        with mctx.Pool(processes=min(threads, len(tasks))) as pool:
+            return list(pool.map(worker, tasks))
+    finally:
+        _PAR_CTX = None
+def _slices(items: list, n: int) -> list:
+    """Contiguous near-equal slices (keeps contig locality; order preserved).
+
+    GFF rows are contig-ordered in practice, so slicing the ordered key list
+    into ``n`` chunks yields >= #contigs parallel tasks whenever
+    threads >= #contigs (7 for Arabidopsis), and finer-grained tasks when
+    more threads are available."""
+    n = max(1, min(n, len(items)))
+    base, extra = divmod(len(items), n)
+    out, off = [], 0
+    for i in range(n):
+        k = base + (1 if i < extra else 0)
+        out.append(items[off:off + k])
+        off += k
+    return out
+
+
+def _flag_worker(keys: list) -> dict:
+    """Platform-flagging worker: {group_key: IsoDonor} for matched groups."""
+    ctx = _PAR_CTX
+    groups, iso_idx, tol = ctx["groups"], ctx["iso_idx"], ctx["isoseq_tol_bp"]
+    out = {}
+    for key in keys:
+        g = groups[key]
+        span = (min(x.start for x in g["exons"]),
+                max(x.end for x in g["exons"]))
+        m = _iso_match(iso_idx, g["seqid"], g["strand"],
+                       _chain_introns(g["exons"]), span, tol)
+        if m is not None:
+            out[key] = m
+    return out
+
+
+def _phase4_gene(gid, gene, ctx, stats, used):
+    """Per-gene Phase 4 body (isoform adoption + platform-aware dedup + UTR
+    isoform building).  Mutates only `gene` (returned), `stats` and `used`;
+    everything else is read from the shared (fork-inherited) ctx.
+    Returns (gene, short_pool_tpm_max, isoseq_pool_cov_max)."""
+    from bisect import bisect_right as _bisect_right
+    groups = ctx["groups"]
+    donor_idx = ctx["donor_idx"]
+    donor_starts = ctx["donor_starts"]
+    donor_span = ctx["donor_span"]
+    st_tpms = ctx["st_tpms"]
+    dedup_mode = ctx["dedup_mode"]
+    pwm = ctx["pwm"]
+    pwm_gate = ctx["pwm_gate"]
+    junc = ctx["junc"]
+    tpm_ratio = ctx["tpm_ratio"]
+    min_tpm = ctx["min_tpm"]
+    jitter_merge_bp = ctx["jitter_merge_bp"]
+    isoseq_tol_bp = ctx["isoseq_tol_bp"]
+    isoseq_fl_min = ctx["isoseq_fl_min"]
+    cores = ctx["cores"]
+    max_extend = ctx["max_extend"]
+    genome = ctx["genome"]
+
+    anc = gene.isoforms[0]
+    cs, ce = _cds_span(anc)
+    ai = _cds_introns(anc)
+    utr_cands = []
+    gene_donor_keys: list = []
+    _ik = (anc.mrna.seqid, anc.mrna.strand)
+    _bucket = donor_idx.get(_ik, [])
+    _cand = [iv for iv in _bucket[:_bisect_right(donor_starts.get(_ik, []), ce)]
+             if iv[1] >= cs]
+    _cand.sort(key=lambda iv: iv[2])
+    for _, _, _, key in _cand:
+        g = groups[key]
+        dspan = donor_span[key]
+        gene_donor_keys.append(key)
+        din = _chain_introns(g["exons"])
+        if _donor_covers(din, dspan, ai, (cs, ce)):
+            utr_cands.append((key, g, dspan, din))
+            continue
+        # AS branch: donor's own best ORF
+        orf = _best_orf(g)
+        if orf is None:
+            stats["donor_no_orf_skip"] += 1
+            continue
+        cds_seg = tuple(sorted((c.start, c.end) for c in orf.cds))
+        if cds_seg == tuple(sorted((c.start, c.end) for c in anc.cds)):
+            continue                      # identical to anchor, no value
+        if "*" in _translate_cds(genome, orf)[:-1]:
+            stats["as_orf_invalid_skip"] += 1
+            continue
+        if not any(c.start <= ce and c.end >= cs for c in orf.cds):
+            stats["donor_no_cds_overlap"] += 1
+            continue
+        # reject if the AS exon chain overlaps another gene's CDS core
+        clash = False
+        for x in orf.exons:
+            for (s, e) in cores.get(x.seqid, []):
+                if x.start <= e and x.end >= s and not (s <= cs and e >= ce):
+                    clash = True
+                    break
+            if clash:
+                break
+        if clash:
+            stats["as_core_clash_skip"] += 1
+            continue
+        # FSM: the donor's complete intron chain is exactly matched by a
+        # (screened) Iso-Seq transcript — full-length confirmation of the
+        # alternative splicing pattern.  cov >= fl_min (multi-read) makes it
+        # STRONG evidence: the junction vote is waived (the molecule itself
+        # corroborates every novel intron); the PWM gate always applies.
+        # Single-read FSM still needs all gates.
+        iso = g.get("iso")
+        fsm_strong = iso is not None and iso.cov >= isoseq_fl_min
+        if dedup_mode == "evidence":
+            jj = None if fsm_strong else junc
+            if not _donor_gates_pass(
+                    g, din, ai, cs, ce, genome, pwm, pwm_gate, jj,
+                    stats, "as"):
+                continue
+        plat = g.get("platform", "short")
+        attrs = f"donor_tpm={st_tpms.get(key, 0.0)};donor_platform={plat}"
+        if iso is not None:
+            attrs += f";fl_support=FSM({iso.cov:g})"
+            stats["as_fsm_supported"] += 1
+            if fsm_strong:
+                stats["as_fsm_strong"] += 1
+        orf.mrna.attrs = attrs
+        gene.isoforms.append(orf)
+        used.add(key)
+        stats["isoform_as"] += 1
+    # near-duplicate collapse BEFORE isoform building; mixed-platform
+    # candidate lists go through the platform-aware path
+    if any(c[1].get("platform") == "isoseq" for c in utr_cands):
+        kept, n_merged = _dedup_platform(
+            utr_cands, dedup_mode, st_tpms, genome, pwm, pwm_gate, junc,
+            tpm_ratio, min_tpm, (cs, ce), stats, isoseq_tol_bp,
+            isoseq_fl_min)
+    elif dedup_mode == "evidence":
+        kept, n_merged = _dedup_evidence(utr_cands, st_tpms, genome, pwm,
+                                         pwm_gate, junc, tpm_ratio, min_tpm,
+                                         (cs, ce), stats)
+    else:
+        kept, n_merged = _merge_jitter(utr_cands, st_tpms, jitter_merge_bp)
+    stats["donor_jitter_merged"] += n_merged
+    tpm_max = max((st_tpms.get(k, 0.0) for k in gene_donor_keys
+                   if groups[k]["platform"] == "short"), default=0.0)
+    iso_max = max((groups[k]["iso"].cov for k in gene_donor_keys
+                   if groups[k]["platform"] == "isoseq" and groups[k]["iso"]),
+                  default=0.0)
+    lo, hi = _neighbor_window(cores, anc.mrna.seqid, cs, ce, max_extend)
+    for key, g, _, _ in kept:
+        iso = _build_utr_isoform(anc, g, lo, hi, tpm=st_tpms.get(key, 0.0))
+        if iso is not None:
+            gene.isoforms.append(iso)
+            used.add(key)
+            stats["isoform_utr"] += 1
+    # collapse exact duplicate isoforms (identical exon chain + CDS)
+    seen, uniq = set(), []
+    for tx in gene.isoforms:
+        k = (_chain(tx.exons), tuple(sorted((c.start, c.end) for c in tx.cds)))
+        if k not in seen:
+            seen.add(k)
+            uniq.append(tx)
+    if len(uniq) != len(gene.isoforms):
+        stats["isoform_exact_dup_collapsed"] += len(gene.isoforms) - len(uniq)
+        gene.isoforms = uniq
+    stats["isoforms_total"] += len(uniq)
+    return gene, tpm_max, iso_max
+
+
+def _phase4_worker(gids: list):
+    """Fork worker: run _phase4_gene over a gid slice, return rebuilt genes
+    (Tx/Feat/_Gene are picklable) plus local stats / donor sets / maxima."""
+    ctx = _PAR_CTX
+    stats: Counter = Counter()
+    used: set = set()
+    tpm_max: dict = {}
+    iso_max: dict = {}
+    items = []
+    for gid in gids:
+        gene, tm, im = _phase4_gene(gid, ctx["l1_genes"][gid], ctx, stats,
+                                    used)
+        items.append((gid, gene))
+        tpm_max[gid] = tm
+        iso_max[gid] = im
+    return items, stats, used, tpm_max, iso_max
+
+
+def _backfill_tx(tx, ctx, stats):
+    """Plan one UTR backfill for a UTR-less transcript (no mutation).
+    Returns (new_exons, start, end, src) or None.  All donor indexes are
+    read from ctx (fork-inherited)."""
+    from bisect import bisect_right as _br
+    five, three = _utr_parts(tx)
+    if five or three or not tx.cds:
+        return None
+    cs, ce = _cds_span(tx)
+    ai = _cds_introns(tx)
+    best = None
+    # tier0: screened Iso-Seq chains (full-length boundaries)
+    iso_idx = ctx["iso_idx"]
+    if iso_idx:
+        _cand0 = []
+        for _sk in ((tx.mrna.seqid, tx.mrna.strand), (tx.mrna.seqid, ".")):
+            _bucket = iso_idx.get(_sk, [])
+            _cand0.extend(
+                iv for iv in _bucket[:_br(ctx["iso_starts"].get(_sk, []), cs)]
+                if iv[1] >= ce)
+        _cand0.sort(key=lambda iv: iv[2])
+        for _, _, _, chain, din in _cand0:
+            span = (min(s for s, _ in chain), max(e for _, e in chain))
+            if not _donor_covers(din, span, ai, (cs, ce)):
+                continue
+            ext = (cs - span[0]) + (span[1] - ce)
+            if best is None or ext > best[0]:
+                best = (ext, "isoseq", chain)
+    # tier1: StringTie chains
+    if best is None:
+        _cand1 = []
+        for _sk in ((tx.mrna.seqid, tx.mrna.strand), (tx.mrna.seqid, ".")):
+            _bucket = ctx["st_idx"].get(_sk, [])
+            _cand1.extend(
+                iv for iv in _bucket[:_br(ctx["st_starts"].get(_sk, []), cs)]
+                if iv[1] >= ce)
+        _cand1.sort(key=lambda iv: iv[2])
+        for _, _, _, chain, din in _cand1:
+            span = (min(s for s, _ in chain), max(e for _, e in chain))
+            if not _donor_covers(din, span, ai, (cs, ce)):
+                continue
+            ext = (cs - span[0]) + (span[1] - ce)
+            if best is None or ext > best[0]:
+                best = (ext, "stringtie", chain)
+    # tier2: de novo chains
+    if best is None:
+        cand = []
+        _dk = (tx.mrna.seqid, tx.mrna.strand)
+        _bucket = ctx["dn_idx"].get(_dk, [])
+        _cand2 = [iv for iv in _bucket[:_br(ctx["dn_starts"].get(_dk, []), cs)]
+                  if iv[1] >= ce]
+        _cand2.sort(key=lambda iv: (iv[2], iv[3]))
+        for _s, _e, _, _, name, din, chain in _cand2:
+            span = (_s, _e)
+            if not _donor_covers(din, span, ai, (cs, ce)):
+                continue
+            ext = (cs - span[0]) + (span[1] - ce)
+            sc = (ctx["scores"] or {}).get(name, (0.0, 0.0))
+            cand.append((ext, sc, name, chain))
+        if cand:
+            cand.sort(key=lambda c: (-c[1][0], -c[1][1], -c[0]))
+            best = (cand[0][0], f"denovo:{cand[0][2]}", cand[0][3])
+    if best is None:
+        stats["utr_none"] += 1
+        return None
+    ext, src, chain = best
+    lo, hi = _neighbor_window(ctx["cores"], tx.mrna.seqid, cs, ce,
+                              ctx["max_extend"])
+    from .sanity import Feat
+    new_exons = [Feat(tx.mrna.seqid, "aug", "exon", max(s, lo), min(e, hi),
+                      ".", tx.mrna.strand, ".", "")
+                 for s, e in sorted(chain) if max(s, lo) <= min(e, hi)]
+    if not new_exons or new_exons[0].start > cs or new_exons[-1].end < ce:
+        stats["utr_backfill_failed"] += 1
+        return None
+    src = src.split(":")[0]
+    stats[f"utr_from_{src}"] += 1
+    return new_exons, new_exons[0].start, new_exons[-1].end, src
+
+
+def _backfill_worker(gene_idx: list):
+    """Fork worker: plan backfills for a gene-index slice; changes travel
+    back as plain records (Feat is a dataclass) and the parent applies them
+    to the live gene objects (identity with l1_genes/genes is preserved)."""
+    ctx = _PAR_CTX
+    stats: Counter = Counter()
+    changes = []
+    genes = ctx["genes"]
+    for gi in gene_idx:
+        for ti, tx in enumerate(genes[gi].isoforms):
+            ch = _backfill_tx(tx, ctx, stats)
+            if ch is not None:
+                changes.append((gi, ti) + ch)
+    return changes, stats
 
 
 # ------------------------------------------------------------- main entry
@@ -176,7 +480,8 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
                 isoseq_priority: bool = True,
                 coverage_bams: list | None = None,
                 isoseq_fl_min: float = 2.0,
-                isoseq_cov_cliff: float = 0.5) -> dict:
+                isoseq_cov_cliff: float = 0.5,
+                threads: int = 8) -> dict:
     """dedup_mode: geometric = legacy ±jitter_merge_bp span clustering;
     evidence = EviAnn-style voting — splice-PWM gate on non-anchor introns,
     junction-read corroboration of unique UTR introns, and TPM-ratio test
@@ -210,7 +515,7 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     if iso_donors:
         cov_checker = _CovChecker(coverage_bams)
         iso_donors = _screen_isoseq(iso_donors, genome, cov_checker,
-                                    isoseq_cov_cliff, stats)
+                                    isoseq_cov_cliff, stats, threads=threads)
         stats["isoseq_screened_kept"] = len(iso_donors)
     iso_idx = _iso_index(iso_donors) if iso_donors else {}
     if iso_donors:
@@ -220,15 +525,19 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
         g["platform"] = "short"
         g["iso"] = None
     if iso_donors:
-        for key, g in groups.items():
-            span = (min(x.start for x in g["exons"]),
-                    max(x.end for x in g["exons"]))
-            m = _iso_match(iso_idx, g["seqid"], g["strand"],
-                           _chain_introns(g["exons"]), span, isoseq_tol_bp)
-            if m is not None:
-                g["platform"] = "isoseq"
-                g["iso"] = m
-                stats["isoseq_goldset_groups"] += 1
+        # platform flagging: pure tuple comparisons per group — fork-parallel
+        # over contiguous key slices (chromosome locality); workers return
+        # {key: IsoDonor} matches, the parent applies them to live groups.
+        flag_ctx = {"groups": groups, "iso_idx": iso_idx,
+                    "isoseq_tol_bp": isoseq_tol_bp}
+        matched: dict = {}
+        for part in _fork_map(_slices(list(groups.keys()), threads),
+                              _flag_worker, flag_ctx, threads):
+            matched.update(part)
+        for key, m in matched.items():
+            groups[key]["platform"] = "isoseq"
+            groups[key]["iso"] = m
+        stats["isoseq_goldset_groups"] = len(matched)
     # evidence-mode machinery (built lazily; cheap when geometric)
     pwm = train_from_transcripts(genome, [g["orfs"][n] for g in groups.values()
                                           for n in g["orfs"]]) \
@@ -353,115 +662,29 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     for _v in donor_idx.values():
         _v.sort()
     donor_starts = {k: [iv[0] for iv in v] for k, v in donor_idx.items()}
-    for gid, gene in l1_genes.items():
-        anc = gene.isoforms[0]
-        cs, ce = _cds_span(anc)
-        ai = _cds_introns(anc)
-        utr_cands = []                     # (key, group, dspan) awaiting jitter merge
-        gene_donor_keys: list = []
-        _ik = (anc.mrna.seqid, anc.mrna.strand)
-        _bucket = donor_idx.get(_ik, [])
-        _cand = [iv for iv in _bucket[:_bisect_right(donor_starts.get(_ik, []), ce)]
-                 if iv[1] >= cs]
-        _cand.sort(key=lambda iv: iv[2])   # restore original groups order
-        for _, _, _, key in _cand:
-            g = groups[key]
-            dspan = donor_span[key]
-            gene_donor_keys.append(key)
-            din = _chain_introns(g["exons"])
-            if _donor_covers(din, dspan, ai, (cs, ce)):
-                utr_cands.append((key, g, dspan, din))
-                continue
-            # AS branch: donor's own best ORF
-            orf = _best_orf(g)
-            if orf is None:
-                stats["donor_no_orf_skip"] += 1
-                continue
-            cds_seg = tuple(sorted((c.start, c.end) for c in orf.cds))
-            if cds_seg == tuple(sorted((c.start, c.end) for c in anc.cds)):
-                continue                      # identical to anchor, no value
-            if "*" in _translate_cds(genome, orf)[:-1]:
-                stats["as_orf_invalid_skip"] += 1
-                continue
-            if not any(c.start <= ce and c.end >= cs for c in orf.cds):
-                stats["donor_no_cds_overlap"] += 1
-                continue
-            # reject if the AS exon chain overlaps another gene's CDS core
-            clash = False
-            for x in orf.exons:
-                for (s, e) in cores.get(x.seqid, []):
-                    if x.start <= e and x.end >= s and not (s <= cs and e >= ce):
-                        clash = True
-                        break
-                if clash:
-                    break
-            if clash:
-                stats["as_core_clash_skip"] += 1
-                continue
-            # FSM: the donor's complete intron chain is exactly matched by a
-            # (screened) Iso-Seq transcript — full-length confirmation of the
-            # alternative splicing pattern.  cov >= fl_min (multi-read) makes
-            # it STRONG evidence: the junction vote is waived (the molecule
-            # itself corroborates every novel intron); the PWM gate always
-            # applies.  Single-read FSM still needs all gates.
-            iso = g.get("iso")
-            fsm_strong = iso is not None and iso.cov >= isoseq_fl_min
-            if dedup_mode == "evidence":
-                jj = None if fsm_strong else junc
-                if not _donor_gates_pass(
-                        g, din, ai, cs, ce, genome, pwm, pwm_gate, jj,
-                        stats, "as"):
-                    continue
-            plat = g.get("platform", "short")
-            attrs = f"donor_tpm={st_tpms.get(key, 0.0)};donor_platform={plat}"
-            if iso is not None:
-                attrs += f";fl_support=FSM({iso.cov:g})"
-                stats["as_fsm_supported"] += 1
-                if fsm_strong:
-                    stats["as_fsm_strong"] += 1
-            orf.mrna.attrs = attrs
-            gene.isoforms.append(orf)
-            used_donors.add(key)
-            stats["isoform_as"] += 1
-        # near-duplicate (assembly jitter) collapse BEFORE isoform building;
-        # mixed-platform candidate lists go through the platform-aware path
-        if any(c[1].get("platform") == "isoseq" for c in utr_cands):
-            kept, n_merged = _dedup_platform(
-                utr_cands, dedup_mode, st_tpms, genome, pwm, pwm_gate, junc,
-                tpm_ratio, min_tpm, (cs, ce), stats, isoseq_tol_bp,
-                isoseq_fl_min)
-        elif dedup_mode == "evidence":
-            kept, n_merged = _dedup_evidence(utr_cands, st_tpms, genome, pwm,
-                                             pwm_gate, junc, tpm_ratio, min_tpm,
-                                             (cs, ce), stats)
-        else:
-            kept, n_merged = _merge_jitter(utr_cands, st_tpms, jitter_merge_bp)
-        stats["donor_jitter_merged"] += n_merged
-        gene_donor_tpm_max[gid] = max(
-            (st_tpms.get(k, 0.0) for k in gene_donor_keys
-             if groups[k]["platform"] == "short"), default=0.0)
-        gene_donor_iso_max[gid] = max(
-            (groups[k]["iso"].cov for k in gene_donor_keys
-             if groups[k]["platform"] == "isoseq" and groups[k]["iso"]),
-            default=0.0)
-        lo, hi = _neighbor_window(cores, anc.mrna.seqid, cs, ce, max_extend)
-        for key, g, _, _ in kept:
-            iso = _build_utr_isoform(anc, g, lo, hi, tpm=st_tpms.get(key, 0.0))
-            if iso is not None:
-                gene.isoforms.append(iso)
-                used_donors.add(key)
-                stats["isoform_utr"] += 1
-        # collapse exact duplicate isoforms (identical exon chain + CDS)
-        seen, uniq = set(), []
-        for tx in gene.isoforms:
-            k = (_chain(tx.exons), tuple(sorted((c.start, c.end) for c in tx.cds)))
-            if k not in seen:
-                seen.add(k)
-                uniq.append(tx)
-        if len(uniq) != len(gene.isoforms):
-            stats["isoform_exact_dup_collapsed"] += len(gene.isoforms) - len(uniq)
-            gene.isoforms = uniq
-        stats["isoforms_total"] += len(uniq)
+    # Phase 4 is per-gene independent (cores is complete by now; all donor
+    # indexes read-only), so it runs fork-parallel over contiguous gid slices
+    # — chromosome-scale locality: >= #contigs tasks when threads >= #contigs
+    # (7 for Arabidopsis), finer with more threads.  Workers return rebuilt
+    # genes + local stats/donor sets; the parent merges in original order.
+    p4_ctx = {"l1_genes": l1_genes, "groups": groups, "donor_idx": donor_idx,
+              "donor_starts": donor_starts, "donor_span": donor_span,
+              "st_tpms": st_tpms, "dedup_mode": dedup_mode, "pwm": pwm,
+              "pwm_gate": pwm_gate, "junc": junc, "tpm_ratio": tpm_ratio,
+              "min_tpm": min_tpm, "jitter_merge_bp": jitter_merge_bp,
+              "isoseq_tol_bp": isoseq_tol_bp, "isoseq_fl_min": isoseq_fl_min,
+              "cores": cores, "max_extend": max_extend, "genome": genome}
+    rebuilt: dict = {}
+    for items, st2, used2, tm2, im2 in _fork_map(
+            _slices(list(l1_genes.keys()), threads), _phase4_worker,
+            p4_ctx, threads):
+        stats.update(st2)
+        used_donors |= used2
+        gene_donor_tpm_max.update(tm2)
+        gene_donor_iso_max.update(im2)
+        for gid, gene in items:
+            rebuilt[gid] = gene
+    l1_genes = rebuilt
 
     genes.extend(l1_genes.values())
     genes.extend(l2_gene_list)
@@ -470,7 +693,7 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     # ---------------- UTR backfill (tier0 Iso-Seq, tier1 StringTie, tier2 de novo)
     st_donors = _parse_stringtie_chains(stringtie_gtf)
     _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, cores,
-                   iso_donors=iso_donors)
+                   iso_donors=iso_donors, threads=threads)
 
     # -------- collapse same-exon-chain ORF shadows (AFTER backfill) ---------
     # Backfill rebuilds the anchor's exon chain from the same StringTie pool
@@ -704,29 +927,29 @@ def _iso_match(idx: dict, seqid: str, strand: str, introns: tuple,
     return best
 class _CovChecker:
     """Windowed Illumina coverage for Iso-Seq boundary corroboration.
-    Lazily opens coverage BAMs (short-read only — long-read depth is too
-    sparse for cliff detection); mean depth over small windows via
-    pysam.count_coverage (C-level).  Disabled (None bams) -> all checks
-    pass, screening degrades to the priming test only."""
+    Thread-safe: every worker thread opens its own pysam handles
+    (threading.local); count_coverage releases the GIL inside htslib,
+    so the artifact screen scales with --threads.  Disabled (None bams)
+    -> all checks pass, screening degrades to the priming test only."""
 
     def __init__(self, bams):
-        import pysam
-        self._pysam = pysam
+        import threading
         self._bams = list(bams or [])
-        self._af = {}
+        self._local = threading.local()
 
-    def _open(self, bam):
-        if bam not in self._af:
-            self._af[bam] = self._pysam.AlignmentFile(str(bam), "rb")
-        return self._af[bam]
+    def _handles(self):
+        import pysam
+        if not getattr(self._local, "af", None):
+            self._local.af = {b: pysam.AlignmentFile(str(b), "rb")
+                              for b in self._bams}
+        return self._local.af
 
     def mean_depth(self, seqid, start, end) -> float:
         """1-based inclusive [start,end]; 0.0 when disabled or off-contig."""
         if not self._bams or end < start or end - start + 1 <= 0:
             return 0.0
         total = 0
-        for bam in self._bams:
-            af = self._open(bam)
+        for bam, af in self._handles().items():
             if seqid not in af.references:
                 continue
             s = max(0, start - 1)
@@ -784,22 +1007,33 @@ def _priming_artifact(genome: dict, seqid: str, strand: str, span,
             run = 0
     return best >= 6 or (len(frag) > 0 and n / len(frag) >= 0.6)
 def _screen_isoseq(donors: list, genome: dict, cov: _CovChecker,
-                   cov_cliff: float, stats: Counter) -> list:
+                   cov_cliff: float, stats: Counter,
+                   threads: int = 1) -> list:
     """Tier0 admission screening: demote Iso-Seq donors whose boundaries
     are classic artifacts (internal priming / RTS-degradation truncation)
-    BEFORE they can privilege any goldset group or backfill chain."""
-    kept = []
-    for d in donors:
+    BEFORE they can privilege any goldset group or backfill chain.
+    Parallel over donor chunks (coverage queries release the GIL)."""
+    def _one(d):
         if _priming_artifact(genome, d.seqid, d.strand, d.span):
-            stats["isoseq_demoted_priming"] += 1
-            continue
+            return d, "priming"
         tss, tes = (d.span[1], d.span[0]) if d.strand == "-" \
             else (d.span[0], d.span[1])
         if cov.boundary_truncated(d.seqid, tss, "tss", cliff=cov_cliff) or \
                 cov.boundary_truncated(d.seqid, tes, "tes", cliff=cov_cliff):
-            stats["isoseq_demoted_coverage"] += 1
-            continue
-        kept.append(d)
+            return d, "coverage"
+        return d, ""
+    if threads > 1 and len(donors) > 200:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(threads, len(donors))) as ex:
+            verdicts = list(ex.map(_one, donors, chunksize=64))
+    else:
+        verdicts = [_one(d) for d in donors]
+    kept = []
+    for d, v in verdicts:
+        if v:
+            stats[f"isoseq_demoted_{v}"] += 1
+        else:
+            kept.append(d)
     return kept
 def _dedup_platform(cands, mode, tpms, genome, pwm, pwm_gate, junc,
                     tpm_ratio, min_tpm, cds_span, stats, isoseq_tol_bp,
@@ -1026,7 +1260,7 @@ def _merge_jitter(cands: list, tpms: dict, thr: int) -> tuple[list, int]:
 
 
 def _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, cores,
-                   iso_donors=None):
+                   iso_donors=None, threads: int = 1):
     """For UTR-less transcripts extend exons from tier0 Iso-Seq (when given),
     then tier1 StringTie, then tier2 de novo donors (internal introns must
     match CDS exactly).  Iso-Seq chains are pre-screened (priming/truncation)
@@ -1080,82 +1314,24 @@ def _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, c
         v.sort()
     dn_starts = {k: [iv[0] for iv in v] for k, v in dn_idx.items()}
 
-    for gene in genes:
-        for tx in gene.isoforms:
-            five, three = _utr_parts(tx)
-            if five or three or not tx.cds:
-                continue
-            cs, ce = _cds_span(tx)
-            ai = _cds_introns(tx)
-            best = None
-            # tier0: screened Iso-Seq chains (full-length boundaries)
-            if iso_idx:
-                _cand0 = []
-                for _sk in ((tx.mrna.seqid, tx.mrna.strand), (tx.mrna.seqid, ".")):
-                    _bucket = iso_idx.get(_sk, [])
-                    _cand0.extend(
-                        iv for iv in _bucket[:_br(iso_starts.get(_sk, []), cs)]
-                        if iv[1] >= ce)
-                _cand0.sort(key=lambda iv: iv[2])
-                for _, _, _, chain, din in _cand0:
-                    span = (min(s for s, _ in chain), max(e for _, e in chain))
-                    if not _donor_covers(din, span, ai, (cs, ce)):
-                        continue
-                    ext = (cs - span[0]) + (span[1] - ce)
-                    if best is None or ext > best[0]:
-                        best = (ext, "isoseq", chain)
-            # tier1: StringTie chains
-            if best is None:
-                _cand1 = []
-                for _sk in ((tx.mrna.seqid, tx.mrna.strand), (tx.mrna.seqid, ".")):
-                    _bucket = st_idx.get(_sk, [])
-                    _cand1.extend(
-                        iv for iv in _bucket[:_br(st_starts.get(_sk, []), cs)]
-                        if iv[1] >= ce)
-                _cand1.sort(key=lambda iv: iv[2])   # original st_donors order
-                for _, _, _, chain, din in _cand1:
-                    span = (min(s for s, _ in chain), max(e for _, e in chain))
-                    if not _donor_covers(din, span, ai, (cs, ce)):
-                        continue
-                    ext = (cs - span[0]) + (span[1] - ce)
-                    if best is None or ext > best[0]:
-                        best = (ext, "stringtie", chain)
-            # tier2: de novo chains
-            if best is None:
-                cand = []
-                _dk = (tx.mrna.seqid, tx.mrna.strand)
-                _bucket = dn_idx.get(_dk, [])
-                _cand2 = [iv for iv in _bucket[:_br(dn_starts.get(_dk, []), cs)]
-                          if iv[1] >= ce]
-                _cand2.sort(key=lambda iv: (iv[2], iv[3]))  # preds, then GFF order
-                for _s, _e, _, _, name, din, chain in _cand2:
-                    span = (_s, _e)
-                    if not _donor_covers(din, span, ai, (cs, ce)):
-                        continue
-                    ext = (cs - span[0]) + (span[1] - ce)
-                    sc = (scores or {}).get(name, (0.0, 0.0))
-                    cand.append((ext, sc, name, chain))
-                if cand:
-                    cand.sort(key=lambda c: (-c[1][0], -c[1][1], -c[0]))
-                    best = (cand[0][0], f"denovo:{cand[0][2]}", cand[0][3])
-            if best is None:
-                stats["utr_none"] += 1
-                continue
-            ext, src, chain = best
-            lo, hi = _neighbor_window(cores, tx.mrna.seqid, cs, ce, max_extend)
-            from .sanity import Feat
-            new_exons = [Feat(tx.mrna.seqid, "aug", "exon", max(s, lo), min(e, hi),
-                              ".", tx.mrna.strand, ".", "")
-                         for s, e in sorted(chain) if max(s, lo) <= min(e, hi)]
-            # guard: rebuilt chain must be non-empty and still cover the CDS
-            if not new_exons or new_exons[0].start > cs or new_exons[-1].end < ce:
-                stats["utr_backfill_failed"] += 1
-                continue
-            tx.exons = new_exons
-            tx.mrna.start = new_exons[0].start
-            tx.mrna.end = new_exons[-1].end
-            tx.mrna.attrs = f"utr_source={src.split(':')[0]}"
-            stats[f"utr_from_{src.split(':')[0]}"] += 1
+    # plan/apply: workers compute backfill changes fork-parallel over
+    # gene-index slices (contiguous => chromosome-local); the parent applies
+    # them so gene-object identity with l1_genes / genes is preserved.
+    bf_ctx = {"genes": genes, "iso_idx": iso_idx, "iso_starts": iso_starts,
+              "st_idx": st_idx, "st_starts": st_starts, "dn_idx": dn_idx,
+              "dn_starts": dn_starts, "scores": scores, "cores": cores,
+              "max_extend": max_extend}
+    changes = []
+    for ch_list, st2 in _fork_map(_slices(list(range(len(genes))), threads),
+                                  _backfill_worker, bf_ctx, threads):
+        stats.update(st2)
+        changes.extend(ch_list)
+    for gi, ti, new_exons, start, end, src in changes:
+        tx = genes[gi].isoforms[ti]
+        tx.exons = new_exons
+        tx.mrna.start = start
+        tx.mrna.end = end
+        tx.mrna.attrs = f"utr_source={src}"
 
 
 def _cds_intron_chain(tx) -> tuple:

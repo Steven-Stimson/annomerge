@@ -856,7 +856,8 @@ def merge(
             coverage_bams=(rna_res.get("short_coverage_bams")
                            or rna_res.get("coverage_bams")),
             isoseq_fl_min=isoseq_fl_min,
-            isoseq_cov_cliff=isoseq_cov_cliff)
+            isoseq_cov_cliff=isoseq_cov_cliff,
+            threads=threads)
         typer.secho(f"augment output: {aug['augment_gff3']}", fg="green")
         aug_sanity = sanity_filter(
             aug["augment_gff3"], vi.genome,
