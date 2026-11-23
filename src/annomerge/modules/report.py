@@ -255,13 +255,17 @@ def _busco_version() -> str:
     if exe:
         import subprocess, tempfile, json as _json
         try:
+            from ..deps import _VERSION_ERR_MARKERS
             with tempfile.TemporaryDirectory() as td:
                 p = subprocess.run([exe, "--version"], capture_output=True,
                                    text=True, timeout=120, cwd=td)
-            m = re.search(r"BUSCO\s+(\d+\.\d+(?:\.\d+)?)",
-                          p.stdout + "\n" + p.stderr)
-            if m:
-                return m.group(1)
+            text = p.stdout + "\n" + p.stderr
+            # a wrapper crash text is not a version (e.g. "No module named
+            # 'busco'" when the wrapper binds the wrong interpreter)
+            if not any(mk in text for mk in _VERSION_ERR_MARKERS):
+                m = re.search(r"BUSCO\s+(\d+\.\d+(?:\.\d+)?)", text)
+                if m:
+                    return m.group(1)
         except Exception:
             pass
         try:

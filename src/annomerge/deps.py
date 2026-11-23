@@ -204,6 +204,11 @@ def utility(key: str, relpath: str) -> Path:
 
 
 # ---------------------------------------------------------------- checking
+_VERSION_ERR_MARKERS = ("No module named", "ModuleNotFoundError",
+                        "Traceback (most recent call last)",
+                        "command not found", "No such file or directory")
+
+
 def _version_of(exe_path: str) -> str:
     for args in (["--version"], ["-version"], ["-v"]):
         try:
@@ -213,7 +218,10 @@ def _version_of(exe_path: str) -> str:
             out = subprocess.run([exe_path] + args, capture_output=True,
                                  text=True, timeout=15, env=env)
             text = (out.stdout + out.stderr).strip()
-            if text:
+            # a python-level crash text (e.g. "No module named 'busco'" from
+            # a `python -m busco` wrapper resolving to the wrong interpreter)
+            # is NOT a version — treat the probe as failed
+            if text and not any(m in text for m in _VERSION_ERR_MARKERS):
                 lines = [l.strip() for l in text.splitlines() if l.strip()][:2]
                 for line in lines:                       # prefer a dotted version token
                     m = re.search(r"(\d+\.\d+[\w.\-]*)", line)
@@ -252,14 +260,37 @@ def _home_version(key: str, p: Path) -> str:
     return m.group(1) if m else "?"
 
 
+def _conda_meta_version(key: str, exe_path: str | None) -> str | None:
+    """Version from the conda-meta record of the env the resolved exe lives
+    in (works even when the wrapper itself cannot run — e.g. a
+    `python -m busco` wrapper resolving to the wrong interpreter)."""
+    if not exe_path:
+        return None
+    try:
+        import json
+        meta = Path(exe_path).resolve().parent.parent / "conda-meta"
+        for j in sorted(meta.glob(f"{key}-*.json")):
+            v = json.loads(j.read_text()).get("version")
+            if v:
+                return v
+    except Exception:
+        pass
+    return None
+
+
 def _dist_version(key: str, exe_path: str | None) -> str:
     """Python-distribution tools (omark/omamer) report via importlib; CLI tools
-    (and wrappers whose --version argparse would only print usage) via --version."""
+    (and wrappers whose --version argparse would only print usage) via --version.
+    The conda-meta record is consulted before running the exe, since a broken
+    wrapper would otherwise leak its crash text as the 'version'."""
     try:
         from importlib.metadata import version as _v
         return _v(key)
     except Exception:
         pass
+    v = _conda_meta_version(key, exe_path)
+    if v:
+        return v
     if exe_path and "TransDecoder" in Path(exe_path).name:
         # perl script with the version embedded: my $VERSION = "5.7.1";
         # (not every script carries it — the wrapper does, so probe siblings)
