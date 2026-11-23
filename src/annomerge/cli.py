@@ -480,14 +480,16 @@ def merge(
              "Requires RNA evidence; auto-falls back to EVM-only without RNA.",
         rich_help_panel="Augment"),
     aug_dedup: str = typer.Option(
-        "geometric", "--aug-dedup",
+        "evidence", "--aug-dedup",
         help="\b\nNear-duplicate UTR-donor removal, two philosophies:\n"
-             "  [cyan]geometric[/cyan]  (default) merge donors whose spans sit "
-             "within ±--aug-jitter-bp on both ends (assembly-jitter clustering)\n"
-             "  [cyan]evidence[/cyan]   EviAnn-style voting — a novel splice "
-             "site must pass the splice-PWM gate (--aug-pwm-gate), junction-read "
-             "corroboration (--aug-junc-reads) and expression filters "
-             "(--aug-tpm-ratio, --aug-min-tpm); no bp threshold\n"
+             "  [cyan]evidence[/cyan]   (default) EviAnn-style voting — a novel "
+             "splice site must pass the splice-PWM gate (--aug-pwm-gate), "
+             "junction-read corroboration (--aug-junc-reads) and expression "
+             "filters (--aug-tpm-ratio, --aug-min-tpm); no bp threshold\n"
+             "  [cyan]geometric[/cyan]  [yellow]legacy[/yellow]: merge donors "
+             "whose spans sit within ±--aug-jitter-bp on both ends "
+             "(assembly-jitter clustering); frozen, kept for reproduction of "
+             "historical results\n"
              "Independent of both: --aug-collapse-tol-bp folds "
              "identical-intron-chain isoforms after dedup.",
         rich_help_panel="Augment"),

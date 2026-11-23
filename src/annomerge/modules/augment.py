@@ -468,7 +468,7 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
                 stringtie_gtf: Path, preds: dict, scores: dict | None,
                 max_extend: int = MAX_EXTEND,
                 jitter_merge_bp: int = JITTER_MERGE_BP,
-                dedup_mode: str = "geometric",
+                dedup_mode: str = "evidence",
                 junctions_bed: Path | None = None,
                 tpm_ratio: float = 0.1,
                 min_tpm: float = 0.1,
@@ -482,10 +482,11 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
                 isoseq_fl_min: float = 2.0,
                 isoseq_cov_cliff: float = 0.5,
                 threads: int = 8) -> dict:
-    """dedup_mode: geometric = legacy ±jitter_merge_bp span clustering;
-    evidence = EviAnn-style voting — splice-PWM gate on non-anchor introns,
+    """dedup_mode: evidence (default) = EviAnn-style voting — splice-PWM gate on non-anchor introns,
     junction-read corroboration of unique UTR introns, and TPM-ratio test
-    for terminal-span duplicates (no bp-distance threshold anywhere).
+    for terminal-span duplicates (no bp-distance threshold anywhere);
+    geometric = legacy ±jitter_merge_bp span clustering, frozen for
+    reproduction of historical results.
 
     Iso-Seq platform awareness (isoseq_gtf given + isoseq_priority):
     donors structurally matched to the Iso-Seq-only merged assembly carry
