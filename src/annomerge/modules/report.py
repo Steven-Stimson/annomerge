@@ -95,7 +95,10 @@ def _hist(vals: list, bins: int = 40) -> dict:
 
 # ------------------------------------------------------- longest isoform faa
 def longest_isoform_proteins(gff3: Path, genome_fa: Path, out_faa: Path) -> Path:
-    """One protein per gene: longest CDS transcript, translated (table 1)."""
+    """One protein per gene: longest CDS transcript, translated (table 1).
+    Sequence ids are the TRANSCRIPT ids of the chosen isoform (they carry
+    the .tN suffix), so downstream BUSCO/OMArk outputs can be mapped back
+    to both the gene and the exact isoform that was assessed."""
     if lazy([out_faa], desc="longest-isoform proteins"):
         return out_faa
     from .sanity import _translate_cds
@@ -108,11 +111,11 @@ def longest_isoform_proteins(gff3: Path, genome_fa: Path, out_faa: Path) -> Path
             continue
         L = sum(c.end - c.start + 1 for c in tx.cds)
         if tx.gid not in best or L > best[tx.gid][0]:
-            best[tx.gid] = (L, tx)
+            best[tx.gid] = (L, tid)
     with open(out_faa, "w") as fh:
-        for gid, (_, tx) in sorted(best.items()):
-            prot = _translate_cds(genome, tx).rstrip("*")
-            fh.write(f">{gid}\n")
+        for gid, (_, tid) in sorted(best.items()):
+            prot = _translate_cds(genome, txs[tid]).rstrip("*")
+            fh.write(f">{tid}\n")
             for i in range(0, len(prot), 60):
                 fh.write(prot[i:i + 60] + "\n")
     log.info("longest-isoform proteins: %d genes -> %s", len(best), out_faa)
@@ -224,6 +227,57 @@ def _pkg_version(dist: str) -> str | None:
         return None
 
 
+def _tool_version_via_exe(exe: str) -> str | None:
+    """Version of a tool installed in a SEPARATE environment (addressed via
+    its *_HOME env var): resolve the executable through the dependency
+    registry and parse ``--version``. None when unresolvable."""
+    try:
+        path = which(exe)
+    except Exception:
+        return None
+    for flag in ("--version", "-version", "-v"):
+        v = _probe_version([path, flag])
+        if v:
+            return v
+    return None
+
+
+def _busco_version() -> str:
+    """BUSCO version, in probe order:
+    1. ``busco --version`` run in a writable temp cwd (a plain probe in the
+       current cwd dies on read-only mounts because BUSCO writes logs);
+    2. the conda-meta record of the resolved installation (offline-safe);
+    3. version token in the resolved path; 4. importlib metadata."""
+    try:
+        exe = which("busco")
+    except Exception:
+        exe = None
+    if exe:
+        import subprocess, tempfile, json as _json
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                p = subprocess.run([exe, "--version"], capture_output=True,
+                                   text=True, timeout=120, cwd=td)
+            m = re.search(r"BUSCO\s+(\d+\.\d+(?:\.\d+)?)",
+                          p.stdout + "\n" + p.stderr)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+        try:
+            meta = Path(exe).resolve().parent.parent / "conda-meta"
+            for j in sorted(meta.glob("busco-*.json")):
+                v = _json.loads(j.read_text()).get("version")
+                if v:
+                    return v
+        except Exception:
+            pass
+        m = re.search(r"busco[/\\](\d+\.\d+(?:\.\d+)?)", exe)
+        if m:
+            return m.group(1)
+    return _pkg_version("busco") or "unknown"
+
+
 def software_versions() -> dict:
     """Versions of the tools the pipeline invoked, probed from the resolved
     executables (fixed: gffcompare/hisat2 print to stderr, EVM/TransDecoder
@@ -299,18 +353,14 @@ def software_versions() -> dict:
         except Exception:
             evm_v = None
     rows.append(("EVidenceModeler", evm_v or "unknown"))
-    # BUSCO: `busco --version` writes logs and dies on read-only mounts;
-    # derive the version from the resolved installation path instead.
-    busco_v = None
-    try:
-        m = re.search(r"busco[/\\](\d+\.\d+(?:\.\d+)?)", which("busco"))
-        if m:
-            busco_v = m.group(1)
-    except Exception:
-        pass
-    rows.append(("BUSCO", busco_v or _pkg_version("busco") or "unknown"))
-    rows.append(("OMArk", _pkg_version("omark") or "not installed"))
-    rows.append(("OMAmer", _pkg_version("omamer") or "not installed"))
+    rows.append(("BUSCO", _busco_version()))
+    # OMArk/OMAmer often live in a dedicated env (OMARK_HOME/OMAMER_HOME):
+    # resolve the executable and probe --version; importlib only sees the
+    # pipeline's own env and would falsely report "not installed"
+    rows.append(("OMArk", _tool_version_via_exe("omark")
+                 or _pkg_version("omark") or "not installed"))
+    rows.append(("OMAmer", _tool_version_via_exe("omamer")
+                 or _pkg_version("omamer") or "not installed"))
     return {"rows": rows}
 
 
@@ -1107,24 +1157,13 @@ def _elapsed_str(start_iso: str, end_dt) -> str:
 
 def final_sequences(final_gff3: Path, genome_fa: Path, out_dir: Path) -> dict:
     """09.result deliverables: annomerge.gff (full annotation),
-    annomerge.pep / annomerge.cds (one representative isoform per gene:
-    longest CDS)."""
+    annomerge.pep / annomerge.cds (ALL transcripts, ids = GFF transcript
+    ids which carry the .tN isoform suffix)."""
     import shutil
     res = {}
     gff_out = Path(out_dir) / "annomerge.gff"
     shutil.copy2(final_gff3, gff_out)
     res["gff"] = gff_out
-    # representative isoform per gene = longest CDS
-    _, txs, order = _parse_gff3(Path(final_gff3))
-    best: dict = {}
-    for tid in order:
-        tx = txs[tid]
-        if not tx.cds:
-            continue
-        L = sum(c.end - c.start + 1 for c in tx.cds)
-        if tx.gid not in best or L > best[tx.gid][0]:
-            best[tx.gid] = (L, tid)
-    keep = {tid for _, tid in best.values()}
     gffread = which("gffread")
     tmp_pep = Path(out_dir) / ".annomerge.all.pep.fa"
     tmp_cds = Path(out_dir) / ".annomerge.all.cds.fa"
@@ -1135,18 +1174,16 @@ def final_sequences(final_gff3: Path, genome_fa: Path, out_dir: Path) -> dict:
         out_fa = Path(out_dir) / name
         n = 0
         with open(tmp) as fh, open(out_fa, "w") as out:
-            take = False
             for ln in fh:
                 if ln.startswith(">"):
+                    # normalize the header to the bare transcript id
                     rid = ln[1:].split()[0]
-                    take = rid in keep
-                    if take:
-                        n += 1
-                        out.write(f">{rid}\n")
-                elif take:
+                    n += 1
+                    out.write(f">{rid}\n")
+                else:
                     out.write(ln)
         res[name.split(".", 1)[1]] = out_fa
-        log.info("%s: %d representative sequences -> %s", name, n, out_fa)
+        log.info("%s: %d transcript sequences -> %s", name, n, out_fa)
     tmp_pep.unlink(missing_ok=True)
     tmp_cds.unlink(missing_ok=True)
     return res
@@ -1168,8 +1205,10 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
     tracker.note("collecting stats")
     ctx["gene_set"] = gene_set_stats(final_gff3)
     ctx["evidence"] = evidence_distribution(assess / "confidence.tsv")
+    # the longest-isoform proteome is an assessment INPUT (BUSCO/OMArk run
+    # on it), not a deliverable: keep it under 08.assessment
     faa = longest_isoform_proteins(final_gff3, genome_fa,
-                                   d / "longest_isoforms.faa")
+                                   assess / "longest_isoforms.faa")
     if busco_lineage and Path(busco_lineage).exists():
         ctx["busco"] = busco_proteins(faa, busco_lineage, assess / "busco",
                                       threads)

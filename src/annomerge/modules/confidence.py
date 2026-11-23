@@ -731,10 +731,36 @@ def annotate_orthodb_support(gff3: Path, assess_dir: Path,
                             hog_of[f[0]] = f[1]
     if not busco_genes and not omark_genes:
         return {"busco_supported": 0, "omark_supported": 0, "applied": False}
+    # protein ids in the assessment outputs are TRANSCRIPT ids (the
+    # longest-isoform proteome is keyed by transcript id, with the .tN
+    # suffix); map them to gene ids via the final GFF3's mRNA rows. Ids
+    # already equal to a gene id (legacy gene-keyed caches) pass through.
+    lines = Path(gff3).read_text().splitlines()
+    tx2gene: dict = {}
+    for ln in lines:
+        p = ln.split("\t")
+        if len(p) < 9 or p[2] not in ("mRNA", "transcript"):
+            continue
+        mid = re.search(r"ID=([^;]+)", p[8])
+        par = re.search(r"Parent=([^;]+)", p[8])
+        if mid and par:
+            tx2gene[mid.group(1)] = par.group(1).split(",")[0]
+    if tx2gene:
+        def _remap(d: dict) -> dict:
+            out: dict = {}
+            for k, v in d.items():
+                g = tx2gene.get(k, k)
+                if isinstance(v, set):
+                    out.setdefault(g, set()).update(v)
+                else:
+                    out.setdefault(g, v)
+            return out
+        busco_genes = _remap(busco_genes)
+        omark_genes = _remap(omark_genes)
+        hog_of = _remap(hog_of)
     lineage_name = Path(busco_lineage).name if busco_lineage else None
     db_name = Path(omark_db).name if omark_db else None
     old = {"BUSCO_support", "BUSCO_group", "OMArk_support", "OMArk_HOG"}
-    lines = Path(gff3).read_text().splitlines()
     n_b = n_o = 0
     out = []
     for ln in lines:

@@ -356,19 +356,24 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
 
 
 def _write_stringtie_gtf(src: Path, dst: Path) -> None:
-    """Copy the StringTie GTF without its 'transcript' rows.
-
+    """Copy the StringTie GTF without its 'transcript' rows OR any comment
+    lines.
     igv.js renders the GTF transcript row as a feature of its own, so every
     transcript occupied TWO rows (the transcript span plus its exons).
     With only exon rows left, igv synthesizes one feature per transcript_id
     and draws exons + introns on a single row.
-    """
+    Comment lines must be dropped too: a '##gff-version 3' header (written
+    by stringtie --merge) makes igv.js switch the track decoder from GTF
+    (space-separated attributes) to GFF3 ('='-separated) mode; the
+    transcript_id attribute then fails to parse, exons cannot be grouped
+    into transcripts and every exon renders as an isolated solid block
+    instead of a dashed-outline box with intron arrows."""
     n_drop = 0
     kept: list = []
     with open(src) as fh:
         for line in fh:
             if line.startswith("#"):
-                kept.append(line)
+                n_drop += 1
                 continue
             f = line.split("\t")
             if len(f) >= 3 and f[2] == "transcript":
@@ -379,7 +384,7 @@ def _write_stringtie_gtf(src: Path, dst: Path) -> None:
     # older viewer data dir), where open(dst, "w") would truncate the input
     with open(dst, "w") as out:
         out.writelines(kept)
-    log.info("viewer: stringtie.gtf transcript rows dropped: %d", n_drop)
+    log.info("viewer: stringtie.gtf transcript/comment rows dropped: %d", n_drop)
 
 
 def _protein_accession(attrs: str) -> str:
@@ -536,8 +541,11 @@ def _tabix_bundle(src: Path, data_dir: Path, preset: str) -> tuple | None:
             with open(src) as fh:
                 for line in fh:
                     (header if line.startswith("#") else body).append(line)
-            if preset == "gff" and not any(l.startswith("##gff-version")
-                                           for l in header):
+            # do NOT inject a gff-version header into GTF sources: igv.js
+            # would switch their decoder to GFF3 mode and break attribute
+            # parsing (see _write_stringtie_gtf)
+            if preset == "gff" and src.suffix.lower() != ".gtf" \
+                    and not any(l.startswith("##gff-version") for l in header):
                 header.insert(0, "##gff-version 3\n")
             def key(ln):
                 f = ln.split("\t")

@@ -260,7 +260,9 @@ function tierColorFn(feature) {
     }
   } catch (e) { /* ignore */ }
   if (id) {
-    const gid = String(id).replace(/\.\d+$/, "");
+    // strip an isoform suffix first (.t1/.t2/...), then a plain version
+    // suffix (.1): "NC_003070.9.g123.t1" -> "NC_003070.9.g123"
+    const gid = String(id).replace(/\.t\d+$/, "").replace(/\.\d+$/, "");
     const g = geneMap.get(gid);
     if (g && TIER_COLORS[g.tier]) return TIER_COLORS[g.tier];
   }

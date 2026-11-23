@@ -15,7 +15,7 @@ import logging
 import re
 from pathlib import Path
 
-from ..utils import ensure_dir, run, which
+from ..utils import ensure_dir, run, which, ToolError
 
 log = logging.getLogger("annomerge")
 
@@ -110,13 +110,15 @@ def parse_omark_summary(txt: str, db: Path, version: str) -> dict:
 
 
 def _resolve_exe(name: str) -> str | None:
-    """Find an omark/omamer executable: PATH first, then the bin/ directory
-    sitting next to an importable omamer package (pip --target style installs
-    put the console scripts there without touching PATH)."""
-    import shutil
-    exe = shutil.which(name)
-    if exe:
-        return exe
+    """Find an omark/omamer executable: the dependency registry first
+    (OMARK / OMARK_HOME / OMAMER / OMAMER_HOME env vars, then PATH — same
+    resolution as deps.check_all so validation and runtime agree), then the
+    bin/ directory sitting next to an importable omamer package (pip
+    --target style installs put the console scripts there)."""
+    try:
+        return which(name)
+    except ToolError:
+        pass
     try:
         import omamer  # noqa: F401
         cand = Path(omamer.__file__).resolve().parent.parent / "bin" / name
@@ -169,20 +171,25 @@ def run_omark(faa: Path, db: Path, out_dir: Path, threads: int,
             summaries = []
     if not summaries:
         tsv = bdir / "omamer_hits.tsv"
-        if not tsv.exists():
-            # omamer 2.x CLI: -o/--out 无长形式, 线程参数是 -t (0..48)
-            run([omamer_exe, "search", "-d", str(db),
-                 "-q", str(faa), "-o", str(tsv),
-                 "-t", str(threads)],
-                desc="omamer search (OMArk)")
-        # omark 0.3.x CLI: -o 是输出目录(非文件前缀), 无线程参数(-t 是 TAXID)
-        cmd = [omark_exe, "-f", str(tsv), "-d", str(db), "-o", str(bdir)]
-        if isoform_file:
-            cmd += ["-i", str(isoform_file)]
-        if extra_opts:
-            import shlex
-            cmd += shlex.split(extra_opts)
-        run(cmd, desc="omark assessment")
+        try:
+            if not tsv.exists():
+                # omamer 2.x CLI: -o/--out 无长形式, 线程参数是 -t (0..48)
+                run([omamer_exe, "search", "-d", str(db),
+                     "-q", str(faa), "-o", str(tsv),
+                     "-t", str(threads)],
+                    desc="omamer search (OMArk)")
+            # omark 0.3.x CLI: -o 是输出目录(非文件前缀), 无线程参数(-t 是 TAXID)
+            cmd = [omark_exe, "-f", str(tsv), "-d", str(db), "-o", str(bdir)]
+            if isoform_file:
+                cmd += ["-i", str(isoform_file)]
+            if extra_opts:
+                import shlex
+                cmd += shlex.split(extra_opts)
+            run(cmd, desc="omark assessment")
+        except ToolError as e:
+            # degrade gracefully like a missing install: the report shows the
+            # failure note instead of aborting the whole result step
+            return {"ok": False, "error": f"OMArk run failed: {e}"}
         summaries = list(bdir.glob("*.sum"))
         args_rec.write_text(cur_args)
     if not summaries:
