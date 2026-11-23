@@ -207,6 +207,11 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     # ---- Iso-Seq platform layer -----------------------------------------
     iso_donors = _parse_isoseq_gtf(isoseq_gtf) \
         if (isoseq_priority and isoseq_gtf) else []
+    if iso_donors:
+        cov_checker = _CovChecker(coverage_bams)
+        iso_donors = _screen_isoseq(iso_donors, genome, cov_checker,
+                                    isoseq_cov_cliff, stats)
+        stats["isoseq_screened_kept"] = len(iso_donors)
     iso_idx = _iso_index(iso_donors) if iso_donors else {}
     if iso_donors:
         stats["isoseq_donors"] = len(iso_donors)
@@ -400,8 +405,14 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
             gene.isoforms.append(orf)
             used_donors.add(key)
             stats["isoform_as"] += 1
-        # near-duplicate (assembly jitter) collapse BEFORE isoform building
-        if dedup_mode == "evidence":
+        # near-duplicate (assembly jitter) collapse BEFORE isoform building;
+        # mixed-platform candidate lists go through the platform-aware path
+        if any(c[1].get("platform") == "isoseq" for c in utr_cands):
+            kept, n_merged = _dedup_platform(
+                utr_cands, dedup_mode, st_tpms, genome, pwm, pwm_gate, junc,
+                tpm_ratio, min_tpm, (cs, ce), stats, isoseq_tol_bp,
+                isoseq_fl_min)
+        elif dedup_mode == "evidence":
             kept, n_merged = _dedup_evidence(utr_cands, st_tpms, genome, pwm,
                                              pwm_gate, junc, tpm_ratio, min_tpm,
                                              (cs, ce), stats)
@@ -438,9 +449,10 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     genes.extend(l2_gene_list)
     genes.extend(l3_gene_list)
 
-    # ---------------- UTR backfill (tier1 StringTie, tier2 de novo)
+    # ---------------- UTR backfill (tier0 Iso-Seq, tier1 StringTie, tier2 de novo)
     st_donors = _parse_stringtie_chains(stringtie_gtf)
-    _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, cores)
+    _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, cores,
+                   iso_donors=iso_donors)
 
     # -------- collapse same-exon-chain ORF shadows (AFTER backfill) ---------
     # Backfill rebuilds the anchor's exon chain from the same StringTie pool
@@ -477,6 +489,9 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
     # carries no splicing diversity.  geometric mode folds those within
     # +-jitter_merge_bp on both ends; evidence mode folds those whose donor
     # TPM fails the TPM-ratio test against the gene donor pool (no bp distance).
+    # Iso-Seq-sourced isoforms ignore both abundance tests: they fold only
+    # when their (trusted) boundaries lie within isoseq_tol_bp of the anchor
+    # — beyond tolerance they are full-length-supported alternative TSS/TES.
     TPM_RE = re.compile(r"donor_tpm=([\d.eE+-]+)")
     for gene in l1_genes.values():
         if len(gene.isoforms) < 2:
@@ -491,8 +506,17 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
             if _chain_introns(tx.exons) != ai_anc:
                 kept.append(tx)
                 continue
-            if dedup_mode == "evidence":
-                m = TPM_RE.search(getattr(tx.mrna, "attrs", "") or "")
+            _attrs = getattr(tx.mrna, "attrs", "") or ""
+            if "donor_platform=isoseq" in _attrs or \
+                    "utr_source=isoseq" in _attrs:
+                fold = (abs(tx.mrna.start - anc.mrna.start) <= isoseq_tol_bp
+                        and abs(tx.mrna.end - anc.mrna.end) <= isoseq_tol_bp)
+                if fold:
+                    stats["isoseq_folded_into_anchor"] += 1
+                else:
+                    stats["isoseq_alt_boundary_kept"] += 1
+            elif dedup_mode == "evidence":
+                m = TPM_RE.search(_attrs)
                 t = float(m.group(1)) if m else 0.0
                 fold = t < thr_tpm
             else:
@@ -532,7 +556,9 @@ def run_augment(vi, out_dir: Path, evm_gff3: Path, goldset_gff: Path,
 
 def _build_utr_isoform(anc, group, lo, hi, tpm: float = 0.0):
     """New Tx: CDS = anchor's, exon chain = donor's clipped to [lo,hi].
-    donor_tpm is carried in mRNA attrs for the evidence-mode fold test."""
+    donor_tpm is carried in mRNA attrs for the evidence-mode fold test;
+    donor_platform/fl let the post-backfill fold treat Iso-Seq-sourced
+    boundaries as trusted evidence instead of abundance."""
     from .sanity import Tx, Feat
     cs, ce = _cds_span(anc)
     exons = []
@@ -542,9 +568,15 @@ def _build_utr_isoform(anc, group, lo, hi, tpm: float = 0.0):
             exons.append(Feat(x.seqid, "goldset", "exon", s, e, ".", x.strand, ".", ""))
     if not exons or exons[0].start > cs or exons[-1].end < ce:
         return None
+    plat = group.get("platform", "short")
+    iso = group.get("iso")
+    src = "isoseq" if plat == "isoseq" else "stringtie"
+    attrs = (f"utr_source={src};donor_tpm={tpm};donor_platform={plat}"
+             f";fl={(iso.cov if iso else 0):g}")
+    if group.get("_corroborated"):
+        attrs += ";corroborated_by=illumina"
     mrna = Feat(anc.mrna.seqid, "aug", "mRNA", exons[0].start, exons[-1].end,
-                ".", anc.mrna.strand, ".",
-                f"utr_source=stringtie;donor_tpm={tpm}")
+                ".", anc.mrna.strand, ".", attrs)
     return Tx("", "", mrna, exons, list(anc.cds))
 
 
@@ -652,6 +684,187 @@ def _iso_match(idx: dict, seqid: str, strand: str, introns: tuple,
             if best is None or d.cov > best.cov:
                 best = d
     return best
+class _CovChecker:
+    """Windowed Illumina coverage for Iso-Seq boundary corroboration.
+    Lazily opens coverage BAMs (short-read only — long-read depth is too
+    sparse for cliff detection); mean depth over small windows via
+    pysam.count_coverage (C-level).  Disabled (None bams) -> all checks
+    pass, screening degrades to the priming test only."""
+
+    def __init__(self, bams):
+        import pysam
+        self._pysam = pysam
+        self._bams = list(bams or [])
+        self._af = {}
+
+    def _open(self, bam):
+        if bam not in self._af:
+            self._af[bam] = self._pysam.AlignmentFile(str(bam), "rb")
+        return self._af[bam]
+
+    def mean_depth(self, seqid, start, end) -> float:
+        """1-based inclusive [start,end]; 0.0 when disabled or off-contig."""
+        if not self._bams or end < start or end - start + 1 <= 0:
+            return 0.0
+        total = 0
+        for bam in self._bams:
+            af = self._open(bam)
+            if seqid not in af.references:
+                continue
+            s = max(0, start - 1)
+            e = min(af.get_reference_length(seqid), end)
+            if e <= s:
+                continue
+            cov = af.count_coverage(seqid, s, e)
+            total += sum(sum(ch) for ch in cov)
+        return total / (end - start + 1)
+
+    def boundary_truncated(self, seqid, pos, kind: str, win: int = 40,
+                           cliff: float = 0.5) -> bool:
+        """True when Illumina coverage continues past the Iso-Seq boundary
+        (=> the molecule is truncated, not a real transcript end).
+        kind='tss': outside=[pos-win,pos) vs inside=[pos,pos+win);
+        kind='tes': inside=[pos-win,pos) vs outside=[pos,pos+win)."""
+        if not self._bams:
+            return False
+        if kind == "tss":
+            out_d = self.mean_depth(seqid, pos - win, pos - 1)
+            in_d = self.mean_depth(seqid, pos, pos + win - 1)
+        else:
+            in_d = self.mean_depth(seqid, pos - win + 1, pos)
+            out_d = self.mean_depth(seqid, pos + 1, pos + win)
+        if in_d <= 0:
+            return False          # no Illumina evidence at all: no opinion
+        return out_d >= cliff * in_d
+def _priming_artifact(genome: dict, seqid: str, strand: str, span,
+                      win: int = 20) -> bool:
+    """Internal-priming (false polyA/TES) check: the genomic window just
+    downstream of the Iso-Seq TES is A-rich (polyA tail primed inside the
+    transcript at an A-rich stretch).  For '-' strand the TES is the span
+    start and the poly-A equivalent is a T-rich window upstream on the
+    plus strand.  Rule: longest A(T)-run >= 6 or A(T) fraction >= 0.6."""
+    seq = genome.get(seqid)
+    if not seq:
+        return False
+    s, e = span
+    if strand == "-":
+        frag = seq[max(0, s - 1 - win):s - 1].upper()
+        base = "T"
+    else:
+        frag = seq[e:e + win].upper()
+        base = "A"
+    if not frag:
+        return False
+    run = best = 0
+    n = 0
+    for ch in frag:
+        if ch == base:
+            run += 1
+            n += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return best >= 6 or (len(frag) > 0 and n / len(frag) >= 0.6)
+def _screen_isoseq(donors: list, genome: dict, cov: _CovChecker,
+                   cov_cliff: float, stats: Counter) -> list:
+    """Tier0 admission screening: demote Iso-Seq donors whose boundaries
+    are classic artifacts (internal priming / RTS-degradation truncation)
+    BEFORE they can privilege any goldset group or backfill chain."""
+    kept = []
+    for d in donors:
+        if _priming_artifact(genome, d.seqid, d.strand, d.span):
+            stats["isoseq_demoted_priming"] += 1
+            continue
+        tss, tes = (d.span[1], d.span[0]) if d.strand == "-" \
+            else (d.span[0], d.span[1])
+        if cov.boundary_truncated(d.seqid, tss, "tss", cliff=cov_cliff) or \
+                cov.boundary_truncated(d.seqid, tes, "tes", cliff=cov_cliff):
+            stats["isoseq_demoted_coverage"] += 1
+            continue
+        kept.append(d)
+    return kept
+def _dedup_platform(cands, mode, tpms, genome, pwm, pwm_gate, junc,
+                    tpm_ratio, min_tpm, cds_span, stats, isoseq_tol_bp,
+                    fl_min):
+    """UTR-donor dedup for MIXED-platform candidate lists (at least one
+    Iso-Seq donor).  Same skeleton as the pure-short paths (gates -> cluster
+    by UTR-intron signature -> representative + fold) with three platform
+    rules on top:
+      1. Iso-Seq donors with cov >= fl_min skip the junction vote (the
+         molecule itself corroborates every intron it spans); the PWM gate
+         still applies to them (motif legitimacy is platform-independent).
+      2. Representative preference: an Iso-Seq donor (highest cov) always
+         wins the cluster over short donors (highest TPM) — full-length
+         boundaries outrank abundance.
+      3. Cross-platform folding never uses TPM: a member folds into the
+         representative iff BOTH boundaries lie within isoseq_tol_bp (same
+         biological transcript; isoseq boundaries kept, short member becomes
+         corroboration).  Members beyond tolerance survive as candidate
+         alternative TSS/polyA isoforms regardless of abundance.
+    cands: [(key, group, (ds,de), dintrons), ...]; returns (kept, n_merged).
+    """
+    cs, ce = cds_span
+    n0 = len(cands)
+    if not cands:
+        return [], 0
+    gated = []
+    for key, g, dspan, din in cands:
+        iso = g.get("iso")
+        strong_iso = iso is not None and iso.cov >= fl_min
+        if mode == "evidence":
+            jj = None if strong_iso else junc   # junction-vote exemption
+            if not _donor_gates_pass(g, din, (), cs, ce, genome, pwm,
+                                     pwm_gate, jj, stats, "donor"):
+                continue
+        gated.append((key, g, dspan, din))
+    by_sig: dict = {}
+    for c in gated:
+        by_sig.setdefault(_utr_introns(c[3], cs, ce), []).append(c)
+    kept = []
+    for sig, members in by_sig.items():
+        iso_members = [c for c in members if c[1].get("platform") == "isoseq"]
+        if not iso_members:
+            # pure short cluster: identical to the legacy single-platform
+            # fold (geometric: jitter vs rep; evidence: TPM-ratio vs rep)
+            rep = max(members, key=lambda c: (tpms.get(c[0], 0.0),
+                                              c[2][1] - c[2][0]))
+            rep_tpm = tpms.get(rep[0], 0.0)
+            for c in members:
+                if c is rep:
+                    kept.append(c)
+                    continue
+                if mode == "evidence":
+                    fold = tpms.get(c[0], 0.0) < max(min_tpm,
+                                                     tpm_ratio * rep_tpm)
+                else:
+                    fold = (abs(c[2][0] - rep[2][0]) < JITTER_MERGE_BP
+                            and abs(c[2][1] - rep[2][1]) < JITTER_MERGE_BP)
+                if fold:
+                    stats["donor_tpm_ratio_merged" if mode == "evidence"
+                          else "donor_jitter_merged"] += 1
+                else:
+                    kept.append(c)
+            continue
+        rep = max(iso_members, key=lambda c: (c[1]["iso"].cov,
+                                              c[2][1] - c[2][0]))
+        for c in members:
+            if c is rep:
+                kept.append(c)
+                continue
+            close = (abs(c[2][0] - rep[2][0]) <= isoseq_tol_bp
+                     and abs(c[2][1] - rep[2][1]) <= isoseq_tol_bp)
+            if c[1].get("platform") == "isoseq":
+                if close:                    # same molecule, jitter ends
+                    stats["isoseq_self_merged"] += 1
+                else:                        # FL-supported alt boundary
+                    kept.append(c)
+                continue
+            if close:                        # short corroboration, not rival
+                rep[1]["_corroborated"] = True
+                stats["isoseq_short_corroborated"] += 1
+            else:                            # possible APA from short reads
+                kept.append(c)
+    return kept, n0 - len(kept)
 
 
 def _parse_stringtie_tpm(gtf: Path) -> dict:
@@ -794,11 +1007,14 @@ def _merge_jitter(cands: list, tpms: dict, thr: int) -> tuple[list, int]:
     return kept, len(cands) - len(kept)
 
 
-def _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, cores):
-    """For UTR-less transcripts extend exons from tier1 StringTie then tier2
-    de novo donors (internal introns must match CDS exactly).
+def _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, cores,
+                   iso_donors=None):
+    """For UTR-less transcripts extend exons from tier0 Iso-Seq (when given),
+    then tier1 StringTie, then tier2 de novo donors (internal introns must
+    match CDS exactly).  Iso-Seq chains are pre-screened (priming/truncation)
+    and carry full-length boundary evidence, so they are tried first.
 
-    Performance: both donor pools are pre-indexed by (seqid, strand) with
+    Performance: all donor pools are pre-indexed by (seqid, strand) with
     spans sorted for bisect, and tier2 predictor GFFs are parsed ONCE here
     (the old code re-parsed every predictor GFF for every unextended
     transcript — the dominant cost on large genomes). Span pre-filtering
@@ -806,6 +1022,15 @@ def _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, c
     candidate order is restored to the original scan order, so results are
     byte-identical to the naive implementation."""
     from bisect import bisect_right as _br
+    # ---- tier0 index: screened Iso-Seq chains
+    # (seqid, strand) -> [(start, end, seq, chain, din)]
+    iso_idx: dict = {}
+    for _seq, dd in enumerate(iso_donors or []):
+        iso_idx.setdefault((dd.seqid, dd.strand), []).append(
+            (dd.span[0], dd.span[1], _seq, dd.chain, dd.introns))
+    for v in iso_idx.values():
+        v.sort()
+    iso_starts = {k: [iv[0] for iv in v] for k, v in iso_idx.items()}
     # ---- tier1 index: (seqid, strand) -> [(start, end, seq, chain, din)]
     # '.'-stranded donors are queried for both transcription directions.
     st_idx: dict = {}
@@ -845,21 +1070,38 @@ def _backfill_utrs(genes, st_donors, preds, scores, genome, stats, max_extend, c
             cs, ce = _cds_span(tx)
             ai = _cds_introns(tx)
             best = None
+            # tier0: screened Iso-Seq chains (full-length boundaries)
+            if iso_idx:
+                _cand0 = []
+                for _sk in ((tx.mrna.seqid, tx.mrna.strand), (tx.mrna.seqid, ".")):
+                    _bucket = iso_idx.get(_sk, [])
+                    _cand0.extend(
+                        iv for iv in _bucket[:_br(iso_starts.get(_sk, []), cs)]
+                        if iv[1] >= ce)
+                _cand0.sort(key=lambda iv: iv[2])
+                for _, _, _, chain, din in _cand0:
+                    span = (min(s for s, _ in chain), max(e for _, e in chain))
+                    if not _donor_covers(din, span, ai, (cs, ce)):
+                        continue
+                    ext = (cs - span[0]) + (span[1] - ce)
+                    if best is None or ext > best[0]:
+                        best = (ext, "isoseq", chain)
             # tier1: StringTie chains
-            _cand1 = []
-            for _sk in ((tx.mrna.seqid, tx.mrna.strand), (tx.mrna.seqid, ".")):
-                _bucket = st_idx.get(_sk, [])
-                _cand1.extend(
-                    iv for iv in _bucket[:_br(st_starts.get(_sk, []), cs)]
-                    if iv[1] >= ce)
-            _cand1.sort(key=lambda iv: iv[2])   # original st_donors order
-            for _, _, _, chain, din in _cand1:
-                span = (min(s for s, _ in chain), max(e for _, e in chain))
-                if not _donor_covers(din, span, ai, (cs, ce)):
-                    continue
-                ext = (cs - span[0]) + (span[1] - ce)
-                if best is None or ext > best[0]:
-                    best = (ext, "stringtie", chain)
+            if best is None:
+                _cand1 = []
+                for _sk in ((tx.mrna.seqid, tx.mrna.strand), (tx.mrna.seqid, ".")):
+                    _bucket = st_idx.get(_sk, [])
+                    _cand1.extend(
+                        iv for iv in _bucket[:_br(st_starts.get(_sk, []), cs)]
+                        if iv[1] >= ce)
+                _cand1.sort(key=lambda iv: iv[2])   # original st_donors order
+                for _, _, _, chain, din in _cand1:
+                    span = (min(s for s, _ in chain), max(e for _, e in chain))
+                    if not _donor_covers(din, span, ai, (cs, ce)):
+                        continue
+                    ext = (cs - span[0]) + (span[1] - ce)
+                    if best is None or ext > best[0]:
+                        best = (ext, "stringtie", chain)
             # tier2: de novo chains
             if best is None:
                 cand = []
