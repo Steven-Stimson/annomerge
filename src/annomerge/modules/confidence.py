@@ -39,6 +39,7 @@ noncanonical_splice (intron not GT-AG/GC-AG), single_exon, neighbour_overlap
 from __future__ import annotations
 
 import logging
+import math
 import re
 import shutil
 from collections import Counter
@@ -135,112 +136,40 @@ class BedCovRunner:
         self._ran = True
         if not self.bams or shutil.which("samtools") is None:
             return
-        import subprocess
-        import tempfile
-        # group intervals per seqid and merge into super-regions
+        # S11: shard regions into balanced seqid groups and run one depth
+        # pass per shard in a fork pool.  Each shard is an independent
+        # `samtools depth` call, so speedup is near-linear in threads for
+        # multi-chromosome genomes.  Serial path stays for small inputs.
         by_seq: dict[str, list] = {}
-        for seqid, s, e, tag in self.regions:
-            by_seq.setdefault(seqid, []).append((s, e))
-        super_bed: dict[str, list] = {}  # seqid -> merged (s,e)
-        for seqid, ivs in by_seq.items():
-            ivs.sort()
-            merged: list[list] = []
-            for s, e in ivs:
-                if merged and s <= merged[-1][1] + 1:
-                    merged[-1][1] = max(merged[-1][1], e)
-                else:
-                    merged.append([s, e])
-            super_bed[seqid] = merged
-        with tempfile.NamedTemporaryFile("w", suffix=".bed", delete=False) as tf:
-            for seqid, ivs in super_bed.items():
-                for s, e in ivs:
-                    tf.write(f"{seqid}\t{s - 1}\t{e}\n")
-            bed_path = tf.name
-        # -@ threads lets htslib decompress the BAMs' bgzf blocks in parallel
-        # (a real win on large BAMs); the depth stream itself stays single-pass
-        cmd = ["samtools", "depth", "-aa", "-@", str(self.threads),
-               "-b", bed_path, *[str(b) for b in self.bams]]
-        # Stream the per-base depth output line by line: buffering the whole
-        # stdout via subprocess.run(PIPE) (100M+ lines on large genomes)
-        # triples the footprint (bytes + decoded str + splitlines list) and
-        # OOM-kills small containers.
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, bufsize=1 << 20)
-        # attribute each reported base to the interval(s) covering it.
-        # NOTE: keep duplicate intervals (a single-exon transcript's CDS
-        # segment equals its locus span) — one base may serve several tags.
-        from bisect import bisect_right
-        starts: dict[str, list] = {}
-        iv_map: dict[str, list] = {}
-        for seqid, ivs in by_seq.items():
-            srt = sorted(ivs)  # duplicates kept on purpose
-            starts[seqid] = [s for s, _ in srt]
-            iv_map[seqid] = srt
-        results = self._attribute(proc.stdout, starts, iv_map)
-        rc = proc.wait()
-        Path(bed_path).unlink(missing_ok=True)
-        if rc != 0:
-            log.warning("samtools depth failed (rc=%d)", rc)
+        for r in self.regions:
+            by_seq.setdefault(r[0], []).append(r)
+        seqids = sorted(by_seq, key=lambda q: -len(by_seq[q]))
+        n_shards = min(max(1, self.threads), len(seqids))
+        if n_shards <= 1 or len(self.regions) < 5000:
+            self.results = _run_depth_shard(self.regions, self.bams,
+                                            self.min_depth, self.threads)
             return
+        shards: list[list] = [[] for _ in range(n_shards)]
+        loads = [0] * n_shards
+        for q in seqids:
+            i = loads.index(min(loads))
+            shards[i].extend(by_seq[q])
+            loads[i] += len(by_seq[q])
+        jobs = [(sh, self.bams, self.min_depth) for sh in shards if sh]
+        tracker.note("confidence: depth sharded into %d seqid groups "
+                     "(%d regions), threads=%d",
+                     len(jobs), len(self.regions), self.threads)
+        from multiprocessing import get_context
+        results: dict = {}
+        with get_context("fork").Pool(processes=self.threads) as pool:
+            for part in pool.imap_unordered(_depth_shard_worker, jobs,
+                                            chunksize=1):
+                results.update(part)
         self.results = results
 
     def _attribute(self, stream, starts, iv_map):
-        from bisect import bisect_right
-        tag_of: dict[tuple, list] = {}
-        for seqid, s, e, t in self.regions:
-            tag_of.setdefault((seqid, s, e), []).append(t)
-        acc: dict[str, list] = {}
-        nbam = max(1, len(self.bams))
-        # samtools prints positions grouped by seqid — cache the decoded key
-        # and the lookup results instead of decoding every line.
-        last_raw = None
-        seqid = None
-        st = ivs = None
-        for line in stream:
-            f = line.split(b"\t")
-            if len(f) < 3:
-                continue
-            if f[0] != last_raw:
-                last_raw = f[0]
-                seqid = last_raw.decode()
-                st = starts.get(seqid)
-                ivs = iv_map.get(seqid)
-            if st is None:
-                continue
-            pos = int(f[1])
-            # depth = mean across BAMs (previously only the first column was
-            # used, silently ignoring the remaining samples)
-            d = sum(int(x) for x in f[2:2 + nbam]) / nbam
-            i = bisect_right(st, pos) - 1
-            if i < 0:
-                continue
-            # add to every interval containing pos (sorted, may overlap)
-            j = i
-            while j < len(ivs) and ivs[j][0] <= pos:
-                s, e = ivs[j]
-                if pos <= e:
-                    for tag in tag_of.get((seqid, s, e), []):
-                        a = acc.setdefault(tag, [0, 0, 0])
-                        a[1] += 1
-                        a[2] += d
-                        if d >= self.min_depth:
-                            a[0] += 1
-                j += 1
-        out: dict[str, tuple[float, float]] = {}
-        for tag, (ge, tot, dsum) in acc.items():
-            out[tag] = ((ge / tot) if tot else 0.0,
-                        (dsum / tot) if tot else 0.0)
-        # per-transcript CDS rollup: mean of segment cov fracs weighted by len
-        cds_acc: dict[str, list] = {}
-        for tag, (ge, tot, dsum) in acc.items():
-            if "#cds" in tag:
-                tid = tag.rsplit("#cds", 1)[0]
-                a = cds_acc.setdefault(tid, [0, 0])
-                a[0] += ge
-                a[1] += tot
-        for tid, (ge, tot) in cds_acc.items():
-            out[f"{tid}#cds"] = ((ge / tot) if tot else 0.0, 0.0)
-        return out
+        return _attribute_depth(stream, starts, iv_map, self.regions,
+                                max(1, len(self.bams)), self.min_depth)
 
     def locus(self, tag: str) -> tuple[float, float]:
         return self.results.get(tag, (0.0, 0.0))
@@ -248,6 +177,116 @@ class BedCovRunner:
     def cds(self, tag: str) -> float:
         return self.results.get(f"{tag}#cds", (0.0,))[0]
 
+
+
+def _attribute_depth(stream, starts, iv_map, regions, nbam, min_depth):
+    """Attribute a samtools-depth stream to tagged intervals (module-level
+    so fork-pool workers can share the implementation)."""
+    from bisect import bisect_right
+    tag_of: dict[tuple, list] = {}
+    for seqid, s, e, t in regions:
+        tag_of.setdefault((seqid, s, e), []).append(t)
+    acc: dict[str, list] = {}
+    # samtools prints positions grouped by seqid — cache the decoded key
+    # and the lookup results instead of decoding every line.
+    last_raw = None
+    seqid = None
+    st = ivs = None
+    for line in stream:
+        f = line.split(b"\t")
+        if len(f) < 3:
+            continue
+        if f[0] != last_raw:
+            last_raw = f[0]
+            seqid = last_raw.decode()
+            st = starts.get(seqid)
+            ivs = iv_map.get(seqid)
+        if st is None:
+            continue
+        pos = int(f[1])
+        # depth = mean across BAMs (previously only the first column was
+        # used, silently ignoring the remaining samples)
+        d = sum(int(x) for x in f[2:2 + nbam]) / nbam
+        i = bisect_right(st, pos) - 1
+        if i < 0:
+            continue
+        # add to every interval containing pos (sorted, may overlap)
+        j = i
+        while j < len(ivs) and ivs[j][0] <= pos:
+            s, e = ivs[j]
+            if pos <= e:
+                for tag in tag_of.get((seqid, s, e), []):
+                    a = acc.setdefault(tag, [0, 0, 0])
+                    a[1] += 1
+                    a[2] += d
+                    if d >= min_depth:
+                        a[0] += 1
+            j += 1
+    out: dict[str, tuple[float, float]] = {}
+    for tag, (ge, tot, dsum) in acc.items():
+        out[tag] = ((ge / tot) if tot else 0.0,
+                    (dsum / tot) if tot else 0.0)
+    # per-transcript CDS rollup: mean of segment cov fracs weighted by len
+    cds_acc: dict[str, list] = {}
+    for tag, (ge, tot, dsum) in acc.items():
+        if "#cds" in tag:
+            tid = tag.rsplit("#cds", 1)[0]
+            a = cds_acc.setdefault(tid, [0, 0])
+            a[0] += ge
+            a[1] += tot
+    for tid, (ge, tot) in cds_acc.items():
+        out[f"{tid}#cds"] = ((ge / tot) if tot else 0.0, 0.0)
+    return out
+
+
+def _run_depth_shard(regions, bams, min_depth, sam_threads):
+    """One super-region depth pass over a subset of regions (S11 worker
+    body; also the serial path of BedCovRunner.run)."""
+    import subprocess
+    import tempfile
+    by_seq: dict[str, list] = {}
+    for seqid, s, e, tag in regions:
+        by_seq.setdefault(seqid, []).append((s, e))
+    super_bed: dict[str, list] = {}  # seqid -> merged (s,e)
+    for seqid, ivs in by_seq.items():
+        ivs.sort()
+        merged: list[list] = []
+        for s, e in ivs:
+            if merged and s <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        super_bed[seqid] = merged
+    with tempfile.NamedTemporaryFile("w", suffix=".bed", delete=False) as tf:
+        for seqid, ivs in super_bed.items():
+            for s, e in ivs:
+                tf.write(f"{seqid}\t{s - 1}\t{e}\n")
+        bed_path = tf.name
+    cmd = ["samtools", "depth", "-aa", "-@", str(max(1, sam_threads)),
+           "-b", bed_path, *[str(b) for b in bams]]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, bufsize=1 << 20)
+    starts: dict[str, list] = {}
+    iv_map: dict[str, list] = {}
+    for seqid, ivs in by_seq.items():
+        srt = sorted(ivs)  # duplicates kept on purpose
+        starts[seqid] = [s for s, _ in srt]
+        iv_map[seqid] = srt
+    results = _attribute_depth(proc.stdout, starts, iv_map, regions,
+                               max(1, len(bams)), min_depth)
+    rc = proc.wait()
+    Path(bed_path).unlink(missing_ok=True)
+    if rc != 0:
+        log.warning("samtools depth failed (rc=%d)", rc)
+        return {}
+    return results
+
+
+def _depth_shard_worker(job):
+    """Fork worker: one depth pass over a seqid-group shard (sam_threads=1
+    inside workers to avoid CPU oversubscription)."""
+    shard_regions, bams, min_depth = job
+    return _run_depth_shard(shard_regions, bams, min_depth, 1)
 
 # ---------------------------------------------------------------- tiering
 
@@ -269,6 +308,176 @@ def tier_transcript(rna_ok: bool | None, prot_ok: bool,
     return "uncalibrated"
 
 
+def _score_transcript(tid: str, cds_segs: list, single_exon: bool,
+                      ctx: dict) -> dict:
+    """Tier one transcript (S9 dual-platform RNA support).
+
+    The SHORT-platform metric is computed exactly as the pre-split
+    pipeline did; the LONG metric mirrors it against the isoseq junction
+    DB / long-read bams.  Combined RNA support = max(short, long); a
+    transcript counts as RNA-supported when EITHER platform fully supports
+    it (multi-exon: all CDS introns junction-corroborated; single-exon:
+    CDS coverage >= cov_support_min).  Returns {"row", "tier",
+    "rna_reached"} so callers can run under a fork pool (S11).
+    """
+    tx = ctx["txs"][tid]
+    m = tx.mrna
+    introns = [(cds_segs[i][1] + 1, cds_segs[i + 1][0] - 1)
+               for i in range(len(cds_segs) - 1)
+               if cds_segs[i][1] + 1 <= cds_segs[i + 1][0] - 1]
+    cov_frac, mean_depth = ctx["cov"].locus(tid) if ctx["cov"] else (0.0, 0.0)
+    rna_reached = bool(ctx["junc"]) and cov_frac >= ctx["min_cov_frac"]
+    # ---- short-platform RNA support (identical to the pre-split logic)
+    if introns:
+        hits = 0
+        for (s, e) in introns:
+            st = ctx["junc"].get((m.seqid, s, e))
+            if st is not None and (st == "." or st == m.strand):
+                hits += 1
+        short_frac = hits / len(introns)
+        short_ok = hits == len(introns)
+        short_note = f"{hits}/{len(introns)}"
+    elif single_exon and ctx["cov"] is not None:
+        cds_cov = ctx["cov"].cds(tid)
+        short_frac = cds_cov
+        short_ok = cds_cov >= ctx["cov_support_min"]
+        rna_reached = rna_reached or cov_frac >= ctx["min_cov_frac"]
+        short_note = "coverage"
+    else:
+        short_frac = None
+        short_ok = None
+        short_note = "coverage"
+    # ---- long-platform RNA support (Iso-Seq), optional
+    long_frac = long_ok = long_note = None
+    if ctx["has_long"]:
+        lc_frac, _lc_mean = (ctx["cov_long"].locus(tid)
+                             if ctx["cov_long"] else (0.0, 0.0))
+        long_reached = bool(ctx["junc_long"]) and \
+            lc_frac >= ctx["min_cov_frac"]
+        if introns:
+            lhits = 0
+            for (s, e) in introns:
+                st = ctx["junc_long"].get((m.seqid, s, e))
+                if st is not None and (st == "." or st == m.strand):
+                    lhits += 1
+            long_frac = lhits / len(introns)
+            long_ok = lhits == len(introns)
+            long_note = f"{lhits}/{len(introns)}"
+        elif single_exon and ctx["cov_long"] is not None:
+            lcds = ctx["cov_long"].cds(tid)
+            long_frac = lcds
+            long_ok = lcds >= ctx["cov_support_min"]
+            long_reached = long_reached or lc_frac >= ctx["min_cov_frac"]
+            long_note = "coverage"
+        else:
+            long_note = "coverage"
+        rna_reached = rna_reached or long_reached
+    # ---- combined (max across platforms; either platform may carry it)
+    if ctx["has_long"]:
+        _vals = [v for v in (short_frac, long_frac) if v is not None]
+        rna_frac = max(_vals) if _vals else None
+        if short_ok is None and long_ok is None:
+            rna_ok = None
+        else:
+            rna_ok = bool(short_ok) or bool(long_ok)
+        rna_frac_out = f"{rna_frac:.3f}" if rna_frac is not None else "NA"
+        basis_out = f"S:{short_note};L:{long_note}"
+        short_out = f"{short_frac:.3f}" if short_frac is not None else "NA"
+        long_out = f"{long_frac:.3f}" if long_frac is not None else "NA"
+    else:
+        rna_ok = short_ok
+        rna_frac_out = (f"{short_frac:.3f}" if short_frac is not None
+                        else "NA")
+        basis_out = short_note if introns else "coverage"
+    # ---- protein support (relatedness-weighted when protein_weights given)
+    blocks = ctx["pblocks"].get(m.seqid, [])
+    wsum = 0.0
+    n_hit = 0
+    for (s, e) in cds_segs:
+        best_w = 0.0
+        for bs, be, bst, bprot in blocks:
+            if bs <= e and s <= be and (bst == m.strand or bst == "."):
+                if ctx["protein_weights"]:
+                    w = ctx["protein_weights"].get(bprot, 1.0) / 2.0
+                    best_w = max(best_w, w)
+                else:
+                    best_w = 1.0
+                    break
+        if best_w > 0.0:
+            n_hit += 1
+            wsum += best_w
+    if ctx["protein_weights"]:
+        prot_frac = wsum / len(cds_segs)
+    else:
+        prot_frac = n_hit / len(cds_segs)
+    prot_ok = prot_frac >= ctx["prot_support_min"]
+    prot_reached = bool(blocks)
+    # ---- goldset origin
+    gold = _cds_key(tx) in ctx["gold_keys"]
+    # ---- intrinsic flags
+    flags: list[str] = []
+    cds_len = sum(e - s + 1 for s, e in cds_segs)
+    if cds_len // 3 < ctx["min_orf_aa"]:
+        flags.append("short_orf")
+    if len(cds_segs) == 1:
+        flags.append("single_exon")
+    for (s, e) in introns:
+        donor = _subseq(ctx["genome"], m.seqid, s, s + 1, m.strand)
+        acceptor = _subseq(ctx["genome"], m.seqid, e - 1, e, m.strand)
+        if (donor, acceptor) not in (("GT", "AG"), ("GC", "AG")):
+            flags.append("noncanonical_splice")
+            break
+    if tid in ctx["overlap_tids"]:
+        flags.append("neighbour_overlap")
+    notes = ctx["notes_map"].get(tid, [])
+    tier = tier_transcript(rna_ok, prot_ok, rna_reached, prot_reached,
+                           gold, notes)
+    cols = [tx.gid, tid, m.seqid, m.strand, str(m.start), str(m.end),
+            tier, "yes" if gold else "no",
+            rna_frac_out, basis_out,
+            f"{cov_frac:.3f}", f"{mean_depth:.1f}",
+            "yes" if rna_reached else "no",
+            f"{prot_frac:.3f}", f"{n_hit}/{len(cds_segs)}",
+            "yes" if prot_reached else "no",
+            ",".join(notes) if notes else ".",
+            ",".join(flags) if flags else "."]
+    if ctx["has_long"]:
+        cols += [short_out, long_out]
+    return {"row": "\t".join(cols), "tier": tier,
+            "rna_reached": rna_reached}
+
+
+_CONF_CTX = None
+
+
+def _score_chunk_worker(chunk):
+    return [_score_transcript(tid, segs, single, _CONF_CTX)
+            for tid, segs, single in chunk]
+
+
+def _parallel_score(planned: list, ctx: dict, threads: int) -> list:
+    """Run _score_transcript over planned transcripts.  S11: chunked fork
+    pool (chunks follow GFF order; results merged in input order so the
+    output TSV stays byte-identical to the serial run)."""
+    if threads <= 1 or len(planned) < 2000:
+        return [_score_transcript(tid, segs, single, ctx)
+                for tid, segs, single in planned]
+    global _CONF_CTX
+    _CONF_CTX = ctx
+    from multiprocessing import get_context
+    n_chunks = threads * 4
+    per = max(1, math.ceil(len(planned) / n_chunks))
+    chunks = [planned[i:i + per] for i in range(0, len(planned), per)]
+    tracker.note("confidence: pass-2 scoring %d transcripts, %d chunks, "
+                 "threads=%d", len(planned), len(chunks), threads)
+    results: list = []
+    with get_context("fork").Pool(processes=threads) as pool:
+        for part in pool.imap(_score_chunk_worker, chunks, chunksize=1):
+            results.extend(part)
+    _CONF_CTX = None
+    return results
+
+
 def confidence_annotation(gff_in: Path, genome_fa: Path, junctions_bed: Path | None,
                           protein_gff: Path | None, bams: list[Path],
                           goldset_gff: Path | None, sanity_tsv: Path | None,
@@ -278,7 +487,10 @@ def confidence_annotation(gff_in: Path, genome_fa: Path, junctions_bed: Path | N
                           prot_support_min: float = 0.5,
                           min_orf_aa: int = 50,
                           protein_weights: dict | None = None,
-                          threads: int = 1) -> dict:
+                          threads: int = 1,
+                          junctions_isoseq_bed: Path | None = None,
+                          isoseq_bams: list | None = None,
+                          isoseq_min_depth: int = 1) -> dict:
     """Annotate every coding transcript with evidence support and a tier.
 
     protein_weights: {protein_id: relatedness weight} — when given, the
@@ -319,6 +531,18 @@ def confidence_annotation(gff_in: Path, genome_fa: Path, junctions_bed: Path | N
 
     has_cov = bool(bams) and shutil.which("samtools") is not None
     cov = BedCovRunner(bams, min_depth, threads) if has_cov else None
+    # long-read (Iso-Seq) platform metric (S9): junction support from the
+    # isoseq-only junction DB and CDS coverage from long-read bams at a
+    # lower depth threshold (long reads are sparse).  The SHORT metric is
+    # computed exactly as before; with no long-read inputs has_long stays
+    # False and the output is byte-identical.
+    has_long = bool(isoseq_bams) or bool(
+        junctions_isoseq_bed and Path(junctions_isoseq_bed).exists())
+    junc_long = load_junctions(junctions_isoseq_bed) \
+        if (junctions_isoseq_bed and Path(junctions_isoseq_bed).exists()) \
+        else {}
+    cov_long = BedCovRunner(isoseq_bams, isoseq_min_depth, threads) \
+        if (isoseq_bams and shutil.which("samtools") is not None) else None
 
     rows: list[str] = []
     tier_count: Counter = Counter()
@@ -336,110 +560,47 @@ def confidence_annotation(gff_in: Path, genome_fa: Path, junctions_bed: Path | N
             cov.add_locus(tid, tx.mrna.seqid, tx.mrna.start, tx.mrna.end)
             if len(cds_segs) == 1:
                 cov.add_cds(tid, tx.mrna.seqid, cds_segs)
+        if cov_long is not None:
+            cov_long.add_locus(tid, tx.mrna.seqid, tx.mrna.start,
+                               tx.mrna.end)
+            if len(cds_segs) == 1:
+                cov_long.add_cds(tid, tx.mrna.seqid, cds_segs)
     if cov is not None:
         tracker.note("confidence: bedcov over %d regions...", len(cov.regions))
         cov.run()
+    if cov_long is not None:
+        tracker.note("confidence: bedcov (isoseq) over %d regions...",
+                     len(cov_long.regions))
+        cov_long.run()
 
-    # pass 2: tier every transcript
-    for tid, cds_segs, single_exon in planned:
-        tx = txs[tid]
-        m = tx.mrna
-        introns = [(cds_segs[i][1] + 1, cds_segs[i + 1][0] - 1)
-                   for i in range(len(cds_segs) - 1)
-                   if cds_segs[i][1] + 1 <= cds_segs[i + 1][0] - 1]
-        cov_frac, mean_depth = cov.locus(tid) if cov else (0.0, 0.0)
-        rna_reached = bool(junc) and cov_frac >= min_cov_frac
-        if rna_reached:
+    # pass 2: tier every transcript.  Per-transcript scoring is factored
+    # into the module-level _score_transcript; _parallel_score runs it
+    # serially or under a fork pool depending on threads (S11).
+    ctx = {"txs": txs, "junc": junc, "junc_long": junc_long,
+           "cov": cov, "cov_long": cov_long, "has_long": has_long,
+           "min_cov_frac": min_cov_frac, "cov_support_min": cov_support_min,
+           "prot_support_min": prot_support_min, "min_orf_aa": min_orf_aa,
+           "pblocks": pblocks, "protein_weights": protein_weights,
+           "gold_keys": gold_keys, "notes_map": notes_map,
+           "overlap_tids": overlap_tids, "genome": genome}
+    results = _parallel_score(planned, ctx, threads)
+    for r in results:
+        if r["rna_reached"]:
             n_rna_reached += 1
-        if introns:
-            hits = 0
-            for (s, e) in introns:
-                st = junc.get((m.seqid, s, e))
-                if st is not None and (st == "." or st == m.strand):
-                    hits += 1
-            rna_frac = hits / len(introns)
-            rna_ok: bool | None = hits == len(introns)
-            rna_frac_out = f"{rna_frac:.3f}"
-            intron_note = f"{hits}/{len(introns)}"
-        elif single_exon and cov is not None:
-            cds_cov = cov.cds(tid)
-            rna_ok = cds_cov >= cov_support_min
-            rna_frac_out = f"{cds_cov:.3f}"
-            rna_reached = rna_reached or cov_frac >= min_cov_frac
-            intron_note = "coverage"
-        else:
-            rna_ok = None
-            rna_frac_out = "NA"
-            intron_note = "coverage"
-
-        # ---- protein support (relatedness-weighted when protein_weights given)
-        blocks = pblocks.get(m.seqid, [])
-        wsum = 0.0
-        n_hit = 0
-        for (s, e) in cds_segs:
-            best_w = 0.0
-            for bs, be, bst, bprot in blocks:
-                if bs <= e and s <= be and (bst == m.strand or bst == "."):
-                    if protein_weights:
-                        w = protein_weights.get(bprot, 1.0) / 2.0
-                        best_w = max(best_w, w)
-                    else:
-                        best_w = 1.0
-                        break
-            if best_w > 0.0:
-                n_hit += 1
-                wsum += best_w
-        if protein_weights:
-            prot_frac = wsum / len(cds_segs)
-        else:
-            prot_frac = n_hit / len(cds_segs)
-        prot_ok = prot_frac >= prot_support_min
-        prot_reached = bool(blocks)
-
-        # ---- goldset origin
-        gold = _cds_key(tx) in gold_keys
-
-        # ---- intrinsic flags
-        flags: list[str] = []
-        cds_len = sum(e - s + 1 for s, e in cds_segs)
-        if cds_len // 3 < min_orf_aa:
-            flags.append("short_orf")
-        if len(cds_segs) == 1:
-            flags.append("single_exon")
-        for (s, e) in introns:
-            donor = _subseq(genome, m.seqid, s, s + 1, m.strand)
-            acceptor = _subseq(genome, m.seqid, e - 1, e, m.strand)
-            if (donor, acceptor) not in (("GT", "AG"), ("GC", "AG")):
-                flags.append("noncanonical_splice")
-                break
-        if tid in overlap_tids:
-            flags.append("neighbour_overlap")
-
-        notes = notes_map.get(tid, [])
-        tier = tier_transcript(rna_ok, prot_ok, rna_reached, prot_reached,
-                               gold, notes)
-        tier_count[tier] += 1
-        rows.append("\t".join([
-            tx.gid, tid, m.seqid, m.strand, str(m.start), str(m.end),
-            tier, "yes" if gold else "no",
-            rna_frac_out, intron_note if introns else "coverage",
-            f"{cov_frac:.3f}", f"{mean_depth:.1f}",
-            "yes" if rna_reached else "no",
-            f"{prot_frac:.3f}", f"{n_hit}/{len(cds_segs)}",
-            "yes" if prot_reached else "no",
-            ",".join(notes) if notes else ".",
-            ",".join(flags) if flags else ".",
-        ]))
-
+        tier_count[r["tier"]] += 1
+        rows.append(r["row"])
     with open(out_tsv, "w") as fh:
         fh.write("# tiers: " + ", ".join(f"{k}={v}" for k, v in
                                          sorted(tier_count.items())) + "\n")
         fh.write("# rna_reached_loci: %d/%d\n" % (n_rna_reached,
                                                   tier_count.total()))
-        fh.write("gene_id\ttranscript_id\tseqid\tstrand\tstart\tend\ttier\t"
-                 "goldset_origin\trna_support_frac\trna_basis\tlocus_cov_frac\t"
-                 "locus_mean_depth\trna_reached\tprotein_support_frac\t"
-                 "protein_basis\tprotein_reached\tsanity_notes\tintrinsic_flags\n")
+        hdr = ("gene_id\ttranscript_id\tseqid\tstrand\tstart\tend\ttier\t"
+               "goldset_origin\trna_support_frac\trna_basis\tlocus_cov_frac\t"
+               "locus_mean_depth\trna_reached\tprotein_support_frac\t"
+               "protein_basis\tprotein_reached\tsanity_notes\tintrinsic_flags")
+        if has_long:
+            hdr += "\trna_support_short_frac\trna_support_long_frac"
+        fh.write(hdr + "\n")
         fh.write("\n".join(rows) + "\n")
     tracker.note("confidence tiers: %s", dict(tier_count))
     return dict(tier_count)
@@ -461,7 +622,7 @@ _TAG_NOTE_MAP = {
     "ambiguous_cds": "ambiguous-cds",
 }
 _TAG_KEYS = ("Tier", "RNA_support", "Protein_support", "denovo_support",
-             "Flags")
+             "Flags", "RNA_support_short", "RNA_support_long")
 
 
 def annotate_support(gff3: Path, conf_tsv: Path,
@@ -530,6 +691,8 @@ def annotate_support(gff3: Path, conf_tsv: Path,
     gene_rna: dict = {}
     gene_prot: dict = {}
     gene_flags: dict = {}
+    gene_rna_short: dict = {}
+    gene_rna_long: dict = {}
     with open(conf_tsv) as fh:
         for ln in fh:
             if ln.startswith("#") or ln.startswith("gene_id"):
@@ -540,6 +703,9 @@ def annotate_support(gff3: Path, conf_tsv: Path,
             (gid, tid, _seq, _strand, _s, _e, tier, _gold,
              rna, _rb, _cf, _dp, _rr, prot, _pb, _pr, notes, flags) = p[:18]
             tx_info[tid] = {"tier": tier, "rna": rna, "prot": prot}
+            if len(p) >= 20:          # dual-platform columns (S9)
+                tx_info[tid]["rna_short"] = p[18]
+                tx_info[tid]["rna_long"] = p[19]
             if gid not in gene_tier:
                 gene_tier[gid] = tier      # first row = representative
             def _maxfrac(old, new):
@@ -555,6 +721,9 @@ def annotate_support(gff3: Path, conf_tsv: Path,
                     return new
             gene_rna[gid] = _maxfrac(gene_rna.get(gid), rna)
             gene_prot[gid] = _maxfrac(gene_prot.get(gid), prot)
+            if len(p) >= 20:
+                gene_rna_short[gid] = _maxfrac(gene_rna_short.get(gid), p[18])
+                gene_rna_long[gid] = _maxfrac(gene_rna_long.get(gid), p[19])
             fl = set()
             if flags != ".":
                 fl |= {_TAG_FLAG_MAP[f] for f in flags.split(",")
@@ -656,6 +825,8 @@ def annotate_support(gff3: Path, conf_tsv: Path,
             "Protein_support": info["prot"],
             "denovo_support": _dn_str(tx_dn[tid]) if tid in tx_dn else None,
             "Flags": _tx_flags(tid),
+            "RNA_support_short": info.get("rna_short"),
+            "RNA_support_long": info.get("rna_long"),
         })
         lines[i] = "\t".join(p)
         n_tx += 1
@@ -669,6 +840,8 @@ def annotate_support(gff3: Path, conf_tsv: Path,
                               else None,
             "Flags": (",".join(sorted(gene_flags[gid]))
                       if gene_flags.get(gid) else "none"),
+            "RNA_support_short": gene_rna_short.get(gid),
+            "RNA_support_long": gene_rna_long.get(gid),
         })
         lines[i] = "\t".join(p)
         n_gene += 1

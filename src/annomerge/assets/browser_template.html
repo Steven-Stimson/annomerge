@@ -194,11 +194,10 @@
               <option value="mid">0.5–0.8</option>
               <option value="lo">&lt;0.5</option>
             </select></th>
-            <th title="GoldSet origin">GoldSet <select id="flt-gold" class="col-flt" title="Filter by GoldSet origin">
-              <option value="">all</option>
-              <option value="yes">yes</option>
-              <option value="no">no</option>
-            </select></th>
+            <th title="GoldSet origin (gene level)">GoldSet <span class="flag-flt-wrap">
+              <button type="button" id="flt-gold-btn" title="Filter by GoldSet platform origin (gene level; multi-select)">all &#9662;</button>
+              <div id="flt-gold-panel" class="flag-panel"></div>
+            </span></th>
             <th title="Intrinsic flags">Flags <span class="flag-flt-wrap">
               <button type="button" id="flt-flag-btn" title="Filter by intrinsic flags (multi-select; transcript must carry at least one selected flag)">all &#9662;</button>
               <div id="flt-flag-panel" class="flag-panel"></div>
@@ -227,7 +226,12 @@ let currentTier = "all";
 let fltChr = "";
 let fltRna = "";     // "" | hi (>=0.8) | mid (0.5-0.8) | lo (<0.5)
 let fltProt = "";
-let fltGold = "";    // "" | yes | no
+let fltGoldSet = new Set();   // selected gene-level GoldSet origins ("both"|"isoseq"|"short"); empty = no filter
+const GOLD_LABELS = {
+  both: "long-read + short-read",
+  isoseq: "long-read only",
+  short: "short-read only",
+};
 let fltFlags = new Set();   // selected intrinsic flags (multi-select; empty = no flag filter)
 // intrinsic flag value -> human label (mirrors viewer.py _FLAG_MAP)
 const FLAG_LABELS = {
@@ -282,9 +286,7 @@ const TRACKS_EVIDENCE = [
     url: "data/goldset.gff3", color: "__GOLDSET_COLOR__", height: 80,
     visibilityWindow: -1 },
 /*__COVERAGE_TRACK__*/
-  { name: "Transcript Assembly (StringTie)", type: "annotation", format: "gtf",
-    url: "data/stringtie.gtf", color: "__STRINGTIE_COLOR__", height: 50,
-    displayMode: "EXPANDED", visibilityWindow: -1 },
+/*__ASSEMBLY_TRACKS__*/
 /*__PROTEIN_TRACKS__*/
 ];
 let denovoTracks = [];
@@ -443,6 +445,7 @@ async function loadGenes() {
     dl.appendChild(opt);
   }
   buildFlagFilter();
+buildGoldFilter();
   renderTable("");
   const nTx = genes.reduce((n, g) => n + (g.isoforms || []).length, 0);
   document.getElementById("count-info").textContent =
@@ -550,8 +553,9 @@ function renderTable(keyword) {
       if (fltProt === "hi" && pv < 0.8) continue;
       if (fltProt === "mid" && (pv < 0.5 || pv >= 0.8)) continue;
       if (fltProt === "lo" && pv >= 0.5) continue;
-      if (fltGold === "yes" && t.gold !== "yes") continue;
-      if (fltGold === "no" && t.gold === "yes") continue;
+      // GoldSet platform-origin filter (gene level): a transcript row
+      // passes when its GENE's goldset state is among the selected states
+      if (fltGoldSet.size && !fltGoldSet.has(g.goldset)) continue;
       // intrinsic-flag multi-select filter (AND-combined with the filters
       // above). A transcript passes when it carries >= 1 selected flag, or —
       // when the special "no flags" entry is selected — when it carries none.
@@ -602,7 +606,7 @@ function renderTable(keyword) {
       `<td><span class="badge b-${t.tier}">${t.tier}</span></td>` +
       `<td class="${rnaCls}" title="RNA support: ${t.rna_basis}">${t.rna}</td>` +
       `<td class="${protCls}" title="Protein support: ${t.prot_basis}">${t.prot}</td>` +
-      `<td class="${t.gold === "yes" ? "gs-yes" : "gs-no"}" title="GoldSet origin">${t.gold === "yes" ? "✓" : "·"}</td>` +
+      `<td class="${t.gold !== "no" ? "gs-yes" : "gs-no"}" title="GoldSet origin">${t.gold === "isoseq" ? "LR" : t.gold === "short" ? "SR" : t.gold === "both" ? "LR+SR" : "·"}</td>` +
       `<td class="${(t.flags && t.flags.length) ? "flag-yes" : ""}" ` +
       `title="${(t.flags && t.flags.length) ? ("Intrinsic flags (" + t.flags.length + "): " + t.flags.map(f => FLAG_LABELS[f] || f).join(", ")) : "no intrinsic flags"}">` +
       `${(t.flags && t.flags.length) ? t.flags.length : "·"}</td>`;
@@ -641,10 +645,12 @@ function renderDetail(g) {
       <div class="tx-head"><span class="tx-id">${esc(t.tid)}</span>` +
         `<span class="tx-loc">${esc(g.seqid)}:${t.start}-${t.end} (${(t.end - t.start + 1).toLocaleString()} bp)</span>` +
         `<span class="badge b-${t.tier}">${t.tier}</span>` +
-        (t.gold === "yes" ? '<span class="gs-yes" title="GoldSet origin">GoldSet ✓</span>' : "") +
+        (t.gold === "isoseq" ? '<span class="gs-yes" title="GoldSet origin: long-read">GoldSet LR ✓</span>' : "") +
+        (t.gold === "short" ? '<span class="gs-yes" title="GoldSet origin: short-read">GoldSet SR ✓</span>' : "") +
+        (t.gold === "both" ? '<span class="gs-yes" title="GoldSet origin: long-read + short-read">GoldSet LR ✓ SR ✓</span>' : "") +
       `</div>
       <div class="tx-grid">
-        <span class="k">RNA support</span><span class="v ${rnaCls}">${t.rna} <span class="dim">(basis: ${esc(t.rna_basis || "-")}, ${t.rna_reached})</span></span>
+        <span class="k">RNA support</span><span class="v ${rnaCls}">${t.rna}${t.rna_long != null ? ` <span class="dim">(S:${t.rna_short} / L:${t.rna_long})</span>` : ""} <span class="dim">(basis: ${esc(t.rna_basis || "-")}, ${t.rna_reached})</span></span>
         <span class="k">Protein support</span><span class="v ${protCls}">${t.prot} <span class="dim">(basis: ${esc(t.prot_basis || "-")}, ${t.prot_reached})</span></span>
         <span class="k">CDS / Exons</span><span class="v">${t.cds} CDS / ${t.exon} exons</span>
         ${tdn ? `<span class="k">De novo (CDS)</span><span class="v">${tdn}</span>` : ""}
@@ -663,7 +669,25 @@ function renderDetail(g) {
         <span class="k">Gene ID</span><span class="v">${esc(g.gene)}</span>
         <span class="k">Locus</span><span class="v">${esc(g.locus)} (${g.strand})</span>
         <span class="k">Overall tier</span><span class="v"><span class="badge b-${g.tier}">${g.tier}</span></span>
-        <span class="k">GoldSet origin</span><span class="v ${g.goldset === "yes" ? "gs-yes" : "gs-no"}">${g.goldset === "yes" ? "yes" : "no"}</span>
+        <span class="k">GoldSet origin</span><span class="v ${g.goldset !== "no" ? "gs-yes" : "gs-no"}">${GOLD_LABELS[g.goldset] || "no"}</span>
+      </div>
+    </div>
+    <div class="dt-section">
+      <div class="dt-title">Structure</div>
+      <div class="dt-grid">
+        <span class="k">Transcripts</span><span class="v">${g.tx}</span>
+        <span class="k">CDS</span><span class="v">${g.cds}</span>
+        <span class="k">Exons</span><span class="v">${g.exon}</span>
+        <span class="k">Length</span><span class="v">${(g.end - g.start + 1).toLocaleString()} bp</span>
+      </div>
+    </div>
+    <div class="dt-section">
+      <div class="dt-title">Gene list indicators</div>
+      <div class="dt-grid">
+        <span class="k">Transcripts</span><span class="v">${g.tx}</span>
+        <span class="k">RNA</span><span class="v">${g.rna}${g.rna_long != null ? ` <span class="dim">(S:${g.rna_short} / L:${g.rna_long})</span>` : ""}</span>
+        <span class="k">Protein</span><span class="v">${g.prot}</span>
+        <span class="k">Flags</span><span class="v">${marks || '<span class="dt-empty">none</span>'}</span>
       </div>
     </div>
     ${g.busco_support || g.omark_support ? `<div class="dt-section">
@@ -674,33 +698,14 @@ function renderDetail(g) {
       </div>
     </div>` : ""}
     <div class="dt-section">
-      <div class="dt-title">Gene list indicators</div>
-      <div class="dt-grid">
-        <span class="k">Transcripts</span><span class="v">${g.tx}</span>
-        <span class="k">RNA</span><span class="v">${g.rna}</span>
-        <span class="k">Protein</span><span class="v">${g.prot}</span>
-        <span class="k">GoldSet</span><span class="v ${g.goldset === "yes" ? "gs-yes" : "gs-no"}">${g.goldset === "yes" ? "yes ✓" : "no"}</span>
-        <span class="k">Flags</span><span class="v">${marks || '<span class="dt-empty">none</span>'}</span>
-      </div>
+      <div class="dt-title">De novo evidence（CDS coverage）</div>
+      ${denovoRows || '<span class="dt-empty">no de novo predictors</span>'}
     </div>
-    <div class="dt-section">
-      <div class="dt-title">Structure (from final GFF3)</div>
-      <div class="dt-grid">
-        <span class="k">Transcripts</span><span class="v">${g.tx}</span>
-        <span class="k">CDS</span><span class="v">${g.cds}</span>
-        <span class="k">Exons</span><span class="v">${g.exon}</span>
-        <span class="k">Length</span><span class="v">${(g.end - g.start + 1).toLocaleString()} bp</span>
-      </div>
-    </div>
+    ${marks || markDesc ? `<div class="dt-section"><div class="dt-title">Flags</div><div>${marks}${markDesc ? `<div class="warn-line">${esc(markDesc)}</div>` : ""}</div></div>` : ""}
     <div class="dt-section">
       <div class="dt-title">Transcripts (${(g.isoforms || []).length}) — per-transcript metrics</div>
       ${txCards || '<span class="dt-empty">no transcript records</span>'}
     </div>
-    <div class="dt-section">
-      <div class="dt-title">De novo evidence — CDS coverage</div>
-      ${denovoRows || '<span class="dt-empty">no de novo predictors</span>'}
-    </div>
-    ${marks || markDesc ? `<div class="dt-section"><div class="dt-title">Flags / notes</div><div>${marks}${markDesc ? `<div class="warn-line">${esc(markDesc)}</div>` : ""}</div></div>` : ""}
   `;
 }
 function jumpToGene(gid) {
@@ -767,7 +772,47 @@ function bindFilter(id, setter) {
 bindFilter("flt-tier", v => currentTier = v);
 bindFilter("flt-rna", v => fltRna = v);
 bindFilter("flt-prot", v => fltProt = v);
-bindFilter("flt-gold", v => fltGold = v);
+// GoldSet platform-origin filter panel (gene level; built from the states
+// actually present — long-read entries hidden when the run had no Iso-Seq)
+function buildGoldFilter() {
+  const present = new Set(genes.map(g => g.goldset));
+  const panel = document.getElementById("flt-gold-panel");
+  panel.innerHTML = "";
+  const addOpt = (value, text) => {
+    const lab = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.value = value;
+    cb.addEventListener("change", () => {
+      if (cb.checked) fltGoldSet.add(value); else fltGoldSet.delete(value);
+      updateGoldBtn();
+      renderTable(document.getElementById("gene-search").value);
+    });
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(text));
+    panel.appendChild(lab);
+  };
+  for (const k of ["both", "isoseq", "short"]) {
+    if (present.has(k)) addOpt(k, GOLD_LABELS[k]);
+  }
+  const act = document.createElement("div");
+  act.className = "fp-actions";
+  const clr = document.createElement("a");
+  clr.textContent = "clear";
+  clr.addEventListener("click", () => {
+    fltGoldSet.clear();
+    panel.querySelectorAll("input[type=checkbox]").forEach(c => { c.checked = false; });
+    updateGoldBtn();
+    renderTable(document.getElementById("gene-search").value);
+  });
+  act.appendChild(clr);
+  panel.appendChild(act);
+}
+function updateGoldBtn() {
+  const b = document.getElementById("flt-gold-btn");
+  const n = fltGoldSet.size;
+  b.textContent = n ? `${n} origin${n > 1 ? "s" : ""} ▾` : "all ▾";
+  b.classList.toggle("active", n > 0);
+}
 // Flags multi-select: toggle the panel on button click; close on outside click.
 // (selection state lives in fltFlags; it only re-filters via renderTable and
 // never touches sortMode/sortDir, so it cannot disturb the sorters.)
@@ -780,6 +825,14 @@ bindFilter("flt-gold", v => fltGold = v);
   });
   flagPanel.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", () => flagPanel.classList.remove("open"));
+  const goldBtn = document.getElementById("flt-gold-btn");
+  const goldPanel = document.getElementById("flt-gold-panel");
+  goldBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    goldPanel.classList.toggle("open");
+  });
+  goldPanel.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => goldPanel.classList.remove("open"));
 }
 document.getElementById("side-toggle").addEventListener("click", () => {
   document.body.classList.toggle("side-collapsed");

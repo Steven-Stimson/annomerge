@@ -202,10 +202,42 @@ def _denovo_gene_coverage(gff3: Path, genes: list,
     return tx_out, gene_out
 
 
+
+def _goldset_origin_keys(goldset_gff3: Path | None) -> dict:
+    """goldset genome gff3 -> {(seqid, strand, cds_key): 'isoseq'|'short'}.
+    Origin comes from the ;origin=isoseq attribute written by evm.py's
+    lift_goldset; mRNAs without the attribute count as short-read origin.
+    Empty dict when the file is absent (homolog-only runs)."""
+    if not goldset_gff3 or not Path(goldset_gff3).exists():
+        return {}
+    from .confidence import _parse_gff3, _cds_key
+    org_of: dict = {}
+    with open(goldset_gff3) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) >= 9 and f[2] == "mRNA":
+                m = re.search(r"ID=([^;]+)", f[8])
+                if m:
+                    org_of[m.group(1)] = ("isoseq" if "origin=isoseq" in f[8]
+                                          else "short")
+    _, txs, _ = _parse_gff3(Path(goldset_gff3))
+    out: dict = {}
+    for tid, tx in txs.items():
+        if tx.cds:
+            out[_cds_key(tx)] = org_of.get(tid, "short")
+    return out
+
+
 def build_genes_json(confidence_tsv: Path, out_json: Path, *,
                      final_gff3: Path | None = None,
-                     denovo_gff3: dict | None = None) -> int:
-    """Aggregate confidence.tsv -> one viewer record per gene."""
+                     denovo_gff3: dict | None = None,
+                     goldset_gff3: Path | None = None) -> int:
+    """Aggregate confidence.tsv -> one viewer record per gene.
+    goldset_gff3 (S7): when given, per-transcript gold flags are refined
+    to their platform origin ('isoseq'/'short') and the gene badge becomes
+    four-state ('both'/'isoseq'/'short'/'no')."""
     genes: dict = {}
     def _num(x: str) -> float:
         # confidence.tsv uses 'NA' for unavailable evidence (e.g. no RNA run)
@@ -223,14 +255,21 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
             (gid, _tid, seqid, strand, start, end, tier, gold,
              rna_frac, rna_basis, cov_frac, depth, rna_reached,
              prot_frac, prot_basis, prot_reached, sanity, flags) = p[:18]
+            # S10: optional per-platform support columns (Iso-Seq runs)
+            rna_short = p[18] if len(p) > 19 else None
+            rna_long = p[19] if len(p) > 19 else None
             g = genes.setdefault(gid, {
                 "gene": gid, "seqid": seqid, "strand": strand,
                 "start": int(start), "end": int(end), "tier": tier,
                 "iso": 0, "rna": 0.0, "prot": 0.0, "cov": 0.0, "depth": 0.0,
                 "goldset": "no", "rna_reached": "no", "prot_reached": "no",
                 "rna_basis": "", "prot_basis": "",
+                "rna_short": None, "rna_long": None,
                 "flags": set(), "notes": set(), "isoforms": [],
             })
+            if rna_short is not None:
+                g["rna_short"] = max(g["rna_short"] or 0.0, _num(rna_short))
+                g["rna_long"] = max(g["rna_long"] or 0.0, _num(rna_long))
             g["iso"] += 1
             g["start"] = min(g["start"], int(start))
             g["end"] = max(g["end"], int(end))
@@ -271,6 +310,7 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
                 "prot_reached": prot_reached,
                 "cov": f"{_num(cov_frac):.3f}", "depth": _num(depth),
                 "gold": gold, "marks": ",".join(tx_marks),
+                "rna_short": rna_short, "rna_long": rna_long,
                 # machine-readable intrinsic flags (only _FLAG_MAP keys, in
                 # stable sorted order) for the gene-list flag filter; `marks`
                 # above stays the human-readable label string.
@@ -305,6 +345,10 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
             "prot_reached": g["prot_reached"],
             "rna_basis": g["rna_basis"],
             "prot_basis": g["prot_basis"],
+            "rna_short": (f'{g["rna_short"]:.3f}'
+                          if g["rna_short"] is not None else None),
+            "rna_long": (f'{g["rna_long"]:.3f}'
+                         if g["rna_long"] is not None else None),
             "isoforms": g["isoforms"],
             "marks": ",".join(marks),
             "flag_desc": "; ".join(_FLAG_MAP[f] for f in sorted(g["flags"])
@@ -331,6 +375,38 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
                 ce = tx_ce.get(iso["tid"])
                 if ce:
                     iso["cds"], iso["exon"] = ce
+        # S7: goldset platform origin — refine per-transcript gold flags to
+        # 'isoseq'/'short' and the gene badge to a four-state value
+        gold_orig = _goldset_origin_keys(goldset_gff3)
+        if gold_orig:
+            for r in out:
+                has_lr = has_sr = False
+                for iso in r["isoforms"]:
+                    if iso["gold"] != "yes":
+                        iso["gold"] = "no"
+                        continue
+                    key = (r["seqid"], r["strand"],
+                           tuple(sorted(tx_cds_iv.get(iso["tid"], []))))
+                    org = gold_orig.get(key, "short")
+                    iso["gold"] = org
+                    if org == "isoseq":
+                        has_lr = True
+                    else:
+                        has_sr = True
+                r["goldset"] = ("both" if has_lr and has_sr else
+                                "isoseq" if has_lr else
+                                "short" if has_sr else "no")
+        else:
+            # short-only / no-origin runs: yes -> short, gene badge short|no
+            for r in out:
+                any_yes = False
+                for iso in r["isoforms"]:
+                    if iso["gold"] == "yes":
+                        iso["gold"] = "short"
+                        any_yes = True
+                    else:
+                        iso["gold"] = "no"
+                r["goldset"] = "short" if any_yes else "no"
     else:
         for r in out:
             r["cds"] = 0
@@ -486,7 +562,8 @@ def _split_protein_tracks(pgff: Path, data_dir: Path,
 
 def build_tracks_json(preds: dict, details: dict, data_dir: Path,
                       out_json: Path, protein_tracks: list | None = None,
-                      coverage: dict | None = None) -> list:
+                      coverage: dict | None = None,
+                      assembly: list | None = None) -> list:
     """denovo predictor tracks, colored by P (desc). Copies each GFF3
     into data_dir as denovo_<name>.gff3. Also records the per-set protein
     tracks and the per-sample/merged RNA coverage metadata."""
@@ -509,7 +586,8 @@ def build_tracks_json(preds: dict, details: dict, data_dir: Path,
         d["color"] = _PALETTE[rank % len(_PALETTE)]
     with open(out_json, "w") as fh:
         json.dump({"denovo": denovo, "protein": protein_tracks or [],
-                   "coverage": coverage or {}},
+                   "coverage": coverage or {},
+                   "assembly": assembly or []},
                   fh, ensure_ascii=False, indent=1)
     return denovo
 
@@ -777,7 +855,7 @@ _COV_SAMPLE_PALETTE = ["#31a354", "#756bb1", "#e6550d", "#636363",
 # de-novo predictor palette / tier colors (annotation + badges).
 THEMES: dict = {
     "classic": {
-        "goldset": "#2ca02c", "stringtie": "#9467bd", "coverage": "#3182bd",
+        "goldset": "#2ca02c", "stringtie": "#9467bd", "isoseq": "#8c564b", "coverage": "#3182bd",
         "protein": "#17becf",
         "palette": _PALETTE,
         "sample_palette": _COV_SAMPLE_PALETTE,
@@ -785,7 +863,7 @@ THEMES: dict = {
     },
     # Nature (NPG) — 明亮期刊风
     "npg": {
-        "goldset": "#00A087", "stringtie": "#F39B7F", "coverage": "#FFCE6E",
+        "goldset": "#00A087", "stringtie": "#F39B7F", "isoseq": "#7E6148", "coverage": "#FFCE6E",
         "protein": "#E64B35",
         "palette": ["#3C5488", "#8491B4", "#91D1C2", "#DC0000",
                     "#E64B35", "#4DBBD5", "#00A087", "#F39B7F"],
@@ -795,7 +873,7 @@ THEMES: dict = {
     },
     # Science (AAAS) — 高饱和对比
     "aaas": {
-        "goldset": "#008B45", "stringtie": "#008280", "coverage": "#3B4992",
+        "goldset": "#008B45", "stringtie": "#008280", "isoseq": "#808180", "coverage": "#3B4992",
         "protein": "#EE0000",
         "palette": ["#631879", "#BB0021", "#5F559B", "#A20056",
                     "#3B4992", "#008280", "#008B45", "#EE0000"],
@@ -805,7 +883,7 @@ THEMES: dict = {
     },
     # Lancet — 医学沉稳
     "lancet": {
-        "goldset": "#42B540", "stringtie": "#0099B4", "coverage": "#00468B",
+        "goldset": "#42B540", "stringtie": "#0099B4", "isoseq": "#AD002A", "coverage": "#00468B",
         "protein": "#ED0000",
         "palette": ["#925E9F", "#FDAF91", "#AD002A", "#ADB6B6",
                     "#0099B4", "#00468B", "#42B540", "#ED0000"],
@@ -815,7 +893,7 @@ THEMES: dict = {
     },
     # JAMA — 低饱和大地色
     "jama": {
-        "goldset": "#79AE97", "stringtie": "#DF8F44", "coverage": "#00A1D5",
+        "goldset": "#79AE97", "stringtie": "#DF8F44", "isoseq": "#80796B", "coverage": "#00A1D5",
         "protein": "#B24745",
         "palette": ["#6A6599", "#80796B", "#374E55", "#79AE97",
                     "#DF8F44", "#00A1D5", "#B24745", "#6A6599"],
@@ -893,7 +971,9 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         cov_files.append(covcfg["merged"]["file"])
     for s in covcfg.get("samples", []):
         cov_files.append(s["file"])
-    ann_names = ["final.gff3", "goldset.gff3", "stringtie.gtf"]
+    ann_names = ["final.gff3", "goldset.gff3", "stringtie.gtf",
+                 "isoseq.stringtie.gtf"]
+    ann_names += [a["file"] for a in tracks_cfg.get("assembly", [])]
     ann_names += [d["file"] for d in tracks_cfg.get("denovo", [])]
     ann_names += [t["file"] for t in tracks_cfg.get("protein", [])]
     ann_names += list(dict.fromkeys(cov_files))
@@ -1028,6 +1108,29 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
             + json.dumps(t["color"]) + ', height: 80,\n'
             '    visibilityWindow: -1 }')
     html = html.replace("/*__PROTEIN_TRACKS__*/", ",\n".join(protein_js))
+    # 5c) transcript assembly tracks (S5/S6): merged per platform + optional
+    #     per-sample tracks, colored by platform (short=stringtie color,
+    #     isoseq=isoseq color)
+    asm_js = []
+    for a in tracks_cfg.get("assembly", []):
+        if not _embedded(a["file"]):
+            continue
+        acolor = (th["isoseq"] if a.get("platform") == "isoseq"
+                  else th["stringtie"])
+        aidx = indexed_map.get(a["file"])
+        if aidx:
+            aurlexpr = ('DATA_URI[' + json.dumps(aidx[0]) + '], indexURL: '
+                        'DATA_URI[' + json.dumps(aidx[1]) + ']')
+        else:
+            aurlexpr = 'DATA_URI[' + json.dumps(a["file"]) + ']'
+        asm_js.append(
+            '  { name: ' + json.dumps(a["name"]) + ', type: "annotation", '
+            'format: "gtf",\n'
+            '    url: ' + aurlexpr + ', color: ' + json.dumps(acolor)
+            + ', height: 50,\n'
+            '    displayMode: "EXPANDED", visibilityWindow: -1 }')
+    html = html.replace("/*__ASSEMBLY_TRACKS__*/",
+                        ",\n".join(asm_js) + ("," if asm_js else ""))
 
     # 6) genes/tracks/fai fetches -> inlined constants
     html = html.replace('const resp = await fetch("data/genes.json");\n  genes = await resp.json();',
@@ -1064,7 +1167,8 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
 def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
                final_gff3: Path, final_d: Path, integ_d: Path,
                threads: int, full: bool = False,
-               show_rna_coverage: int = 1) -> dict:
+               show_rna_coverage: int = 1,
+               show_transcript_assembly: int = 1) -> dict:
     """Assemble data/ and the offline single-file evidence browser.
 
     full=False (default): lite browser, genome sequence not embedded.
@@ -1072,6 +1176,9 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
     show_rna_coverage (--show-rna-coverage): 0 = no RNA coverage track,
     1 = merged track only (smallest browser, default), 2 = merged + every
     per-sample track. Forwarded to sample_coverage(mode=...).
+    show_transcript_assembly (--show-transcript-assembly): 0 = no assembly
+    track, 1 = merged assembly per platform (default; Iso-Seq runs show a
+    separate isoseq-colored track), 2 = merged + every per-sample assembly.
     """
     vdir = ensure_dir(Path(out) / "09.result" / "viewer")
     data = ensure_dir(vdir / "data")
@@ -1107,11 +1214,36 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
     set_weights = (results.get("homolog") or {}).get("set_weights") or {}
     protein_tracks = _split_protein_tracks(pgff, data, set_weights) if pgff else []
     rna = results.get("rna") or {}
-    st_gtf = rna.get("stringtie_gtf")
-    if st_gtf and Path(st_gtf).exists():
-        # drop 'transcript' rows so igv renders one row per transcript
-        # (exons + intron line) instead of two (transcript span + exons)
-        _write_stringtie_gtf(Path(st_gtf), data / "stringtie.gtf")
+    assembly_meta: list = []
+    has_iso_asm = bool(rna.get("isoseq_gtf"))
+    if show_transcript_assembly >= 1:
+        st_gtf = rna.get("stringtie_gtf")
+        if st_gtf and Path(st_gtf).exists():
+            # drop 'transcript' rows so igv renders one row per transcript
+            # (exons + intron line) instead of two (transcript span + exons)
+            _write_stringtie_gtf(Path(st_gtf), data / "stringtie.gtf")
+            assembly_meta.append({
+                "name": ("Transcript Assembly (StringTie, short-read)"
+                         if has_iso_asm
+                         else "Transcript Assembly (StringTie)"),
+                "platform": "short", "file": "stringtie.gtf"})
+        iso_gtf = rna.get("isoseq_gtf")
+        if iso_gtf and Path(iso_gtf).exists():
+            _write_stringtie_gtf(Path(iso_gtf),
+                                 data / "isoseq.stringtie.gtf")
+            assembly_meta.append({
+                "name": "Transcript Assembly (Iso-Seq)",
+                "platform": "isoseq", "file": "isoseq.stringtie.gtf"})
+        if show_transcript_assembly >= 2:
+            for u in rna.get("assembly_units") or []:
+                g = Path(u["gtf"])
+                if not g.exists():
+                    continue
+                fname = f"assembly_{u['name']}.gtf"
+                _write_stringtie_gtf(g, data / fname)
+                assembly_meta.append({
+                    "name": f"Assembly: {u['name']} ({u['platform']})",
+                    "platform": u["platform"], "file": fname})
     # NOTE: the HISAT2 junctions.bed track was removed from the browser by
     # design (user request): junctions remain in 02.rnaseq for the pipeline,
     # but are no longer copied into the viewer data/ or embedded.
@@ -1127,12 +1259,15 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
     #    build_genes_json needs on disk to compute de novo evidence coverage
     build_tracks_json(preds, details, data, data / "tracks.json",
                       protein_tracks=protein_tracks,
-                      coverage=cov)
+                      coverage=cov, assembly=assembly_meta)
     build_genes_json(Path(out) / "08.assessment" / "confidence.tsv",
                      data / "genes.json",
                      final_gff3=data / "final.gff3",
                      denovo_gff3={n: data / f"denovo_{n}.gff3"
-                                  for n in (preds or {})})
+                                  for n in (preds or {})},
+                     goldset_gff3=(data / "goldset.gff3"
+                                   if (data / "goldset.gff3").exists()
+                                   else None))
 
     # 4) coverage bedgraphs (already computed above, before tracks.json)
     # 5) pack the single-file offline browser
