@@ -231,6 +231,7 @@ const GOLD_LABELS = {
   both: "long-read + short-read",
   isoseq: "long-read only",
   short: "short-read only",
+  no: "no GoldSet evidence (∅)",
 };
 let fltFlags = new Set();   // selected intrinsic flags (multi-select; empty = no flag filter)
 // intrinsic flag value -> human label (mirrors viewer.py _FLAG_MAP)
@@ -282,8 +283,11 @@ const TRACKS_BEFORE = [
 // (the HISAT2 junction track was removed by design: it overlaps the RNA
 // coverage/StringTie evidence and clutters the browser)
 const TRACKS_EVIDENCE = [
-  { name: "GoldSet (TransDecoder)", type: "annotation", format: "gff3",
-    url: "data/goldset.gff3", color: "__GOLDSET_COLOR__", height: 80,
+  { name: "GoldSet (TransDecoder Long-Reads)", type: "annotation", format: "gff3",
+    url: "data/goldset.isoseq.gff3", color: "__GOLDSET_COLOR__", height: 80,
+    visibilityWindow: -1 },
+  { name: "GoldSet (TransDecoder Short-Reads)", type: "annotation", format: "gff3",
+    url: "data/goldset.short.gff3", color: "__GOLDSET_COLOR__", height: 80,
     visibilityWindow: -1 },
 /*__COVERAGE_TRACK__*/
 /*__ASSEMBLY_TRACKS__*/
@@ -791,7 +795,7 @@ function buildGoldFilter() {
     lab.appendChild(document.createTextNode(text));
     panel.appendChild(lab);
   };
-  for (const k of ["both", "isoseq", "short"]) {
+  for (const k of ["both", "isoseq", "short", "no"]) {
     if (present.has(k)) addOpt(k, GOLD_LABELS[k]);
   }
   const act = document.createElement("div");

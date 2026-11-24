@@ -166,7 +166,13 @@ def lift_goldset(goldset_dir: Path, stringtie_gtf: Path, d: Path,
                 acc += e - s + 1
                 bounds.append(acc)  # cDNA position of exon end
             gsegs = []
+            clen = len(chain)
             for (a, b) in segs:
+                # defensive clip: TransDecoder CDS may exceed cDNA chain by a
+                # few bp (boundary off-by-one); clip instead of IndexError
+                a = max(1, a); b = min(clen, b)
+                if a > b:
+                    continue
                 # split [a,b] at every exon boundary inside it
                 cuts = [a] + [x + 1 for x in bounds if a <= x < b] + [b + 1]
                 for u, v in zip(cuts, cuts[1:]):

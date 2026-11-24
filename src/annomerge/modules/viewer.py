@@ -226,7 +226,10 @@ def _goldset_origin_keys(goldset_gff3: Path | None) -> dict:
     out: dict = {}
     for tid, tx in txs.items():
         if tx.cds:
-            out[_cds_key(tx)] = org_of.get(tid, "short")
+            # a CDS structure can appear under BOTH origins (distinct goldset
+            # ORFs sharing one structure) — keep the full set so a transcript
+            # badge can read SR+LR
+            out.setdefault(_cds_key(tx), set()).add(org_of.get(tid, "short"))
     return out
 
 
@@ -387,11 +390,12 @@ def build_genes_json(confidence_tsv: Path, out_json: Path, *,
                         continue
                     key = (r["seqid"], r["strand"],
                            tuple(sorted(tx_cds_iv.get(iso["tid"], []))))
-                    org = gold_orig.get(key, "short")
-                    iso["gold"] = org
-                    if org == "isoseq":
+                    orgs = gold_orig.get(key, {"short"})
+                    iso["gold"] = ("both" if len(orgs) > 1
+                                   else next(iter(orgs)))
+                    if "isoseq" in orgs:
                         has_lr = True
-                    else:
+                    if "short" in orgs:
                         has_sr = True
                 r["goldset"] = ("both" if has_lr and has_sr else
                                 "isoseq" if has_lr else
@@ -717,7 +721,7 @@ def coverage_bedgraph(bam: Path, out_bedgraph: Path, threads: int) -> Path | Non
 
 
 def sample_coverage(bams: list, data_dir: Path, threads: int,
-                    mode: int = 2) -> dict:
+                    mode: int = 2, tag: str = "") -> dict:
     """Per-sample + merged 50-bp-bin coverage bedgraphs.
     One bedgraph per BAM (coverage_<sample>.bedgraph) plus, for >=2 BAMs, a
     per-bin summed coverage_all.bedgraph. Returns coverage metadata
@@ -732,7 +736,9 @@ def sample_coverage(bams: list, data_dir: Path, threads: int,
     on many-sample runs); 2 = merged + every per-sample track (legacy)."""
     if mode == 0 or not bams:
         return {}
-    mbg = data_dir / "coverage_all.bedgraph"
+    pfx = f"coverage_{tag}_" if tag else "coverage_"
+    mbg = data_dir / (f"coverage_{tag}.bedgraph" if tag
+                      else "coverage_all.bedgraph")
     if mode == 1:
         # merged-only: reuse the finished merged file when present; otherwise
         # stream each BAM's 50-bp bedgraph straight into the sum (no
@@ -800,7 +806,7 @@ def sample_coverage(bams: list, data_dir: Path, threads: int,
             name = f"{base}_{i}"
             i += 1
         used_names.add(name)
-        bg = data_dir / f"coverage_{name}.bedgraph"
+        bg = data_dir / f"{pfx}{name}.bedgraph"
         if not coverage_bedgraph(bam, bg, threads):
             log.warning("viewer: coverage failed for %s; sample track skipped", bam)
             continue
@@ -826,7 +832,8 @@ def sample_coverage(bams: list, data_dir: Path, threads: int,
     if not samples:
         return {}
     if len(samples) > 1:
-        mbg = data_dir / "coverage_all.bedgraph"
+        mbg = data_dir / (f"coverage_{tag}.bedgraph" if tag
+                          else "coverage_all.bedgraph")
         mx = tot = 0.0
         n = 0
         with open(mbg, "w") as out:
@@ -971,8 +978,12 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         cov_files.append(covcfg["merged"]["file"])
     for s in covcfg.get("samples", []):
         cov_files.append(s["file"])
-    ann_names = ["final.gff3", "goldset.gff3", "stringtie.gtf",
-                 "isoseq.stringtie.gtf"]
+    if covcfg.get("merged_isoseq"):
+        cov_files.append(covcfg["merged_isoseq"]["file"])
+    for s in covcfg.get("samples_isoseq", []):
+        cov_files.append(s["file"])
+    ann_names = ["final.gff3", "goldset.isoseq.gff3", "goldset.short.gff3",
+                 "stringtie.gtf", "isoseq.stringtie.gtf"]
     ann_names += [a["file"] for a in tracks_cfg.get("assembly", [])]
     ann_names += [d["file"] for d in tracks_cfg.get("denovo", [])]
     ann_names += [t["file"] for t in tracks_cfg.get("protein", [])]
@@ -1082,6 +1093,21 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
             color = sp[rank % len(sp)]
             label = f'RNA coverage: {s["name"]} (~{s["max"]:,.0f}x max)'
             cov_tracks.append(_wig(label, s["file"], color))
+    # Iso-Seq long-read coverage: separate track(s), isoseq theme color
+    mi = covcfg.get("merged_isoseq") or {}
+    if mi and _embedded(mi["file"]):
+        ni = mi.get("n_samples") or 1
+        label = (f'RNA coverage (Iso-Seq, {ni} samples, '
+                 f'~{mi["max"]:,.0f}x max)' if ni > 1 else
+                 f'RNA coverage (Iso-Seq: {mi.get("name", "sample")}, '
+                 f'~{mi["max"]:,.0f}x max)')
+        cov_tracks.append(_wig(label, mi["file"], th["isoseq"]))
+    for rank, s in enumerate(covcfg.get("samples_isoseq", [])):
+        if not _embedded(s["file"]):
+            continue
+        cov_tracks.append(_wig(
+            f'RNA coverage (Iso-Seq): {s["name"]} (~{s["max"]:,.0f}x max)',
+            s["file"], th["isoseq"]))
     html = html.replace("/*__COVERAGE_TRACK__*/",
                         ",\n".join(cov_tracks) + ("," if cov_tracks else ""))
 
@@ -1164,6 +1190,47 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
 
 
 # ------------------------------------------------------------------ driver
+
+def _split_goldset_display(src: Path, data_dir: Path) -> dict:
+    """Split the UTR-injected display goldset into per-platform track files:
+    goldset.isoseq.gff3 (mRNAs carrying origin=isoseq) and
+    goldset.short.gff3 (all the rest).  Gene/mRNA/feature blocks are kept
+    intact; the isoseq file is only written when non-empty.  Returns
+    {"isoseq": name|None, "short": name|None}."""
+    blocks: list = []          # [origin, [lines]]
+    cur_origin, cur = "short", []
+    with open(src) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 9:
+                continue
+            if f[2] == "gene":
+                if cur:
+                    blocks.append((cur_origin, cur))
+                cur_origin, cur = "short", [line]
+            else:
+                if f[2] == "mRNA":
+                    cur_origin = ("isoseq" if "origin=isoseq" in f[8]
+                                  else "short")
+                cur.append(line)
+    if cur:
+        blocks.append((cur_origin, cur))
+    out = {"isoseq": None, "short": None}
+    for org, fname in (("isoseq", "goldset.isoseq.gff3"),
+                       ("short", "goldset.short.gff3")):
+        lines = [l for o, blk in blocks if o == org for l in blk]
+        if lines:
+            with open(data_dir / fname, "w") as fh:
+                fh.write("##gff-version 3\n")
+                fh.writelines(lines)
+            out[org] = fname
+    log.info("viewer: goldset split -> isoseq=%s short=%s",
+             out["isoseq"], out["short"])
+    return out
+
+
 def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
                final_gff3: Path, final_d: Path, integ_d: Path,
                threads: int, full: bool = False,
@@ -1203,6 +1270,9 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
         if cand.exists():
             n5, n3 = inject_utr_features(cand, data / "goldset.gff3")
             log.info("viewer: goldset UTR rows added: %d 5' + %d 3'", n5, n3)
+            # per-platform display tracks (user request): long-read origin
+            # first (directly under the gene models), short-read origin next
+            _split_goldset_display(data / "goldset.gff3", data)
             break
     # protein evidence: display miniprot's native mRNA/CDS gff3 (NOT the
     # EVM match/match_part adapter file, which stays pipeline-internal)
@@ -1223,16 +1293,14 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
             # (exons + intron line) instead of two (transcript span + exons)
             _write_stringtie_gtf(Path(st_gtf), data / "stringtie.gtf")
             assembly_meta.append({
-                "name": ("Transcript Assembly (StringTie, short-read)"
-                         if has_iso_asm
-                         else "Transcript Assembly (StringTie)"),
+                "name": "Transcript Assembly (StringTie Short-Reads)",
                 "platform": "short", "file": "stringtie.gtf"})
         iso_gtf = rna.get("isoseq_gtf")
         if iso_gtf and Path(iso_gtf).exists():
             _write_stringtie_gtf(Path(iso_gtf),
                                  data / "isoseq.stringtie.gtf")
             assembly_meta.append({
-                "name": "Transcript Assembly (Iso-Seq)",
+                "name": "Transcript Assembly (StringTie Long-Reads)",
                 "platform": "isoseq", "file": "isoseq.stringtie.gtf"})
         if show_transcript_assembly >= 2:
             for u in rna.get("assembly_units") or []:
@@ -1241,8 +1309,10 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
                     continue
                 fname = f"assembly_{u['name']}.gtf"
                 _write_stringtie_gtf(g, data / fname)
+                plat = ("Long-Reads" if u["platform"] == "isoseq"
+                        else "Short-Reads")
                 assembly_meta.append({
-                    "name": f"Assembly: {u['name']} ({u['platform']})",
+                    "name": f"Assembly (StringTie {plat}): {u['name']}",
                     "platform": u["platform"], "file": fname})
     # NOTE: the HISAT2 junctions.bed track was removed from the browser by
     # design (user request): junctions remain in 02.rnaseq for the pipeline,
@@ -1254,6 +1324,16 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
     cov = sample_coverage(rna.get("coverage_bams") or rna.get("bams") or [],
                           data, threads,
                           mode=show_rna_coverage)
+    # separate Iso-Seq coverage track(s) (user request): long-read depth is
+    # sparse and invisible next to Illumina depth on the merged track
+    iso_cov_bams = rna.get("isoseq_coverage_bams") or []
+    if iso_cov_bams:
+        cov_iso = sample_coverage(iso_cov_bams, data, threads,
+                                  mode=show_rna_coverage, tag="isoseq")
+        if cov_iso.get("merged"):
+            cov["merged_isoseq"] = cov_iso["merged"]
+        if cov_iso.get("samples"):
+            cov["samples_isoseq"] = cov_iso["samples"]
 
     # 3) tracks.json first: it copies denovo_<name>.gff3 into data/, which
     #    build_genes_json needs on disk to compute de novo evidence coverage

@@ -598,6 +598,12 @@ def merge(
         help="Min intron length (bp): hisat2 --min-intronlen and EVM "
              "--min_intron_length.",
         rich_help_panel="Advanced"),
+    extra_pred: list[str] = typer.Option(
+        None, "--extra-pred",
+        help="External prediction source injected into EVM as "
+             "ABINITIO_PREDICTION: GFF_PATH[:WEIGHT] (default weight=10). "
+             "Repeatable. Bypasses module-05 scoring (source name = file stem).",
+        rich_help_panel="Advanced"),
     conf_isoseq_min_depth: int = typer.Option(
         1, "--conf-isoseq-min-depth",
         help="Confidence tiering, long-read RNA support: minimum long-read "
@@ -803,6 +809,13 @@ def merge(
         raise typer.Exit(0)
     evm_preds = {name: (preds[name], evm_w[name]) for name in preds
                  if evm_w.get(name) is not None}
+    # externally supplied prediction sources (e.g. polished miniprot models)
+    for xp in (extra_pred or []):
+        xp_path, xp_w = (xp.rsplit(":", 1) if ":" in xp and xp.rsplit(":", 1)[1].isdigit()
+                         else (xp, "10"))
+        xp_name = Path(xp_path).stem.replace(".", "_")
+        evm_preds[xp_name] = (Path(xp_path), int(xp_w))
+        tracker.note(f"extra pred injected: {xp_name} (weight={xp_w}) <- {xp_path}")
     if not evm_preds:
         typer.secho("no predictor passed scoring; integration skipped", fg="red", err=True)
         raise typer.Exit(3)

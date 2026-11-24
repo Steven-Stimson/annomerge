@@ -37,6 +37,9 @@ c1\tgoldset\tCDS\t1100\t2000\t.\t+\t0\tID=ga2;Parent=tx_a
 c1\tgoldset\tgene\t100\t1500\t.\t+\t.\tID=gg2
 c1\tgoldset\tmRNA\t100\t1500\t.\t+\t.\tID=tx_b;Parent=gg2
 c1\tgoldset\tCDS\t100\t1500\t.\t+\t0\tID=gb1;Parent=tx_b
+c1\tgoldset\tgene\t100\t1500\t.\t+\t.\tID=gg3
+c1\tgoldset\tmRNA\t100\t1500\t.\t+\t.\tID=tx_c;Parent=gg3;origin=isoseq
+c1\tgoldset\tCDS\t100\t1500\t.\t+\t0\tID=gc1;Parent=tx_c
 """)
 
 # confidence.tsv with 20 columns (has_long run)
@@ -75,9 +78,9 @@ c1\taugustus\tCDS\t1100\t2000\t.\t+\t0\tID=dcd2;Parent=dt1
 tracks = {"denovo": [{"pred": "augustus", "w": 0.9, "file": "denovo_augustus.gff3", "color": "#1f77b4"}],
           "protein": [], "coverage": {},
           "assembly": [
-              {"name": "Transcript Assembly (StringTie, short-read)", "platform": "short", "file": "stringtie.gtf"},
-              {"name": "Transcript Assembly (Iso-Seq)", "platform": "isoseq", "file": "isoseq.stringtie.gtf"},
-              {"name": "Assembly: s1 (short)", "platform": "short", "file": "assembly_s1.gtf"}]}
+              {"name": "Transcript Assembly (StringTie Short-Reads)", "platform": "short", "file": "stringtie.gtf"},
+              {"name": "Transcript Assembly (StringTie Long-Reads)", "platform": "isoseq", "file": "isoseq.stringtie.gtf"},
+              {"name": "Assembly (StringTie Short-Reads): s1", "platform": "short", "file": "assembly_s1.gtf"}]}
 (data / "tracks.json").write_text(json.dumps(tracks))
 
 # genes.json via build_genes_json (S7/S10 path)
@@ -93,10 +96,19 @@ assert g1["goldset"] == "both", g1["goldset"]
 assert g2["goldset"] == "no", g2["goldset"]
 iso = {t["tid"]: t for t in g1["isoforms"]}
 assert iso["t1"]["gold"] == "isoseq", iso["t1"]["gold"]
-assert iso["t2"]["gold"] == "short", iso["t2"]["gold"]
+assert iso["t2"]["gold"] == "both", iso["t2"]["gold"]
 assert iso["t1"]["rna_long"] == "1.000" and iso["t1"]["rna_short"] == "0.000"
 assert g1["rna_long"] == "1.000" and g1["rna_short"] == "0.900"
 print("genes.json S7/S10 OK")
+
+# split the display goldset into per-platform tracks (S-new)
+sp = viewer._split_goldset_display(data / "goldset.gff3", data)
+assert sp["isoseq"] == "goldset.isoseq.gff3" and sp["short"] == "goldset.short.gff3"
+iso_txt = (data / "goldset.isoseq.gff3").read_text()
+short_txt = (data / "goldset.short.gff3").read_text()
+assert "tx_a" in iso_txt and "tx_c" in iso_txt and "tx_b" not in iso_txt
+assert "tx_b" in short_txt and "tx_a" not in short_txt and "tx_c" not in short_txt
+print("goldset split OK")
 
 # render the offline browser
 out_html = viewer.render_offline_html(data, d / "browser.html",
@@ -107,9 +119,9 @@ html = out_html.read_text()
 print("html size: %.1f MB" % (len(html) / 1048576))
 
 # S5: assembly tracks present with platform colors
-assert "Transcript Assembly (Iso-Seq)" in html
-assert "Transcript Assembly (StringTie, short-read)" in html
-assert "Assembly: s1 (short)" in html
+assert "Transcript Assembly (StringTie Long-Reads)" in html
+assert "Transcript Assembly (StringTie Short-Reads)" in html
+assert "Assembly (StringTie Short-Reads): s1" in html
 th = viewer.theme_colors("npg")
 assert f'color: {json.dumps(th["isoseq"])}' in html, "isoseq color missing"
 assert "stringtie.gtf" not in [m for m in re.findall(r'url: "(data/[^"]+)"', html)], "leftover data refs"
@@ -133,9 +145,16 @@ assert order == sorted(order), order
 assert "(from final GFF3)" not in html
 print("S13 panel order OK")
 
-# S7: gold filter panel present; four-state labels
+# S7: gold filter panel present; four-state labels + no-GoldSet option
 assert "flt-gold-panel" in html and "long-read + short-read" in html
+assert "no GoldSet evidence" in html
 print("S7 filter OK")
+
+# per-platform GoldSet tracks (long-read above short-read)
+i_lr = html.find("GoldSet (TransDecoder Long-Reads)")
+i_sr = html.find("GoldSet (TransDecoder Short-Reads)")
+assert 0 < i_lr < i_sr
+print("goldset tracks OK")
 
 # no leftover unresolved tokens
 for tok in ("__ASSEMBLY_TRACKS__", "__PROTEIN_TRACKS__", "__COVERAGE_TRACK__",
