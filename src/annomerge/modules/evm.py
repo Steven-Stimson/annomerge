@@ -59,7 +59,9 @@ def stringtie_to_gff3(gtf: Path, out: Path) -> Path:
 
 
 def lift_goldset(goldset_dir: Path, stringtie_gtf: Path, d: Path,
-                 out_gff3: Path, genome_fa: Path | None = None) -> Path:
+                 out_gff3: Path, genome_fa: Path | None = None,
+                 isoseq_gtf: Path | None = None,
+                 isoseq_tol_bp: int = 25) -> Path:
     """TransDecoder transcript-coord ORF gff3 -> genome coords, in Python.
 
     Replaces TransDecoder's gtf_to_alignment_gff3.pl + cdna_alignment_orf_to_genome_orf.pl,
@@ -77,6 +79,17 @@ def lift_goldset(goldset_dir: Path, stringtie_gtf: Path, d: Path,
     """
     if lazy([out_gff3], desc="lift goldset to genome (python)"):
         return out_gff3
+    # optional Iso-Seq origin tagging (S2): an ORF is Iso-Seq-origin when
+    # its source transcript's full intron chain matches a transcript of the
+    # Iso-Seq-only merged assembly (same matching semantics as
+    # augment._iso_match).  Written as ;origin=isoseq on the mRNA row;
+    # consumed by run_evm (EVM weight split) and the evidence browser
+    # (GoldSet track split / gene-list filter).  Short-origin rows carry no
+    # attribute so non-Iso-Seq runs stay byte-identical.
+    iso_idx = None
+    if isoseq_gtf and Path(isoseq_gtf).exists():
+        from .augment import _parse_isoseq_gtf, _iso_index
+        iso_idx = _iso_index(_parse_isoseq_gtf(isoseq_gtf))
 
     # --- stringtie transcripts: exons + strand
     tx_exons: dict[str, list] = {}
@@ -165,6 +178,14 @@ def lift_goldset(goldset_dir: Path, stringtie_gtf: Path, d: Path,
             # UTR exons would lose UTR introns and break intron-chain matches
             # against the reference annotation
             ts, te = exons[0][0], exons[-1][1]
+            org_attr = ""
+            if iso_idx is not None:
+                from .augment import _iso_match
+                din = tuple((exons[i][1] + 1, exons[i + 1][0] - 1)
+                            for i in range(len(exons) - 1))
+                if _iso_match(iso_idx, seqid, s_T, din, (ts, te),
+                              isoseq_tol_bp) is not None:
+                    org_attr = ";origin=isoseq"
             gid = f"GOLD.{oid}"
             # short display name: the ORF/transcript id. TransDecoder's
             # Name carries the full ORF/hit description (long); keep the
@@ -173,7 +194,7 @@ def lift_goldset(goldset_dir: Path, stringtie_gtf: Path, d: Path,
             out.write(f"{seqid}\tgoldset\tgene\t{ts}\t{te}\t.\t{g_strand}\t.\t"
                       f"ID={gid}{nm_attr}\n")
             out.write(f"{seqid}\tgoldset\tmRNA\t{ts}\t{te}\t.\t{g_strand}\t.\t"
-                      f"ID={oid};Parent={gid}{nm_attr}\n")
+                      f"ID={oid};Parent={gid}{nm_attr}{org_attr}\n")
             for (s, e) in exons:
                 out.write(f"{seqid}\tgoldset\texon\t{s}\t{e}\t.\t{g_strand}\t.\t"
                           f"ID={oid}.exon{s}_{e};Parent={oid}\n")
@@ -396,13 +417,48 @@ def miniprot_to_protein_gff(miniprot_gff: Path, out_gff3: Path,
     return out_gff3
 
 
+def _split_goldset_by_origin(lifted: Path, d: Path) -> dict:
+    """Split a lifted goldset GFF3 into per-platform prediction sources by
+    the ;origin=isoseq marker written by lift_goldset.  Returns
+    {"goldset": path|None, "isoseq_goldset": path|None} — whole ORF blocks
+    (gene/mRNA/exon/CDS) are routed together; the source column becomes the
+    EVM prediction-source name so the weights file can score them apart."""
+    out_paths = {"goldset": d / "goldset.short.src.gff3",
+                 "isoseq_goldset": d / "goldset.isoseq.src.gff3"}
+    bufs: dict = {"goldset": [], "isoseq_goldset": []}
+    cur = "goldset"
+    for line in open(lifted):
+        if line.startswith("#"):
+            continue
+        f = line.rstrip("\n").split("\t")
+        if len(f) >= 9:
+            if f[2] == "mRNA":
+                cur = "isoseq_goldset" if "origin=isoseq" in f[8] else "goldset"
+            f[1] = cur
+            line = "\t".join(f) + "\n"
+        bufs[cur].append(line)
+    res = {}
+    for key, lines in bufs.items():
+        if lines:
+            with open(out_paths[key], "w") as fh:
+                fh.write("##gff-version 3\n")
+                fh.writelines(lines)
+            res[key] = out_paths[key]
+    return res
+
+
 # ---------------------------------------------------------------- weights + run
 def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
             stringtie_gtf: Path, miniprot_gff: Path, goldset_dir: Path,
             threads: int, min_intron: int = 20,
             w_gold: int = 10, w_transcript: int = 8, w_protein: int = 6,
             protein_set_weights: dict | None = None,
-            protein_membership: dict | None = None) -> dict:
+            protein_membership: dict | None = None,
+            short_gtf: Path | None = None,
+            isoseq_gtf: Path | None = None,
+            isoseq_tol_bp: int = 25,
+            w_isoseq_transcript: int = 10,
+            w_isoseq_gold: int = 12) -> dict:
     """preds: {name: (gff3_path, evm_weight)} — already filtered by scoring.
 
     protein_set_weights: {label: weight} — when given with >1 entries, the
@@ -416,7 +472,38 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
 
     # 1. prep evidence files
     evidence = {}
-    if stringtie_gtf and Path(stringtie_gtf).exists():
+    _iso_ok = bool(isoseq_gtf) and Path(isoseq_gtf).exists()
+    if _iso_ok:
+        # platform-split transcript evidence (S1): the Iso-Seq-only merged
+        # assembly becomes its own TRANSCRIPT source with a higher weight —
+        # full-length molecules outrank short-read assemblies.  Both sources
+        # live in ONE --transcript_alignments file (EVM scores by the source
+        # column, weights.txt gets one row per source).  A structure
+        # assembled by both platforms appears twice (once per source) — the
+        # EVM consensus then naturally favours dual-platform models.
+        _parts = []
+        if short_gtf and Path(short_gtf).exists():
+            aln_s = d / "stringtie.short.alignment.gff3"
+            if not lazy([aln_s], desc="gtf->alignment gff3 (short)"):
+                run(f"{_td_home()}/util/gtf_to_alignment_gff3.pl {short_gtf} > {aln_s}",
+                    shell=True, desc="gtf_to_alignment_gff3 short")
+            _parts.append(rewrite_source(aln_s, "stringtie",
+                                         d / "stringtie.short.src.gff3"))
+        aln_i = d / "isoseq.alignment.gff3"
+        if not lazy([aln_i], desc="gtf->alignment gff3 (isoseq)"):
+            run(f"{_td_home()}/util/gtf_to_alignment_gff3.pl {isoseq_gtf} > {aln_i}",
+                shell=True, desc="gtf_to_alignment_gff3 isoseq")
+        _parts.append(rewrite_source(aln_i, "isoseq", d / "isoseq.src.gff3"))
+        _tx_src = d / "transcript.src.gff3"
+        if not lazy([_tx_src], desc="transcript evidence concat"):
+            with open(_tx_src, "w") as out:
+                out.write("##gff-version 3\n")
+                for sp in _parts:
+                    for line in open(sp):
+                        if not line.startswith("#"):
+                            out.write(line)
+        evidence["stringtie"] = _tx_src
+    elif stringtie_gtf and Path(stringtie_gtf).exists():
         # EVM transcript evidence must be match-style GFF3 with ID=/Target= —
         # gtf_to_alignment_gff3.pl gives exactly that (also reused by lift_goldset)
         aln = d / "stringtie.alignment.gff3"
@@ -424,10 +511,19 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
             run(f"{_td_home()}/util/gtf_to_alignment_gff3.pl {stringtie_gtf} > {aln}",
                 shell=True, desc="gtf_to_alignment_gff3")
         evidence["stringtie"] = rewrite_source(aln, "stringtie", d / "stringtie.src.gff3")
+    goldset_files: dict = {}
     if goldset_dir and (goldset_dir / "transcripts.fa.transdecoder.gff3").exists():
         g = lift_goldset(goldset_dir, stringtie_gtf, d, d / "goldset.genome.gff3",
-                         genome_fa=vi.genome)
-        evidence["goldset"] = rewrite_source(g, "goldset", d / "goldset.src.gff3")
+                         genome_fa=vi.genome,
+                         isoseq_gtf=isoseq_gtf if _iso_ok else None,
+                         isoseq_tol_bp=isoseq_tol_bp)
+        if _iso_ok:
+            # per-platform prediction sources (S2): Iso-Seq-origin ORFs get
+            # their own ABINITIO_PREDICTION source with a higher weight
+            goldset_files = _split_goldset_by_origin(g, d)
+        else:
+            goldset_files = {"goldset": rewrite_source(
+                g, "goldset", d / "goldset.src.gff3")}
     multi = protein_set_weights and len(protein_set_weights) > 1
     if miniprot_gff and Path(miniprot_gff).exists():
         evidence["miniprot"] = miniprot_to_protein_gff(
@@ -442,10 +538,14 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
     lines = []
     for name, (_, w) in pred_files.items():
         lines.append(f"ABINITIO_PREDICTION\t{name}\t{w}")
-    if "goldset" in evidence:
+    if goldset_files.get("goldset"):
         lines.append(f"ABINITIO_PREDICTION\tgoldset\t{w_gold}")
+    if goldset_files.get("isoseq_goldset"):
+        lines.append(f"ABINITIO_PREDICTION\tisoseq_goldset\t{w_isoseq_gold}")
     if "stringtie" in evidence:
         lines.append(f"TRANSCRIPT\tstringtie\t{w_transcript}")
+    if _iso_ok:
+        lines.append(f"TRANSCRIPT\tisoseq\t{w_isoseq_transcript}")
     if multi:
         for label, w in protein_set_weights.items():
             lines.append(f"PROTEIN\tminiprot_{label}\t{w}")
@@ -463,8 +563,9 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
     if not lazy([combined], desc="combine predictions"):
         with open(combined, "w") as out:
             out.write("##gff-version 3\n")
-            for src in [g for _, (g, _) in pred_files.items()] + \
-                       [evidence.get("goldset")]:
+            for src in ([g for _, (g, _) in pred_files.items()]
+                        + [goldset_files.get("goldset"),
+                           goldset_files.get("isoseq_goldset")]):
                 if not src:
                     continue
                 for line in open(src):
