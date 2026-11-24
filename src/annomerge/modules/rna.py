@@ -326,6 +326,8 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
     bams: list[Path] = []
     coverage_bams: list[Path] = []
     short_cov_bams: list[Path] = []   # Illumina-only subset of coverage_bams
+    isoseq_cov_bams: list[Path] = []  # long-read real-read subset (confidence L-metric)
+    bam_platform: dict = {}           # bam path -> "short" | "isoseq" (junction pooling)
     units: list[dict] = []
     idx = None
     bam_dir = rdir / "bam"
@@ -341,6 +343,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
             bams.append(b)
             coverage_bams.append(b)
             short_cov_bams.append(b)
+            bam_platform[b] = "short"
             units.append({"name": s.name, "bams": [b], "mode": "default",
                           "platform": "short"})
         elif s.use_minimap2:
@@ -348,6 +351,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                                max_intron=max_intron,
                                extra_opts=minimap2_opts.for_target(s.name))
             bams.append(b)
+            bam_platform[b] = "short" if s.tag == "transcripts" else "isoseq"
             if s.tag == "transcripts":
                 # assembled transcripts: 1x coverage per isoform by nature —
                 # stringtie -L assembles nothing from them; use the default
@@ -360,6 +364,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                               "platform": "isoseq",
                               "lr_preset": s.mm2_preset or "splice:hq"})
                 coverage_bams.append(b)   # real reads: depth is meaningful
+                isoseq_cov_bams.append(b)
         elif s.tag == "mix":
             b1 = align_sample(s, idx, bam_dir, threads,
                               extra_opts=hisat2_opts.for_target(s.name),
@@ -373,6 +378,9 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
             bams += [b1, b2]
             coverage_bams.append(b1)         # long-read part stays out of coverage
             short_cov_bams.append(b1)
+            isoseq_cov_bams.append(b2)  # ...but counts for the long-read metric
+            bam_platform[b1] = "short"
+            bam_platform[b2] = "isoseq"
             units.append({"name": s.name, "bams": [b1, b2], "mode": "mix",
                           "platform": "short"})
 
@@ -381,13 +389,19 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
             bams += list(s.files)
             coverage_bams.append(s.files[0])
             short_cov_bams.append(s.files[0])
+            isoseq_cov_bams.append(s.files[1])
+            bam_platform[s.files[0]] = "short"
+            bam_platform[s.files[1]] = "isoseq"
             units.append({"name": s.name, "bams": list(s.files), "mode": "mix",
                           "platform": "short"})
         else:
             bams.append(s.files[0])
             coverage_bams.append(s.files[0])
             is_lr = s.stringtie_longread
-            if not is_lr:
+            bam_platform[s.files[0]] = "isoseq" if is_lr else "short"
+            if is_lr:
+                isoseq_cov_bams.append(s.files[0])
+            else:
                 short_cov_bams.append(s.files[0])
             units.append({"name": s.name, "bams": [s.files[0]],
                           "mode": "longread" if is_lr else "default",
@@ -397,9 +411,22 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                           "lr_preset": "splice" if is_lr else None})
 
     beds = []
+    bed_platform: dict = {}
     for bam in bams:
-        beds.append(extract_junctions(bam, bam_dir / (Path(bam).stem + ".junctions.bed")))
+        bed = extract_junctions(bam, bam_dir / (Path(bam).stem + ".junctions.bed"))
+        beds.append(bed)
+        bed_platform[bed] = bam_platform.get(bam, "short")
     merged_bed = merge_junctions(beds, rdir / "junctions.bed") if beds else None
+    # per-platform junction DBs for the dual-metric confidence support
+    # (S8): junction existence is also platform evidence — a long read
+    # spanning an intron corroborates it directly.
+    _iso_present = any(v == "isoseq" for v in bam_platform.values())
+    short_beds = [b for b in beds if bed_platform.get(b) != "isoseq"]
+    iso_beds = [b for b in beds if bed_platform.get(b) == "isoseq"]
+    merged_short = (merge_junctions(short_beds, rdir / "junctions_short.bed")
+                    if short_beds else None)
+    merged_iso = (merge_junctions(iso_beds, rdir / "junctions_isoseq.bed")
+                  if (_iso_present and iso_beds) else None)
 
     gtf = None
     isoseq_gtf = None
@@ -433,10 +460,26 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
     elif vi.rna_gtfs:
         gtf = vi.rna_gtfs[0]  # precomputed transcripts passed through
 
+    # per-sample assembly inventory for the evidence browser (S4):
+    # platform + per-sample GTF (written by assemble(); mix units are one
+    # combined --mix assembly per sample)
+    assembly_units = []
+    if units:
+        for u in units:
+            g = rdir / "stringtie" / f"{u['name']}.gtf"
+            if g.exists():
+                assembly_units.append({"name": u["name"],
+                                       "platform": u.get("platform", "short"),
+                                       "gtf": g})
     result = {"bams": bams, "coverage_bams": coverage_bams,
-              "junctions_bed": merged_bed, "stringtie_gtf": gtf,
+              "junctions_bed": merged_bed,
+              "junctions_short_bed": merged_short,
+              "junctions_isoseq_bed": merged_iso,
+              "stringtie_gtf": gtf,
               "isoseq_gtf": isoseq_gtf, "short_gtf": short_gtf,
               "short_coverage_bams": short_cov_bams,
+              "isoseq_coverage_bams": isoseq_cov_bams,
+              "assembly_units": assembly_units,
               # boundary tolerance for Iso-Seq full-length ends:
               # HiFi (splice:hq) endpoints are near-exact (±10bp); CLR/ONT
               # or unknown (bam_isoseq) get the wider ±25bp
