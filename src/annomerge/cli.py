@@ -472,6 +472,17 @@ def merge(
         help="EVM evidence weight: miniprot homolog proteins (base; per-set weights "
              "apply in labeled multi-set mode).",
         rich_help_panel="EVM integration"),
+    w_isoseq_transcript_evm: int = typer.Option(
+        10, "--w-isoseq-transcript-evm",
+        help="EVM evidence weight: Iso-Seq full-length transcript assemblies. "
+             "Active only when isoseq*/ont/bam_isoseq RNA samples are present "
+             "(short-read StringTie keeps --w-transcript-evm).",
+        rich_help_panel="EVM integration"),
+    w_isoseq_gold_evm: int = typer.Option(
+        12, "--w-isoseq-gold-evm",
+        help="EVM evidence weight: Iso-Seq-origin TransDecoder Gold-set ORFs "
+             "(short-read-origin ORFs keep --w-gold-evm).",
+        rich_help_panel="EVM integration"),
     # ------------------------------------------------------------- augment
     augment: bool = typer.Option(
         False, "--augment",
@@ -563,6 +574,15 @@ def merge(
              "  [cyan]2[/cyan]  merged + one track per sample (largest; "
              "per-sample depth resolution)",
         rich_help_panel="Assessment & report"),
+    show_transcript_assembly: int = typer.Option(
+        1, "--show-transcript-assembly",
+        help="\b\nTranscript assembly tracks in the evidence browser:\n"
+             "  [cyan]0[/cyan]  none\n"
+             "  [cyan]1[/cyan]  (default) one merged track per platform pool "
+             "(Iso-Seq assembly + short-read assembly; a single combined "
+             "track when no long-read samples are present)\n"
+             "  [cyan]2[/cyan]  merged + one track per sample in each pool",
+        rich_help_panel="Assessment & report"),
     weight_only: bool = typer.Option(
         False, "--weight-only", help="Stop after the EVM weight table.",
         rich_help_panel="Assessment & report"),
@@ -577,6 +597,12 @@ def merge(
         20, "--min-intron",
         help="Min intron length (bp): hisat2 --min-intronlen and EVM "
              "--min_intron_length.",
+        rich_help_panel="Advanced"),
+    conf_isoseq_min_depth: int = typer.Option(
+        1, "--conf-isoseq-min-depth",
+        help="Confidence tiering, long-read RNA support: minimum long-read "
+             "depth for CDS coverage of single-exon transcripts (long reads "
+             "are sparse; the short-read metric uses the built-in 5x).",
         rich_help_panel="Advanced"),
     ploidy: int = typer.Option(
         2, "--ploidy",
@@ -813,7 +839,12 @@ def merge(
         threads=threads, min_intron=min_intron,
         w_gold=w_gold_evm, w_transcript=w_transcript_evm, w_protein=w_protein_evm,
         protein_set_weights=protein_evm_weights,
-        protein_membership=membership if multi else None)
+        protein_membership=membership if multi else None,
+        short_gtf=rna_res.get("short_gtf"),
+        isoseq_gtf=rna_res.get("isoseq_gtf"),
+        isoseq_tol_bp=rna_res.get("isoseq_tol_bp", 25),
+        w_isoseq_transcript=w_isoseq_transcript_evm,
+        w_isoseq_gold=w_isoseq_gold_evm)
     integ_gff3 = evm_res["evm_gff3"]
     integ_d = out / "06.merge"
     typer.secho(f"EVM output: {integ_gff3}", fg="green")
@@ -880,15 +911,19 @@ def merge(
         ensure_dir(out / "07.augment")   # evm mode: create the empty dir only
     conf_stats = confidence_annotation(
         final_gff3, vi.genome,
-        rna_res.get("junctions_bed"),
+        rna_res.get("junctions_short_bed") or rna_res.get("junctions_bed"),
         integ_d / "protein.gff3" if (integ_d / "protein.gff3").exists()
         else hom_res.get("gff"),
-        rna_res.get("coverage_bams") or rna_res.get("bams", []),
+        rna_res.get("short_coverage_bams")
+        or rna_res.get("coverage_bams") or rna_res.get("bams", []),
         final_d / "goldset.genome.gff3" if (final_d / "goldset.genome.gff3").exists()
         else integ_d / "goldset.genome.gff3",
         final_d / "sanity_filter.tsv",
         assess_d / "confidence.tsv",
-        protein_weights=protein_weights, threads=threads)
+        protein_weights=protein_weights, threads=threads,
+        junctions_isoseq_bed=rna_res.get("junctions_isoseq_bed"),
+        isoseq_bams=rna_res.get("isoseq_coverage_bams"),
+        isoseq_min_depth=conf_isoseq_min_depth)
     typer.secho(f"confidence tiers: {conf_stats or 'skipped (exists)'}", fg="green")
     # module 6b: tag the final GFF3 with the evidence verdict (Tier /
     # RNA_support / Protein_support / denovo_support / Flags on every gene
@@ -934,7 +969,8 @@ def merge(
         vw_res = run_viewer(out, vi, results, preds, details,
                             final_gff3, final_d, integ_d, threads,
                             full=(vw == "full"),
-                            show_rna_coverage=show_rna_coverage)
+                            show_rna_coverage=show_rna_coverage,
+                            show_transcript_assembly=show_transcript_assembly)
         typer.secho(f"evidence browser: {vw_res['html']}", fg="green")
     tracker.big_done()
     # publish layer removed: the module dirs themselves are the numbered
@@ -1149,6 +1185,15 @@ def evaluate(
              "(a single track)\n"
              "  [cyan]2[/cyan]  merged + one track per sample",
         rich_help_panel="Assessment & report"),
+    show_transcript_assembly: int = typer.Option(
+        1, "--show-transcript-assembly",
+        help="\b\nTranscript assembly tracks in the evidence browser:\n"
+             "  [cyan]0[/cyan]  none\n"
+             "  [cyan]1[/cyan]  (default) one merged track per platform pool "
+             "(Iso-Seq assembly + short-read assembly; a single combined "
+             "track when no long-read samples are present)\n"
+             "  [cyan]2[/cyan]  merged + one track per sample in each pool",
+        rich_help_panel="Assessment & report"),
     max_intron: Optional[int] = typer.Option(
         None, "--max-intron",
         help="Max intron length (bp) for hisat2/minimap2/miniprot. Default: "
@@ -1157,6 +1202,12 @@ def evaluate(
     min_intron: int = typer.Option(
         20, "--min-intron",
         help="Min intron length (bp): hisat2 --min-intronlen.",
+        rich_help_panel="Advanced"),
+    conf_isoseq_min_depth: int = typer.Option(
+        1, "--conf-isoseq-min-depth",
+        help="Confidence tiering, long-read RNA support: minimum long-read "
+             "depth for CDS coverage of single-exon transcripts (long reads "
+             "are sparse; the short-read metric uses the built-in 5x).",
         rich_help_panel="Advanced"),
     ploidy: int = typer.Option(
         2, "--ploidy",
@@ -1277,13 +1328,17 @@ def evaluate(
                        if len(set_w) > 1 else None)
     conf_stats = confidence_annotation(
         final_gff3, vi.genome,
-        rna_res.get("junctions_bed"),
+        rna_res.get("junctions_short_bed") or rna_res.get("junctions_bed"),
         hom_res.get("gff"),
-        rna_res.get("coverage_bams") or rna_res.get("bams", []),
+        rna_res.get("short_coverage_bams")
+        or rna_res.get("coverage_bams") or rna_res.get("bams", []),
         eval_d / "goldset.genome.gff3",
         None,
         assess_d / "confidence.tsv",
-        protein_weights=protein_weights, threads=threads)
+        protein_weights=protein_weights, threads=threads,
+        junctions_isoseq_bed=rna_res.get("junctions_isoseq_bed"),
+        isoseq_bams=rna_res.get("isoseq_coverage_bams"),
+        isoseq_min_depth=conf_isoseq_min_depth)
     typer.secho(f"confidence tiers: {conf_stats or 'skipped (exists)'}", fg="green")
     # module 6b: Tier / RNA_support / Protein_support / denovo_support /
     # Flags on every gene and mRNA + CDS numbering (same as merge)
@@ -1321,7 +1376,8 @@ def evaluate(
         vw_res = run_viewer(out, vi, results, vi.predictors or {}, {},
                             final_gff3, eval_d, eval_d, threads,
                             full=(vw == "full"),
-                            show_rna_coverage=show_rna_coverage)
+                            show_rna_coverage=show_rna_coverage,
+                            show_transcript_assembly=show_transcript_assembly)
         typer.secho(f"evidence browser: {vw_res['html']}", fg="green")
     tracker.big_done()
     typer.secho(f"deliverables: {out}/01.validate ... 09.result", fg="green")
