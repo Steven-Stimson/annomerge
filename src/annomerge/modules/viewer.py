@@ -978,10 +978,6 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
         cov_files.append(covcfg["merged"]["file"])
     for s in covcfg.get("samples", []):
         cov_files.append(s["file"])
-    if covcfg.get("merged_isoseq"):
-        cov_files.append(covcfg["merged_isoseq"]["file"])
-    for s in covcfg.get("samples_isoseq", []):
-        cov_files.append(s["file"])
     ann_names = ["final.gff3", "goldset.isoseq.gff3", "goldset.short.gff3",
                  "stringtie.gtf", "isoseq.stringtie.gtf"]
     ann_names += [a["file"] for a in tracks_cfg.get("assembly", [])]
@@ -1093,21 +1089,6 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
             color = sp[rank % len(sp)]
             label = f'RNA coverage: {s["name"]} (~{s["max"]:,.0f}x max)'
             cov_tracks.append(_wig(label, s["file"], color))
-    # Iso-Seq long-read coverage: separate track(s), isoseq theme color
-    mi = covcfg.get("merged_isoseq") or {}
-    if mi and _embedded(mi["file"]):
-        ni = mi.get("n_samples") or 1
-        label = (f'RNA coverage (Iso-Seq, {ni} samples, '
-                 f'~{mi["max"]:,.0f}x max)' if ni > 1 else
-                 f'RNA coverage (Iso-Seq: {mi.get("name", "sample")}, '
-                 f'~{mi["max"]:,.0f}x max)')
-        cov_tracks.append(_wig(label, mi["file"], th["isoseq"]))
-    for rank, s in enumerate(covcfg.get("samples_isoseq", [])):
-        if not _embedded(s["file"]):
-            continue
-        cov_tracks.append(_wig(
-            f'RNA coverage (Iso-Seq): {s["name"]} (~{s["max"]:,.0f}x max)',
-            s["file"], th["isoseq"]))
     html = html.replace("/*__COVERAGE_TRACK__*/",
                         ",\n".join(cov_tracks) + ("," if cov_tracks else ""))
 
@@ -1324,16 +1305,9 @@ def run_viewer(out: Path, vi, results: dict, preds: dict, details: dict,
     cov = sample_coverage(rna.get("coverage_bams") or rna.get("bams") or [],
                           data, threads,
                           mode=show_rna_coverage)
-    # separate Iso-Seq coverage track(s) (user request): long-read depth is
-    # sparse and invisible next to Illumina depth on the merged track
-    iso_cov_bams = rna.get("isoseq_coverage_bams") or []
-    if iso_cov_bams:
-        cov_iso = sample_coverage(iso_cov_bams, data, threads,
-                                  mode=show_rna_coverage, tag="isoseq")
-        if cov_iso.get("merged"):
-            cov["merged_isoseq"] = cov_iso["merged"]
-        if cov_iso.get("samples"):
-            cov["samples_isoseq"] = cov_iso["samples"]
+    # NOTE (user decision): NO separate Iso-Seq coverage track — long-read
+    # depth is sparse (~9x mean vs ~100x Illumina) and mostly empty space,
+    # so it adds browser size without visual value.
 
     # 3) tracks.json first: it copies denovo_<name>.gff3 into data/, which
     #    build_genes_json needs on disk to compute de novo evidence coverage
