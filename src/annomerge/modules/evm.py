@@ -6,7 +6,7 @@ transcripts (8) > homolog proteins via miniprot (6) > de novo predictions
 
 Steps:
   1. prep evidence: lift TransDecoder ORFs to genome coords, convert miniprot
-     GFF to EVM PROTEIN (match/match_part), stringtie GTF -> GFF3
+     GFF to both EVM PROTEIN and ABINITIO_PREDICTION, stringtie GTF -> GFF3
   2. write weights file
   3. partition -> write commands -> execute -> recombine (standard EVM flow)
 """
@@ -453,6 +453,88 @@ def _split_goldset_by_origin(lifted: Path, d: Path) -> dict:
     return res
 
 
+
+def miniprot_to_prediction_gff(miniprot_gff: Path, out_gff3: Path) -> Path:
+    """Convert miniprot alignments to EVM ABINITIO_PREDICTION gene models.
+
+    Miniprot writes mRNA/CDS/stop_codon rows and includes the terminal stop
+    codon in its CDS span. This matches AnnoMerge's EVM prediction convention
+    (goldset CDS also includes the stop), so CDS spans are preserved verbatim.
+    Each alignment remains a separate prediction; source is always 'miniprot'
+    so one weights.txt row controls the structural prediction channel.
+    """
+    if lazy([out_gff3], desc="miniprot->EVM prediction gff"):
+        return out_gff3
+    feats: dict[str, dict] = {}
+    with open(miniprot_gff) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 9:
+                continue
+            if f[2] == "mRNA":
+                m = re.search(r"ID=([^;]+)", f[8])
+                if m:
+                    feats[m.group(1)] = {
+                        "seqid": f[0], "strand": f[6],
+                        "cds": [], "stops": [],
+                    }
+            elif f[2] in ("CDS", "stop_codon"):
+                m = re.search(r"Parent=([^;]+)", f[8])
+                if not m or m.group(1) not in feats:
+                    continue
+                r = feats[m.group(1)]
+                if f[2] == "CDS":
+                    r["cds"].append((int(f[3]), int(f[4]),
+                                     int(f[7]) if f[7] != "." else 0))
+                else:
+                    r["stops"].append((int(f[3]), int(f[4])))
+
+    def _merged(intervals):
+        out = []
+        for s, e in sorted(intervals):
+            if out and s <= out[-1][1] + 1:
+                out[-1][1] = max(out[-1][1], e)
+            else:
+                out.append([s, e])
+        return [(s, e) for s, e in out]
+
+    n_pred = 0
+    used_ids: set[str] = set()
+    with open(out_gff3, "w") as out:
+        out.write("##gff-version 3\n")
+        for mid, r in feats.items():
+            if not r["cds"]:
+                continue
+            exons = _merged([(s, e) for s, e, _ in r["cds"]] + r["stops"])
+            cds = sorted(r["cds"])
+            if not exons or not cds:
+                continue
+            base = "miniprot." + re.sub(r"[^A-Za-z0-9_.:-]", "_", mid)
+            pid, suffix = base, 2
+            while pid in used_ids:
+                pid, suffix = f"{base}.{suffix}", suffix + 1
+            used_ids.add(pid)
+            gs = min(s for s, _ in exons)
+            ge = max(e for _, e in exons)
+            seqid, strand = r["seqid"], r["strand"]
+            out.write(f"{seqid}\tminiprot\tgene\t{gs}\t{ge}\t.\t{strand}\t.\t"
+                      f"ID={pid}.gene\n")
+            out.write(f"{seqid}\tminiprot\tmRNA\t{gs}\t{ge}\t.\t{strand}\t.\t"
+                      f"ID={pid};Parent={pid}.gene\n")
+            for i, (s, e) in enumerate(exons, 1):
+                out.write(f"{seqid}\tminiprot\texon\t{s}\t{e}\t.\t{strand}\t.\t"
+                          f"ID={pid}.exon{i};Parent={pid}\n")
+                for cs, ce, phase in cds:
+                    if s <= cs and ce <= e:
+                        out.write(f"{seqid}\tminiprot\tCDS\t{cs}\t{ce}\t.\t{strand}\t"
+                                  f"{phase}\tParent={pid}\n")
+            n_pred += 1
+    tracker.note("EVM miniprot predictions: %d models", n_pred)
+    return out_gff3
+
+
 # ---------------------------------------------------------------- weights + run
 def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
             stringtie_gtf: Path, miniprot_gff: Path, goldset_dir: Path,
@@ -468,13 +550,16 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
             extra_protein=None) -> dict:
     """preds: {name: (gff3_path, evm_weight)} — already filtered by scoring.
 
+    Miniprot intentionally enters both gene_predictions (one structural
+    ABINITIO_PREDICTION source at w_protein) and protein_alignments, so it
+    contributes candidate models as well as alignment support.
     protein_set_weights: {label: weight} — when given with >1 entries, the
     protein evidence carries per-set sources 'miniprot_<label>' (via
     protein_membership: {protein: label}) and the weights file gets one
     PROTEIN line per set, so closer relatives count more inside EVM.
     """
     d = ensure_dir(evm_dir)
-    tracker.note("evm: %d predictions + transcripts + proteins + goldset",
+    tracker.note("evm: %d de novo predictions + miniprot predictions + transcripts + proteins + goldset",
              len(preds))
 
     # 1. prep evidence files
@@ -532,10 +617,13 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
             goldset_files = {"goldset": rewrite_source(
                 g, "goldset", d / "goldset.src.gff3")}
     multi = protein_set_weights and len(protein_set_weights) > 1
+    miniprot_pred = None
     if miniprot_gff and Path(miniprot_gff).exists():
         evidence["miniprot"] = miniprot_to_protein_gff(
             Path(miniprot_gff), d / "protein.gff3",
             membership=protein_membership if multi else None)
+        miniprot_pred = miniprot_to_prediction_gff(
+            Path(miniprot_gff), d / "miniprot.prediction.gff3")
     # extra protein evidence (match/match_part GFF) merged into the same
     # PROTEIN alignments file; source name read from the GFF's column 2.
     extra_prot_sources: list[tuple[str, int]] = []
@@ -567,6 +655,8 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
     lines = []
     for name, (_, w) in pred_files.items():
         lines.append(f"ABINITIO_PREDICTION\t{name}\t{w}")
+    if miniprot_pred:
+        lines.append(f"ABINITIO_PREDICTION\tminiprot\t{w_protein}")
     if goldset_files.get("goldset"):
         lines.append(f"ABINITIO_PREDICTION\tgoldset\t{w_gold}")
     if goldset_files.get("isoseq_goldset"):
@@ -589,20 +679,22 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
     if lazy([final], desc="EVM run"):
         return {"evm_gff3": final, "weights": wfile}
 
-    # combine all gene predictions (incl. goldset) into one file — EVM takes a single input
+    # combine de novo, miniprot and goldset predictions into one EVM input
     combined = d / "pred.all.gff3"
     if not lazy([combined], desc="combine predictions"):
         with open(combined, "w") as out:
             out.write("##gff-version 3\n")
             for src in ([g for _, (g, _) in pred_files.items()]
-                        + [goldset_files.get("goldset"),
+                        + [miniprot_pred,
+                           goldset_files.get("goldset"),
                            goldset_files.get("isoseq_goldset")]):
                 if not src:
                     continue
-                for line in open(src):
-                    if line.startswith("#"):
-                        continue
-                    out.write(line)
+                with open(src) as src_fh:
+                    for line in src_fh:
+                        if line.startswith("#"):
+                            continue
+                        out.write(line)
 
     # ---- EVM execution: whole-genome (single thread) or size-balanced
     # parts, one part per thread (genome split granularity matches the
@@ -635,21 +727,23 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
     # concatenate per-accession gff3s in the ORIGINAL genome order
     if not lazy([final], desc="EVM final concat"):
         acc_order = []
-        for line in open(vi.genome):
-            if line.startswith(">"):
-                acc_order.append(line[1:].split()[0])
+        with open(vi.genome) as genome_fh:
+            for line in genome_fh:
+                if line.startswith(">"):
+                    acc_order.append(line[1:].split()[0])
         with open(final, "w") as out:
             header_done = False
             for acc in acc_order:
                 pg = acc_gffs.get(acc)
                 if pg is None or not pg.exists():
                     continue
-                for gline in open(pg):
-                    if gline.startswith("##gff-version"):
-                        if not header_done:
-                            out.write(gline)
-                            header_done = True
-                        continue
-                    out.write(gline)
+                with open(pg) as pg_fh:
+                    for gline in pg_fh:
+                        if gline.startswith("##gff-version"):
+                            if not header_done:
+                                out.write(gline)
+                                header_done = True
+                            continue
+                        out.write(gline)
     tracker.note("evm done: %s", final)
     return {"evm_gff3": final, "weights": wfile}
