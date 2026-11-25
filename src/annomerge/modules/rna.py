@@ -131,18 +131,34 @@ def align_minimap2(sample, genome: Path, bam_dir: Path, threads: int,
     return bam
 
 
-def extract_junctions(bam: Path, out_bed: Path, min_reads: int = 1) -> Path:
+def extract_junctions(bam: Path, out_bed: Path, min_reads: int = 1,
+                      stats_out: Path | None = None) -> Path:
     """Extract splice junctions (CIGAR N blocks) with per-junction read counts.
 
+    When stats_out is given, the same single BAM pass also records primary
+    total/mapped read counts for the report. This avoids a second whole-BAM
+    scan solely for RNA alignment statistics. Secondary/supplementary records
+    are excluded from both counts, so split long reads cannot inflate rates.
     Strand: minimap2 splice alignments carry the ts tag (transcript strand);
     everything else falls back to the alignment direction.
     """
-    if lazy([out_bed], desc=f"junctions {bam.stem}"):
+    cache = [out_bed] + ([stats_out] if stats_out is not None else [])
+    if lazy(cache, desc=f"junctions {bam.stem}"):
         return out_bed
     ensure_dir(out_bed.parent)
     counts: dict[tuple[str, int, int, str], int] = defaultdict(int)
+    total = mapped = paired = proper = 0
     with pysam.AlignmentFile(str(bam), "rb") as af:
         for read in af.fetch(until_eof=True):
+            is_primary = not read.is_secondary and not read.is_supplementary
+            if is_primary:
+                total += 1
+                if read.is_paired:
+                    paired += 1
+                if not read.is_unmapped:
+                    mapped += 1
+                    if read.is_proper_pair:
+                        proper += 1
             if read.is_unmapped or not read.cigartuples:
                 continue
             pos = read.reference_start
@@ -160,6 +176,13 @@ def extract_junctions(bam: Path, out_bed: Path, min_reads: int = 1) -> Path:
         for (chrom, s, e, strand), n in sorted(counts.items()):
             if n >= min_reads:
                 fh.write(f"{chrom}\t{s}\t{e}\t.\t{n}\t{strand}\n")
+    if stats_out is not None:
+        import json
+        stats_out.write_text(json.dumps({
+            "total": total, "mapped": mapped, "paired": paired,
+            "proper_pairs": proper,
+            "rate": round(100.0 * mapped / total, 2) if total else None,
+        }) + "\n")
     tracker.note("splice junctions: %d (>= %d reads) from %s", sum(1 for v in counts.values() if v >= min_reads),
              min_reads, bam.name)
     return out_bed
@@ -417,7 +440,10 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
     beds = []
     bed_platform: dict = {}
     for bam in bams:
-        bed = extract_junctions(bam, bam_dir / (Path(bam).stem + ".junctions.bed"))
+        stats_path = bam_dir / (Path(bam).stem + ".alignment.json")
+        bed = extract_junctions(
+            bam, bam_dir / (Path(bam).stem + ".junctions.bed"),
+            stats_out=stats_path)
         beds.append(bed)
         bed_platform[bed] = bam_platform.get(bam, "short")
     merged_bed = merge_junctions(beds, rdir / "junctions.bed") if beds else None

@@ -127,18 +127,18 @@
 
 <h3>2.1 RNA alignment</h3>
 {% if workflow.rna_align %}
-<p>Per-sample RNA alignment rate (HISAT2 for short reads, minimap2 for
-long reads / transcripts; minimap2 rates are primary-alignment rates
-computed from the BAM):</p>
+<p>Per-sample RNA alignment statistics. HISAT2 rates come from its log;
+pre-aligned BAM inputs are counted directly during junction extraction
+(secondary/supplementary records are excluded from primary-read counts):</p>
 <div class="chart">{{ workflow.rna_chart }}</div>
 <table>
-  <tr><th>Sample</th><th>Aligner</th><th class="num">Alignment rate</th></tr>
+  <tr><th>Sample</th><th>Aligner / input</th><th class="num">Primary reads</th><th class="num">Mapped reads</th><th class="num">Alignment rate</th></tr>
   {% for r in workflow.rna_align %}
-  <tr><td>{{ r.sample }}</td><td>{{ r.aligner }}</td><td class="num">{{ "%.2f"|format(r.rate) }}%</td></tr>
+  <tr><td>{{ r.sample }}</td><td>{{ r.aligner }}</td><td class="num">{% if r.total is defined %}{{ r.total }}{% else %}&mdash;{% endif %}</td><td class="num">{% if r.mapped is defined %}{{ r.mapped }}{% else %}&mdash;{% endif %}</td><td class="num">{{ "%.2f"|format(r.rate) }}%</td></tr>
   {% endfor %}
 </table>
 {% else %}
-<p class="note">No RNA evidence in this run.</p>
+<p class="note">No RNA alignment statistics available.</p>
 {% endif %}
 
 <h3>2.2 Homolog protein alignment</h3>

@@ -708,7 +708,7 @@ def rna_alignment_stats(out: Path) -> list:
     long-read alignments cannot inflate the rate past 100%.
     Rows: {sample, rate, aligner}. Missing samtools/BAM -> sample skipped.
     """
-    import shutil, subprocess
+    import json, shutil, subprocess
     rows = []
     bam_dir = Path(out) / "02.rnaseq" / "bam"
     for logf in sorted(bam_dir.glob("*.hisat2.log")):
@@ -738,6 +738,34 @@ def rna_alignment_stats(out: Path) -> list:
         else:
             log.info("rna alignment rate skipped for %s "
                      "(samtools count failed or 0 reads)", name)
+    # Pre-aligned BAM inputs have no aligner log. run_rna_branch writes these
+    # JSON files during the existing junction scan; merge them here without
+    # re-scanning the BAM. The same records also add read counts to log-based
+    # rows when available.
+    by_sample = {r["sample"]: r for r in rows}
+    for stats_file in sorted(bam_dir.glob("*.alignment.json")):
+        try:
+            stats = json.loads(stats_file.read_text())
+        except (OSError, ValueError):
+            log.warning("invalid RNA alignment stats: %s", stats_file)
+            continue
+        name = stats_file.name.removesuffix(".alignment.json")
+        if name.endswith(".sorted"):
+            name = name[:-len(".sorted")]
+        total = stats.get("total")
+        mapped = stats.get("mapped")
+        row = by_sample.get(name)
+        if row is None:
+            if not total or mapped is None:
+                continue
+            row = {"sample": name,
+                   "rate": round(100.0 * mapped / total, 2),
+                   "aligner": "pre-aligned BAM"}
+            rows.append(row)
+            by_sample[name] = row
+        for key in ("total", "mapped", "paired", "proper_pairs"):
+            if stats.get(key) is not None:
+                row[key] = stats[key]
     return rows
 
 

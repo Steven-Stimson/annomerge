@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Regression test for junction generation from pre-aligned BAM input."""
+import json
 import sys
 import tempfile
 import unittest
@@ -36,6 +37,16 @@ class PrealignedBamTests(unittest.TestCase):
                 read.cigartuples = [(0, 50), (3, 100), (0, 50)]
                 read.query_qualities = pysam.qualitystring_to_array("I" * 100)
                 out.write(read)
+                supp = pysam.AlignedSegment()
+                supp.query_name = "spliced_read.supp"
+                supp.query_sequence = "A" * 100
+                supp.flag = 2048
+                supp.reference_id = 0
+                supp.reference_start = 99
+                supp.mapping_quality = 60
+                supp.cigartuples = [(0, 50), (3, 100), (0, 50)]
+                supp.query_qualities = pysam.qualitystring_to_array("I" * 100)
+                out.write(supp)
             pysam.index(str(bam))
 
             sample = RnaSample(files=[bam], tag="bam", name_override="sample")
@@ -55,11 +66,14 @@ class PrealignedBamTests(unittest.TestCase):
             bam_dir = outdir / "02.rnaseq" / "bam"
             self.assertTrue(bam_dir.is_dir())
             per_sample = bam_dir / "sample.sorted.junctions.bed"
-            self.assertEqual(per_sample.read_text(), "chr1\t149\t249\t.\t1\t+\n")
+            self.assertEqual(per_sample.read_text(), "chr1\t149\t249\t.\t2\t+\n")
             self.assertEqual(Path(result["junctions_bed"]).read_text(),
-                             "chr1\t149\t249\t1\t1\t+\n")
+                             "chr1\t149\t249\t1\t2\t+\n")
             self.assertEqual(Path(result["junctions_short_bed"]).read_text(),
-                             "chr1\t149\t249\t1\t1\t+\n")
+                             "chr1\t149\t249\t1\t2\t+\n")
+            stats = json.loads((bam_dir / "sample.sorted.alignment.json").read_text())
+            self.assertEqual(stats, {"total": 1, "mapped": 1, "paired": 0,
+                                     "proper_pairs": 0, "rate": 100.0})
             self.assertIsNone(result["junctions_isoseq_bed"])
 
 
