@@ -2,7 +2,8 @@
 
 Checks, per CLI design v2.1:
   - genome FASTA exists; seqids extracted
-  - -p homolog FASTA is MANDATORY; headers must carry species tags (>id|species=Genus_species)
+  - -p homolog FASTA is MANDATORY; explicit labels supply missing species tags
+    (>id|species=Genus_species), while legacy unlabeled inputs stay strict
   - -P predictor list parsing (name=path, comma-separated; unnamed -> filename stem)
   - -r RNA list file parsing (fastq/bam/bam_isoseq/gtf tags), mutually exclusive with --bam/--transcripts
   - --busco-lineage local BUSCO odb lineage (offline completeness QC)
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import gzip
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from ..utils import tracker
@@ -402,25 +404,56 @@ def parse_rna_entries(entries: list[str] | None) -> list[RnaSample]:
     return samples
 
 
-_LABEL_RE = __import__("re").compile(r"^[A-Za-z0-9_.\-]+$")
+_LABEL_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+_SPECIES_TAG_RE = re.compile(r"\|species=[^\s|]+")
 
-def parse_homolog_sets(spec: str) -> "dict[str, list[Path]]":
-    """Parse '-p id1=a.fa,b.fa,id2=c.pep' -> {label: [paths]}.
 
-    A 'label=path' item starts a labeled set; every following UNLABELED
-    item joins the most recent labeled set, so one label may span several
-    files (-p ID1=1.1.fa,1.2.fa,ID2=2.1.fa,2.2.fa = two 2-file sets).
-    Items seen before any label (or when no label is given at all) each
-    form their own set named by filename stem (legacy behaviour).
-    Labels must be unique and match [A-Za-z0-9_.-] (they become EVM
-    source names / report columns).
+def _expand_homolog_items(spec: str) -> list[str]:
+    """Expand .txt/.list protein sheets into inline label=path items.
+
+    Each non-empty, non-comment list line must be ID=path. Relative paths are
+    resolved against the list file's directory, not the process working
+    directory, so a sheet remains portable when AnnoMerge is launched elsewhere.
     """
-    out: "dict[str, list[Path]]" = {}
-    cur: str | None = None   # most recent explicit label
-    for item in spec.split(","):
-        item = item.strip()
+    items: list[str] = []
+    for raw in spec.split(","):
+        item = raw.strip()
         if not item:
             continue
+        if not item.lower().endswith(_LIST_SUF):
+            items.append(item)
+            continue
+        list_path = _require(item, "homolog protein list (-p)").resolve()
+        if not list_path.is_file():
+            raise InputError(f"homolog protein list is not a file: {list_path}")
+        with open(list_path) as fh:
+            for ln, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    raise InputError(
+                        f"{list_path}:{ln}: expected ID=path for a homolog protein set"
+                    )
+                label, raw_path = line.split("=", 1)
+                label, raw_path = label.strip(), raw_path.strip()
+                if not label or not raw_path:
+                    raise InputError(
+                        f"{list_path}:{ln}: expected non-empty ID=path"
+                    )
+                p = Path(raw_path).expanduser()
+                if not p.is_absolute():
+                    p = list_path.parent / p
+                items.append(f"{label}={p.resolve()}")
+    return items
+
+
+def _parse_homolog_sets(spec: str) -> tuple[dict[str, list[Path]], set[str]]:
+    """Parse protein items and also return the explicitly labeled set names."""
+    out: dict[str, list[Path]] = {}
+    explicit: set[str] = set()
+    cur: str | None = None   # most recent explicit label
+    for item in _expand_homolog_items(spec):
         if "=" in item:
             label, p = item.split("=", 1)
             label = label.strip()
@@ -434,6 +467,7 @@ def parse_homolog_sets(spec: str) -> "dict[str, list[Path]]":
                     f"files, list them after the label instead — e.g. {label}=a.fa,b.fa"
                 )
             out[label] = []
+            explicit.add(label)
             cur = label
         else:
             p = item
@@ -451,7 +485,22 @@ def parse_homolog_sets(spec: str) -> "dict[str, list[Path]]":
         out[label].append(_require(p.strip(), f"homolog protein FASTA (set {label})"))
     if not out:
         raise InputError("homolog protein FASTA (-p) is empty")
-    return out
+    return out, explicit
+
+
+def parse_homolog_sets(spec: str) -> dict[str, list[Path]]:
+    """Parse '-p id1=a.fa,b.fa,id2=c.pep' or a .txt/.list ID=path sheet.
+
+    A 'label=path' item starts a labeled set; every following UNLABELED
+    item joins the most recent labeled set, so one label may span several
+    files (-p ID1=1.1.fa,1.2.fa,ID2=2.1.fa,2.2.fa = two 2-file sets).
+    Items seen before any label (or when no label is given at all) each
+    form their own set named by filename stem (legacy behaviour).
+    Labels must be unique and match [A-Za-z0-9_.-] (they become EVM
+    source names / report columns).
+    """
+    return _parse_homolog_sets(spec)[0]
+
 
 def check_homolog_headers(path: Path, scan: int = 1000) -> None:
     """Require '>id|species=Genus_species' headers in homolog FASTA."""
@@ -467,6 +516,38 @@ def check_homolog_headers(path: Path, scan: int = 1000) -> None:
             f"{path}: {bad} header(s) in first {scan} lack '|species=Genus_species' tag. "
             "Homolog headers must carry a species tag, e.g. '>protID|species=Genus_species'."
         )
+
+
+def normalize_homolog_species(path: Path, species: str, dest: Path) -> Path:
+    """Write an internal FASTA with missing species tags filled from ``species``.
+
+    The source is never modified. Existing non-empty ``|species=...`` tags on
+    protein identifiers are preserved for backward compatibility; plain
+    identifiers and their optional descriptions are otherwise kept intact.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    n_seq, n_added = 0, 0
+    with _open(path) as src, open(dest, "w") as out:
+        for line in src:
+            if not line.startswith(">"):
+                out.write(line)
+                continue
+            n_seq += 1
+            header = line[1:].rstrip("\r\n")
+            if not header.strip():
+                raise InputError(f"{path}: empty FASTA identifier")
+            protein_id = header.split(None, 1)[0]
+            description = header[len(protein_id):]
+            if not _SPECIES_TAG_RE.search(protein_id):
+                protein_id += f"|species={species}"
+                n_added += 1
+            out.write(f">{protein_id}{description}\n")
+    if not n_seq:
+        raise InputError(f"no sequences found in homolog protein FASTA: {path}")
+    log.info("homolog set %s: added species tags to %d/%d headers -> %s",
+             species, n_added, n_seq, dest.name)
+    return dest
+
 
 def merge_homolog_fastas(sets: "dict[str, Path]", dest: Path) -> tuple[int, Path]:
     """Concatenate multiple labeled homolog protein FASTAs into one (cached at dest).
@@ -565,8 +646,10 @@ def validate(
 ) -> ValidatedInputs:
     """Fail-fast validation shared by merge and evaluate.
 
-    -p accepts 'label=path' items or plain paths, comma-separated
-    ('-p scer=scer.pep,sklu=sklu.pep'); plain items take their filename stem.
+    -p accepts 'label=path' items, plain paths, or a .txt/.list sheet with
+    one ID=path per line; relative sheet paths use the sheet's directory.
+    Explicit labels supply missing species tags in a generated internal FASTA.
+    Plain items take their filename stem and retain the legacy header checks.
     Multiple files are header-checked individually and concatenated (cached
     under the input dir) so every downstream consumer keeps seeing one
     transparent FASTA; a protein->set membership table is kept alongside.
@@ -590,7 +673,7 @@ def validate(
     gids = set(fasta_seqids(g))
     tracker.note("genome: %d sequences", len(gids))
 
-    h_lists = parse_homolog_sets(homologs)
+    h_lists, explicit_labels = _parse_homolog_sets(homologs)
     # flatten multi-file labels into one cached FASTA per set (downstream
     # expects {label: Path}); single-file sets pass through unchanged
     h_sets: dict[str, Path] = {}
@@ -613,10 +696,23 @@ def validate(
             log.info("homolog set %s: %d files merged -> %s",
                      _lab, len(_paths), _mp.name)
             h_sets[_lab] = _mp
+    # Explicit labels are the command-line species fallback. Normalize into
+    # the writable input tree; never rewrite a user's original FASTA.
+    for _lab in explicit_labels:
+        _p = h_sets[_lab]
+        if inroot:
+            _np = inroot / "proteins" / f"homolog_set.{_lab}.species.faa"
+            normalize_homolog_species(_p, _lab, _np)
+            manifest.append((str(_p.resolve()), str(_np),
+                             "generated(proteins-species)"))
+            h_sets[_lab] = _np
+        else:
+            # Preserve the no-workdir API for already tagged legacy files.
+            check_homolog_headers(_p)
     # option B: multiple UNLABELED files are one protein pool (mnp filtering
     # at stage 03 handles divergence; no per-set scoring).  Explicit
     # id=path labels keep the dormant relatedness-weighted multi-set mode.
-    labeled = any("=" in it for it in homologs.split(","))
+    labeled = bool(explicit_labels)
     membership = None
     if len(h_sets) == 1:
         label, hp = next(iter(h_sets.items()))

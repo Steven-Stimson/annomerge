@@ -259,6 +259,10 @@ weights and integrate all evidence into a final annotation.
   annomerge merge -g genome.fa -P denovo1=a.gff3,denovo3=c.gff3 \\
       -p near=near.pep,far=far.fa -r leaf_r1.fq,leaf_r2.fq
 
+  # protein sheet: one species/set per line, ID=path (plain FASTA headers OK)
+  annomerge merge -g genome.fa -P denovo1=a.gff3,denovo3=c.gff3 \\
+      -p proteins.list -r leaf_r1.fq,leaf_r2.fq
+
   # multiple unlabeled protein files (merged into one mnp-filtered pool)
   annomerge merge -g genome.fa -P denovo1=a.gff3 -p a.pep,b.pep,c.fa \\
       -r rnaseq_r1.fq,rnaseq_r2.fq
@@ -344,7 +348,11 @@ def merge(
              "[blue]-p[/blue] near=near.pep [blue]-p[/blue] far=far.fa; "
              "unlabeled -> filename stem). Files after a label join that "
              "label's set: [blue]-p[/blue] near=n1.pep,n2.pep puts both in set "
-             "'near'. Headers: >id|species=Genus_species. "
+             "'near'. A .txt/.list file contains one ID=path per line; relative "
+             "paths resolve from the list file's directory. Explicit IDs supply "
+             "missing species metadata, so plain >protein_id headers are accepted "
+             "for labeled sets; existing >id|species=Genus_species tags are kept. "
+             "Unlabeled files still require species-tagged headers. "
              "Multiple UNLABELED files merge into one protein pool (mnp-filtered, "
              "unweighted); explicit labels keep the relatedness-weighted multi-set mode.",
         rich_help_panel="Input files"),
@@ -1156,8 +1164,9 @@ def evaluate(
     homologs: Optional[List[str]] = typer.Option(
         None, "--proteins", "-p",
         help="[bold green]MANDATORY[/bold green]. Homolog protein FASTA "
-             "(repeat [blue]-p[/blue] per set, or 'label=path' comma list; "
-             "same rules as merge --proteins).",
+             "(repeat [blue]-p[/blue] per set, use a 'label=path' comma list, "
+             "or provide a .txt/.list sheet of ID=path lines; same species-header "
+             "rules as merge --proteins).",
         rich_help_panel="Input files"),
     predictors: Optional[List[str]] = typer.Option(
         None, "--predictions", "-P",
