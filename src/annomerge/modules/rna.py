@@ -139,6 +139,7 @@ def extract_junctions(bam: Path, out_bed: Path, min_reads: int = 1) -> Path:
     """
     if lazy([out_bed], desc=f"junctions {bam.stem}"):
         return out_bed
+    ensure_dir(out_bed.parent)
     counts: dict[tuple[str, int, int, str], int] = defaultdict(int)
     with pysam.AlignmentFile(str(bam), "rb") as af:
         for read in af.fetch(until_eof=True):
@@ -330,7 +331,10 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
     bam_platform: dict = {}           # bam path -> "short" | "isoseq" (junction pooling)
     units: list[dict] = []
     idx = None
-    bam_dir = rdir / "bam"
+    # Pre-aligned BAM inputs bypass align_sample/align_minimap2, which used
+    # to be the only callers that created this directory before junction BEDs
+    # were written here.
+    bam_dir = ensure_dir(rdir / "bam")
 
     if any(s.tag in ("fastq", "fasta", "mix") for s in vi.rna_fastqs):
         idx = build_index(vi.genome, rdir / "hisat2_index", threads)
