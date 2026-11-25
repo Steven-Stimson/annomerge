@@ -109,12 +109,13 @@ class MiniprotPredictionTests(unittest.TestCase):
             kind, source, weight = line.split("\t")
             weights[(kind, source)] = int(weight)
         self.assertEqual(weights[("ABINITIO_PREDICTION", "denovo")], 5)
-        self.assertEqual(weights[("ABINITIO_PREDICTION", "miniprot")], 6)
+        self.assertEqual(weights[("OTHER_PREDICTION", "miniprot")], 6)
+        self.assertNotIn(("ABINITIO_PREDICTION", "miniprot"), weights)
         self.assertEqual(weights[("ABINITIO_PREDICTION", "goldset")], 10)
         self.assertEqual(weights[("PROTEIN", "miniprot")], 6)
-        self.assertGreater(weights[("ABINITIO_PREDICTION", "miniprot")],
+        self.assertGreater(weights[("OTHER_PREDICTION", "miniprot")],
                            weights[("ABINITIO_PREDICTION", "denovo")])
-        self.assertLess(weights[("ABINITIO_PREDICTION", "miniprot")],
+        self.assertLess(weights[("OTHER_PREDICTION", "miniprot")],
                         weights[("ABINITIO_PREDICTION", "goldset")])
 
         combined = _rows(outdir / "pred.all.gff3")

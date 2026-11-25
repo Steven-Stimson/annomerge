@@ -6,7 +6,7 @@ transcripts (8) > homolog proteins via miniprot (6) > de novo predictions
 
 Steps:
   1. prep evidence: lift TransDecoder ORFs to genome coords, convert miniprot
-     GFF to both EVM PROTEIN and ABINITIO_PREDICTION, stringtie GTF -> GFF3
+     GFF to both EVM PROTEIN and OTHER_PREDICTION, stringtie GTF -> GFF3
   2. write weights file
   3. partition -> write commands -> execute -> recombine (standard EVM flow)
 """
@@ -455,7 +455,9 @@ def _split_goldset_by_origin(lifted: Path, d: Path) -> dict:
 
 
 def miniprot_to_prediction_gff(miniprot_gff: Path, out_gff3: Path) -> Path:
-    """Convert miniprot alignments to EVM ABINITIO_PREDICTION gene models.
+    """Convert miniprot alignments to EVM OTHER_PREDICTION gene models.
+    Homology-based predictions keep terminal exons but do not participate in
+    EVM's ab-initio intergenic scoring.
 
     Miniprot writes mRNA/CDS/stop_codon rows and includes the terminal stop
     codon in its CDS span. This matches AnnoMerge's EVM prediction convention
@@ -551,7 +553,7 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
     """preds: {name: (gff3_path, evm_weight)} — already filtered by scoring.
 
     Miniprot intentionally enters both gene_predictions (one structural
-    ABINITIO_PREDICTION source at w_protein) and protein_alignments, so it
+    OTHER_PREDICTION source at w_protein) and protein_alignments, so it
     contributes candidate models as well as alignment support.
     protein_set_weights: {label: weight} — when given with >1 entries, the
     protein evidence carries per-set sources 'miniprot_<label>' (via
@@ -656,7 +658,7 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
     for name, (_, w) in pred_files.items():
         lines.append(f"ABINITIO_PREDICTION\t{name}\t{w}")
     if miniprot_pred:
-        lines.append(f"ABINITIO_PREDICTION\tminiprot\t{w_protein}")
+        lines.append(f"OTHER_PREDICTION\tminiprot\t{w_protein}")
     if goldset_files.get("goldset"):
         lines.append(f"ABINITIO_PREDICTION\tgoldset\t{w_gold}")
     if goldset_files.get("isoseq_goldset"):

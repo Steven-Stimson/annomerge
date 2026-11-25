@@ -477,7 +477,7 @@ def merge(
         rich_help_panel="EVM integration"),
     w_protein_evm: int = typer.Option(
         6, "--w-protein-evm",
-        help="EVM weight for miniprot as both structural ABINITIO_PREDICTION "
+        help="EVM weight for miniprot as both structural OTHER_PREDICTION "
              "and PROTEIN evidence (default 6: above de novo 1-5, below goldset 10; "
              "per-set PROTEIN weights still apply in labeled multi-set mode).",
         rich_help_panel="EVM integration"),
