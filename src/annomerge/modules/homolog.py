@@ -232,11 +232,15 @@ def run_miniprot(genome: Path, proteins: Path, out_dir: Path, threads: int,
             if max_intron:
                 cmd += ["-G", str(max_intron)]
             cmd += [str(genome), str(proteins)]
-            with open(raw, "w") as fh:
+            # Keep machine-readable stdout separate from miniprot's concurrent
+            # worker progress on stderr.  stderr=STDOUT can splice a progress
+            # line into a GFF attribute/PAF row and silently corrupt evidence.
+            raw_log = raw.with_name(raw.name + ".log")
+            with open(raw, "w") as fh, open(raw_log, "w") as log_fh:
                 import subprocess
-                rc = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT).returncode
+                rc = subprocess.run(cmd, stdout=fh, stderr=log_fh).returncode
             if rc != 0:
-                raise ToolError(f"miniprot failed (rc={rc}): see {raw}")
+                raise ToolError(f"miniprot failed (rc={rc}): see {raw_log}")
     if not lazy([paf, gff], desc="miniprot mnp-filter"):
         counts = filter_miniprot_alignments(raw_gff, raw_paf, gff, paf,
                                             proteins, filt or {})
