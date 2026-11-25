@@ -1175,11 +1175,32 @@ def render_offline_html(data_dir: Path, out_html: Path, *,
 def _split_goldset_display(src: Path, data_dir: Path) -> dict:
     """Split the UTR-injected display goldset into per-platform track files:
     goldset.isoseq.gff3 (mRNAs carrying origin=isoseq) and
-    goldset.short.gff3 (all the rest).  Gene/mRNA/feature blocks are kept
-    intact; the isoseq file is only written when non-empty.  Returns
-    {"isoseq": name|None, "short": name|None}."""
-    blocks: list = []          # [origin, [lines]]
-    cur_origin, cur = "short", []
+    goldset.short.gff3 (all the rest).  Rows are routed by their OWNING
+    mRNA (own ID for mRNA rows, Parent= for exon/CDS/UTR rows) — NOT by
+    positional gene blocks: inject_utr_features appends the UTR rows at
+    the END of the file, far from their mRNA, and positional routing
+    mis-assigns them into the other platform's file where igv renders
+    them as orphan solid blocks.  A gene row goes to every file that
+    contains at least one of its mRNAs.  The isoseq file is only written
+    when non-empty.  Returns {"isoseq": name|None, "short": name|None}."""
+    org_of: dict = {}          # mRNA id -> isoseq|short
+    gene_orgs: dict = {}       # gene id -> set of origins
+    with open(src) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 9 or f[2] != "mRNA":
+                continue
+            m = re.search(r"ID=([^;]+)", f[8])
+            if not m:
+                continue
+            org = "isoseq" if "origin=isoseq" in f[8] else "short"
+            org_of[m.group(1)] = org
+            p = re.search(r"Parent=([^;]+)", f[8])
+            if p:
+                gene_orgs.setdefault(p.group(1), set()).add(org)
+    bufs: dict = {"isoseq": [], "short": []}
     with open(src) as fh:
         for line in fh:
             if line.startswith("#"):
@@ -1188,24 +1209,21 @@ def _split_goldset_display(src: Path, data_dir: Path) -> dict:
             if len(f) < 9:
                 continue
             if f[2] == "gene":
-                if cur:
-                    blocks.append((cur_origin, cur))
-                cur_origin, cur = "short", [line]
-            else:
-                if f[2] == "mRNA":
-                    cur_origin = ("isoseq" if "origin=isoseq" in f[8]
-                                  else "short")
-                cur.append(line)
-    if cur:
-        blocks.append((cur_origin, cur))
+                m = re.search(r"ID=([^;]+)", f[8])
+                for org in (gene_orgs.get(m.group(1)) if m else None) or {"short"}:
+                    bufs[org].append(line)
+                continue
+            key_m = (re.search(r"ID=([^;]+)", f[8]) if f[2] == "mRNA"
+                     else re.search(r"Parent=([^;]+)", f[8]))
+            org = org_of.get(key_m.group(1), "short") if key_m else "short"
+            bufs[org].append(line)
     out = {"isoseq": None, "short": None}
     for org, fname in (("isoseq", "goldset.isoseq.gff3"),
                        ("short", "goldset.short.gff3")):
-        lines = [l for o, blk in blocks if o == org for l in blk]
-        if lines:
+        if bufs[org]:
             with open(data_dir / fname, "w") as fh:
                 fh.write("##gff-version 3\n")
-                fh.writelines(lines)
+                fh.writelines(bufs[org])
             out[org] = fname
     log.info("viewer: goldset split -> isoseq=%s short=%s",
              out["isoseq"], out["short"])

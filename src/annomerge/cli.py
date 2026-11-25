@@ -604,6 +604,12 @@ def merge(
              "ABINITIO_PREDICTION: GFF_PATH[:WEIGHT] (default weight=10). "
              "Repeatable. Bypasses module-05 scoring (source name = file stem).",
         rich_help_panel="Advanced"),
+    extra_protein: list[str] = typer.Option(
+        None, "--extra-protein",
+        help="External protein evidence (match/match_part GFF) merged into the "
+             "EVM PROTEIN alignments: GFF_PATH[:WEIGHT] (default weight=12). "
+             "Repeatable. Source name = file stem.",
+        rich_help_panel="Advanced"),
     conf_isoseq_min_depth: int = typer.Option(
         1, "--conf-isoseq-min-depth",
         help="Confidence tiering, long-read RNA support: minimum long-read "
@@ -857,7 +863,10 @@ def merge(
         isoseq_gtf=rna_res.get("isoseq_gtf"),
         isoseq_tol_bp=rna_res.get("isoseq_tol_bp", 25),
         w_isoseq_transcript=w_isoseq_transcript_evm,
-        w_isoseq_gold=w_isoseq_gold_evm)
+        w_isoseq_gold=w_isoseq_gold_evm,
+        extra_protein=[(Path(xp.rsplit(":", 1)[0] if ":" in xp and xp.rsplit(":", 1)[1].isdigit() else xp),
+                        int(xp.rsplit(":", 1)[1]) if ":" in xp and xp.rsplit(":", 1)[1].isdigit() else 12)
+                       for xp in (extra_protein or [])])
     integ_gff3 = evm_res["evm_gff3"]
     integ_d = out / "06.merge"
     typer.secho(f"EVM output: {integ_gff3}", fg="green")

@@ -40,6 +40,8 @@ c1\tgoldset\tCDS\t100\t1500\t.\t+\t0\tID=gb1;Parent=tx_b
 c1\tgoldset\tgene\t100\t1500\t.\t+\t.\tID=gg3
 c1\tgoldset\tmRNA\t100\t1500\t.\t+\t.\tID=tx_c;Parent=gg3;origin=isoseq
 c1\tgoldset\tCDS\t100\t1500\t.\t+\t0\tID=gc1;Parent=tx_c
+c1\tgoldset\tfive_prime_UTR\t100\t199\t.\t+\t.\tParent=tx_a
+c1\tgoldset\tthree_prime_UTR\t1400\t1500\t.\t+\t.\tParent=tx_b
 """)
 
 # confidence.tsv with 20 columns (has_long run)
@@ -108,7 +110,16 @@ iso_txt = (data / "goldset.isoseq.gff3").read_text()
 short_txt = (data / "goldset.short.gff3").read_text()
 assert "tx_a" in iso_txt and "tx_c" in iso_txt and "tx_b" not in iso_txt
 assert "tx_b" in short_txt and "tx_a" not in short_txt and "tx_c" not in short_txt
-print("goldset split OK")
+# UTR rows appended at file end must follow their PARENT mRNA's platform
+assert "Parent=tx_a" in iso_txt and "Parent=tx_a" not in short_txt
+assert "Parent=tx_b" in short_txt and "Parent=tx_b" not in iso_txt
+# no orphan features: every Parent= reference resolves within the same file
+import re as _re
+for name, txt in (("isoseq", iso_txt), ("short", short_txt)):
+    ids = set(_re.findall(r"ID=([^;\n]+)", txt))
+    for parent in set(_re.findall(r"Parent=([^;\n]+)", txt)):
+        assert parent in ids, (name, parent)
+print("goldset split + UTR routing OK")
 
 # render the offline browser
 out_html = viewer.render_offline_html(data, d / "browser.html",

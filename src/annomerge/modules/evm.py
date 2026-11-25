@@ -464,7 +464,8 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
             isoseq_gtf: Path | None = None,
             isoseq_tol_bp: int = 25,
             w_isoseq_transcript: int = 10,
-            w_isoseq_gold: int = 12) -> dict:
+            w_isoseq_gold: int = 12,
+            extra_protein=None) -> dict:
     """preds: {name: (gff3_path, evm_weight)} — already filtered by scoring.
 
     protein_set_weights: {label: weight} — when given with >1 entries, the
@@ -535,6 +536,28 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
         evidence["miniprot"] = miniprot_to_protein_gff(
             Path(miniprot_gff), d / "protein.gff3",
             membership=protein_membership if multi else None)
+    # extra protein evidence (match/match_part GFF) merged into the same
+    # PROTEIN alignments file; source name read from the GFF's column 2.
+    extra_prot_sources: list[tuple[str, int]] = []
+    for xp_path, xp_w in (extra_protein or []):
+        xp_src = None
+        with open(xp_path) as fh:
+            for line in fh:
+                if not line.startswith("#"):
+                    xp_src = line.split("\t")[1]
+                    break
+        if not xp_src:
+            continue
+        target = evidence.get("miniprot")
+        if target is None:
+            target = evidence["miniprot"] = d / "protein.gff3"
+            with open(target, "w") as out:
+                out.write("##gff-version 3\n")
+        with open(target, "a") as out, open(xp_path) as fh:
+            for line in fh:
+                if not line.startswith("#"):
+                    out.write(line)
+        extra_prot_sources.append((xp_src, xp_w))
     pred_files = {}
     for name, (gff, w) in preds.items():
         pred_files[name] = (rewrite_source(Path(gff), name, d / f"pred.{name}.gff3"), w)
@@ -557,6 +580,8 @@ def run_evm(vi, evm_dir: Path, preds: dict[str, tuple[Path, int]],
             lines.append(f"PROTEIN\tminiprot_{label}\t{w}")
     elif "miniprot" in evidence:
         lines.append(f"PROTEIN\tminiprot\t{w_protein}")
+    for xp_src, xp_w in extra_prot_sources:
+        lines.append(f"PROTEIN\t{xp_src}\t{xp_w}")
     wfile.write_text("\n".join(lines) + "\n")
     log.info("weights:\n%s", wfile.read_text().strip())
 
