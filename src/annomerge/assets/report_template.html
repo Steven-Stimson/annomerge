@@ -127,14 +127,14 @@
 
 <h3>2.1 RNA alignment</h3>
 {% if workflow.rna_align %}
-<p>Per-sample RNA alignment statistics. HISAT2 rates come from its log;
-pre-aligned BAM inputs are counted directly during junction extraction
-(secondary/supplementary records are excluded from primary-read counts):</p>
+<p>Per-sample RNA alignment statistics counted from each BAM during
+junction extraction (primary mapped / primary total; secondary and
+supplementary records are excluded from primary-read counts):</p>
 <div class="chart">{{ workflow.rna_chart }}</div>
 <table>
-  <tr><th>Sample</th><th>Aligner / input</th><th class="num">Primary reads</th><th class="num">Mapped reads</th><th class="num">Alignment rate</th></tr>
+  <tr><th>Sample</th><th>Aligner / input</th><th class="num">Primary reads</th><th class="num">Mapped reads</th><th class="num">Unmapped reads</th><th class="num">Alignment rate</th></tr>
   {% for r in workflow.rna_align %}
-  <tr><td>{{ r.sample }}</td><td>{{ r.aligner }}</td><td class="num">{% if r.total is defined %}{{ r.total }}{% else %}&mdash;{% endif %}</td><td class="num">{% if r.mapped is defined %}{{ r.mapped }}{% else %}&mdash;{% endif %}</td><td class="num">{{ "%.2f"|format(r.rate) }}%</td></tr>
+  <tr><td>{{ r.sample }}</td><td>{{ r.aligner }}</td><td class="num">{% if r.total is defined %}{{ r.total }}{% else %}&mdash;{% endif %}</td><td class="num">{% if r.mapped is defined %}{{ r.mapped }}{% else %}&mdash;{% endif %}</td><td class="num">{% if r.unmapped is defined %}{{ r.unmapped }}{% else %}&mdash;{% endif %}</td><td class="num">{{ "%.2f"|format(r.rate) }}%</td></tr>
   {% endfor %}
 </table>
 {% else %}

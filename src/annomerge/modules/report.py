@@ -19,7 +19,7 @@ import shutil
 from collections import Counter
 from pathlib import Path
 
-from ..utils import ensure_dir, env_bin_shell_prefix, lazy, run, tracker, which
+from ..utils import ToolError, ensure_dir, env_bin_shell_prefix, lazy, run, tracker, which
 from .sanity import _parse_gff3, _read_genome
 
 log = logging.getLogger("annomerge")
@@ -696,77 +696,43 @@ def svg_density_marginal(xs: list, ys: list, x_label: str, y_label: str,
 
 # ------------------------------------------------- workflow evidence figures
 def rna_alignment_stats(out: Path) -> list:
-    """Per-sample RNA alignment rate for report section 2.1.
+    """Read per-sample RNA alignment statistics written from each BAM.
 
-    HISAT2 samples: overall alignment rate parsed from
-    02.rnaseq/bam/<name>.hisat2.log. minimap2 samples (long-read /
-    transcripts / mix long-read side): the minimap2 log carries no rate,
-    so compute the PRIMARY alignment rate from the sorted BAM:
-    primary mapped / primary total. Supplementary and secondary records
-    are excluded from both counts (-F 2308 = -F unmapped,secondary,
-    supplementary; -F 2304 = -F secondary,supplementary) so split
-    long-read alignments cannot inflate the rate past 100%.
-    Rows: {sample, rate, aligner}. Missing samtools/BAM -> sample skipped.
+    run_rna_branch computes primary mapped / primary total during the same
+    scan used for junction extraction. This function never parses aligner
+    logs and never rescans a BAM. Legacy JSON files with total/rate remain
+    readable; new files provide sample/source/primary_total/alignment_rate.
     """
-    import json, shutil, subprocess
     rows = []
     bam_dir = Path(out) / "02.rnaseq" / "bam"
-    for logf in sorted(bam_dir.glob("*.hisat2.log")):
-        m = re.search(r"([\d.]+)% overall alignment rate",
-                      logf.read_text(errors="ignore"))
-        if m:
-            rows.append({"sample": logf.name.replace(".hisat2.log", ""),
-                         "rate": float(m.group(1)), "aligner": "hisat2"})
-    samtools = shutil.which("samtools")
-    for logf in sorted(bam_dir.glob("*.minimap2.log")):
-        name = logf.name.replace(".minimap2.log", "")
-        bam = bam_dir / f"{name}.sorted.bam"
-        if not samtools or not bam.exists():
-            log.info("rna alignment rate skipped for %s (%s)", name,
-                     "no samtools" if not samtools else "BAM not found")
-            continue
-        def _count(*flags):
-            p = subprocess.run([samtools, "view", "-c", *flags, str(bam)],
-                               capture_output=True, text=True)
-            return int(p.stdout.strip()) if p.returncode == 0 else None
-        mapped = _count("-F", "2308")     # primary + mapped
-        total = _count("-F", "2304")      # primary, all
-        if mapped is not None and total:
-            rows.append({"sample": name,
-                         "rate": round(100.0 * mapped / total, 2),
-                         "aligner": "minimap2"})
-        else:
-            log.info("rna alignment rate skipped for %s "
-                     "(samtools count failed or 0 reads)", name)
-    # Pre-aligned BAM inputs have no aligner log. run_rna_branch writes these
-    # JSON files during the existing junction scan; merge them here without
-    # re-scanning the BAM. The same records also add read counts to log-based
-    # rows when available.
-    by_sample = {r["sample"]: r for r in rows}
     for stats_file in sorted(bam_dir.glob("*.alignment.json")):
         try:
             stats = json.loads(stats_file.read_text())
         except (OSError, ValueError):
             log.warning("invalid RNA alignment stats: %s", stats_file)
             continue
-        name = stats_file.name.removesuffix(".alignment.json")
-        if name.endswith(".sorted"):
-            name = name[:-len(".sorted")]
-        total = stats.get("total")
+        fallback_name = stats_file.name.removesuffix(".alignment.json")
+        fallback_name = fallback_name.removesuffix(".sorted")
+        sample = stats.get("sample") or fallback_name
+        source = stats.get("source") or "BAM"
+        total = stats.get("primary_total", stats.get("total"))
         mapped = stats.get("mapped")
-        row = by_sample.get(name)
-        if row is None:
-            if not total or mapped is None:
-                continue
-            row = {"sample": name,
-                   "rate": round(100.0 * mapped / total, 2),
-                   "aligner": "pre-aligned BAM"}
-            rows.append(row)
-            by_sample[name] = row
-        for key in ("total", "mapped", "paired", "proper_pairs"):
-            if stats.get(key) is not None:
-                row[key] = stats[key]
-    return rows
+        unmapped = stats.get("unmapped")
+        if unmapped is None and total is not None and mapped is not None:
+            unmapped = total - mapped
+        rate = stats.get("alignment_rate", stats.get("rate"))
+        if rate is None and total and mapped is not None:
+            rate = round(100.0 * mapped / total, 2)
+        if total is None or mapped is None or rate is None:
+            log.warning("incomplete RNA alignment stats: %s", stats_file)
+            continue
+        row = {"sample": sample, "aligner": source,
+               "total": total, "mapped": mapped, "unmapped": unmapped,
+               "paired": stats.get("paired"),
+               "proper_pairs": stats.get("proper_pairs"),
+               "rate": rate}
+        rows.append(row)
+    return sorted(rows, key=lambda r: r["sample"])
 
 
 def _n_raw_queries(raw_paf: Path) -> int:
@@ -1191,38 +1157,149 @@ def _elapsed_str(start_iso: str, end_dt) -> str:
         return "n/a"
 
 
-def final_sequences(final_gff3: Path, genome_fa: Path, out_dir: Path) -> dict:
-    """09.result deliverables: annomerge.gff (full annotation),
-    annomerge.pep / annomerge.cds (ALL transcripts, ids = GFF transcript
-    ids which carry the .tN isoform suffix)."""
-    import shutil
-    res = {}
-    gff_out = Path(out_dir) / "annomerge.gff"
-    shutil.copy2(final_gff3, gff_out)
-    res["gff"] = gff_out
+def _extract_sequences(gff3: Path, genome_fa: Path, out_dir: Path,
+                       stem: str) -> dict:
+    """Run gffread and normalize FASTA headers to bare transcript IDs."""
+    out_dir = Path(out_dir)
     gffread = which("gffread")
-    tmp_pep = Path(out_dir) / ".annomerge.all.pep.fa"
-    tmp_cds = Path(out_dir) / ".annomerge.all.cds.fa"
-    run([gffread, "-y", str(tmp_pep), "-x", str(tmp_cds),
-         "-g", str(genome_fa), str(final_gff3)],
-        desc="gffread pep/cds extraction")
-    for tmp, name in ((tmp_pep, "annomerge.pep"), (tmp_cds, "annomerge.cds")):
-        out_fa = Path(out_dir) / name
+    tmp_pep = out_dir / f".{stem}.pep.fa"
+    tmp_cds = out_dir / f".{stem}.cds.fa"
+    cmd = [gffread, "-y", str(tmp_pep), "-x", str(tmp_cds),
+           "-g", str(genome_fa), str(gff3)]
+    log_file = out_dir / f"{stem}.gffread.log"
+    try:
+        run(cmd, log_file=log_file, cwd=out_dir,
+            desc=f"gffread pep/cds extraction ({stem})")
+    except ToolError:
+        # FASTA index creation on a read-only mount and transient filesystem
+        # errors can make the first invocation fail. Keep the log and allow
+        # exactly one retry; a persistent GFF/error still aborts the run.
+        log.warning("gffread failed for %s; retrying once (log: %s)",
+                    stem, log_file)
+        run(cmd, log_file=log_file, cwd=out_dir,
+            desc=f"gffread pep/cds extraction ({stem}, retry)")
+    counts = {}
+    for tmp, suffix in ((tmp_pep, "pep"), (tmp_cds, "cds")):
+        out_fa = out_dir / f"{stem}.{suffix}"
         n = 0
         with open(tmp) as fh, open(out_fa, "w") as out:
             for ln in fh:
                 if ln.startswith(">"):
-                    # normalize the header to the bare transcript id
                     rid = ln[1:].split()[0]
                     n += 1
                     out.write(f">{rid}\n")
                 else:
                     out.write(ln)
-        res[name.split(".", 1)[1]] = out_fa
-        log.info("%s: %d transcript sequences -> %s", name, n, out_fa)
+        counts[suffix] = n
+        log.info("%s: %d transcript sequences -> %s", out_fa.name, n, out_fa)
     tmp_pep.unlink(missing_ok=True)
     tmp_cds.unlink(missing_ok=True)
+    return counts
+
+
+def final_sequences(final_gff3: Path, genome_fa: Path, out_dir: Path) -> dict:
+    """09.result deliverables: complete GFF plus all-transcript CDS/PEP."""
+    import shutil
+    res = {}
+    gff_out = Path(out_dir) / "annomerge.gff"
+    shutil.copy2(final_gff3, gff_out)
+    res["gff"] = gff_out
+    _extract_sequences(final_gff3, genome_fa, Path(out_dir), "annomerge")
+    res["pep"] = Path(out_dir) / "annomerge.pep"
+    res["cds"] = Path(out_dir) / "annomerge.cds"
     return res
+
+
+def _gff_attr(attrs: str, key: str) -> str | None:
+    m = re.search(rf"(?:^|;){re.escape(key)}=([^;]+)", attrs)
+    return m.group(1) if m else None
+
+
+def _write_tier_gff(final_gff3: Path, out_gff: Path,
+                    tiers: set[str]) -> tuple[int, int]:
+    """Write selected transcripts and their complete GFF parent/child rows."""
+    selected_tids = set()
+    selected_genes = set()
+    with open(final_gff3) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 9 or f[2] not in ("mRNA", "transcript"):
+                continue
+            tier = _gff_attr(f[8], "Tier")
+            tid = _gff_attr(f[8], "ID")
+            if tier not in tiers or not tid:
+                continue
+            selected_tids.add(tid)
+            parents = _gff_attr(f[8], "Parent")
+            if parents:
+                selected_genes.update(parents.split(","))
+    with open(final_gff3) as src, open(out_gff, "w") as dst:
+        current_gene_keep = False
+        for line in src:
+            if line.startswith("#"):
+                dst.write(line)
+                continue
+            f = line.rstrip("\n").split("\t")
+            if len(f) < 9:
+                continue
+            feature, attrs = f[2], f[8]
+            if feature == "gene":
+                gid = _gff_attr(attrs, "ID")
+                current_gene_keep = gid in selected_genes
+                if current_gene_keep:
+                    dst.write(line)
+            elif feature in ("mRNA", "transcript"):
+                if _gff_attr(attrs, "ID") in selected_tids:
+                    dst.write(line)
+            else:
+                parents = _gff_attr(attrs, "Parent")
+                if parents and any(p in selected_tids or p in selected_genes
+                                   for p in parents.split(",")):
+                    dst.write(line)
+                elif not parents and current_gene_keep:
+                    dst.write(line)
+    return len(selected_genes), len(selected_tids)
+
+
+def tiered_sequences(final_gff3: Path, genome_fa: Path,
+                     out_dir: Path) -> list[dict]:
+    """Create strong, strong+moderate and weak-only GFF/CDS/PEP bundles."""
+    groups = (("strong", {"strong"}),
+              ("strong_moderate", {"strong", "moderate"}),
+              ("weak", {"weak"}))
+    root = ensure_dir(Path(out_dir) / "by_tier")
+    rows = []
+    for label, tiers in groups:
+        sub = ensure_dir(root / label)
+        stem = f"annomerge.{label}"
+        gff_out = sub / f"{stem}.gff"
+        n_genes, n_tx = _write_tier_gff(final_gff3, gff_out, tiers)
+        if n_tx:
+            counts = _extract_sequences(gff_out, genome_fa, sub, stem)
+        else:
+            counts = {"cds": 0, "pep": 0}
+            (sub / f"{stem}.cds").write_text("")
+            (sub / f"{stem}.pep").write_text("")
+        row = {"tier": label, "genes": n_genes, "transcripts": n_tx,
+               "cds_sequences": counts["cds"],
+               "pep_sequences": counts["pep"],
+               "gff": str(gff_out),
+               "cds": str(sub / f"{stem}.cds"),
+               "pep": str(sub / f"{stem}.pep")}
+        rows.append(row)
+        log.info("tier %s: %d genes, %d transcripts -> %s",
+                 label, n_genes, n_tx, sub)
+    manifest = root / "tier_deliverables.tsv"
+    with open(manifest, "w") as fh:
+        fh.write("tier\tgenes\ttranscripts\tcds_sequences\tpep_sequences\t"
+                 "gff\tcds\tpep\n")
+        for row in rows:
+            fh.write("\t".join(str(row[k]) for k in (
+                "tier", "genes", "transcripts", "cds_sequences",
+                "pep_sequences", "gff", "cds", "pep")) + "\n")
+    return rows
 
 
 def run_report(out: Path, final_gff3: Path, genome_fa: Path,
@@ -1318,6 +1395,7 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
     ctx["meta"]["finished_at"] = _end.isoformat(timespec="seconds")
     ctx["meta"]["elapsed"] = _elapsed_str(ctx["meta"].get("timestamp", ""), _end)
     final_sequences(final_gff3, genome_fa, d)
+    ctx["tier_deliverables"] = tiered_sequences(final_gff3, genome_fa, d)
     html = render_html(ctx, d / "report.html", None)
     with open(d / "stats.json", "w") as fh:
         json.dump(ctx, fh, ensure_ascii=False, indent=2)

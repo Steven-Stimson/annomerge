@@ -24,6 +24,7 @@ Outputs (under <outdir>/02.rnaseq/):
 from __future__ import annotations
 
 import logging
+import os
 import shlex
 import shutil
 from collections import defaultdict
@@ -131,24 +132,41 @@ def align_minimap2(sample, genome: Path, bam_dir: Path, threads: int,
     return bam
 
 
-def extract_junctions(bam: Path, out_bed: Path, min_reads: int = 1,
-                      stats_out: Path | None = None) -> Path:
-    """Extract splice junctions (CIGAR N blocks) with per-junction read counts.
+def _alignment_stats_complete(stats_out: Path | None) -> bool:
+    """True when a stats file exists with the current complete BAM schema."""
+    if stats_out is None:
+        return True
+    try:
+        import json
+        stats = json.loads(stats_out.read_text())
+    except (OSError, ValueError):
+        return False
+    required = {"sample", "source", "primary_total", "mapped", "unmapped",
+                "paired", "proper_pairs", "alignment_rate"}
+    return required.issubset(stats)
 
-    When stats_out is given, the same single BAM pass also records primary
-    total/mapped read counts for the report. This avoids a second whole-BAM
-    scan solely for RNA alignment statistics. Secondary/supplementary records
-    are excluded from both counts, so split long reads cannot inflate rates.
-    Strand: minimap2 splice alignments carry the ts tag (transcript strand);
-    everything else falls back to the alignment direction.
+
+def extract_junctions(bam: Path, out_bed: Path, min_reads: int = 1,
+                      stats_out: Path | None = None,
+                      sample: str | None = None,
+                      source: str = "BAM", hts_threads: int = 1) -> Path:
+    """Extract junctions and primary alignment counts in one BAM pass.
+
+    Secondary/supplementary records keep their original junction support but
+    are excluded from primary alignment counts. hts_threads controls BGZF
+    decompression only; the Python CIGAR loop uses one additional CPU thread.
+    Outputs are written to per-process temporary files and atomically renamed.
     """
-    cache = [out_bed] + ([stats_out] if stats_out is not None else [])
-    if lazy(cache, desc=f"junctions {bam.stem}"):
+    if lazy([out_bed], desc=f"junctions {bam.stem}") \
+            and _alignment_stats_complete(stats_out):
         return out_bed
     ensure_dir(out_bed.parent)
+    if stats_out is not None:
+        ensure_dir(stats_out.parent)
     counts: dict[tuple[str, int, int, str], int] = defaultdict(int)
     total = mapped = paired = proper = 0
-    with pysam.AlignmentFile(str(bam), "rb") as af:
+    with pysam.AlignmentFile(str(bam), "rb",
+                             threads=max(1, int(hts_threads))) as af:
         for read in af.fetch(until_eof=True):
             is_primary = not read.is_secondary and not read.is_supplementary
             if is_primary:
@@ -172,20 +190,92 @@ def extract_junctions(bam: Path, out_bed: Path, min_reads: int = 1,
                     pos += length
                 elif op == 2:  # D
                     pos += length
-    with open(out_bed, "w") as fh:
-        for (chrom, s, e, strand), n in sorted(counts.items()):
-            if n >= min_reads:
-                fh.write(f"{chrom}\t{s}\t{e}\t.\t{n}\t{strand}\n")
-    if stats_out is not None:
-        import json
-        stats_out.write_text(json.dumps({
-            "total": total, "mapped": mapped, "paired": paired,
-            "proper_pairs": proper,
-            "rate": round(100.0 * mapped / total, 2) if total else None,
-        }) + "\n")
-    tracker.note("splice junctions: %d (>= %d reads) from %s", sum(1 for v in counts.values() if v >= min_reads),
-             min_reads, bam.name)
+    tmp_bed = out_bed.with_name(f".{out_bed.name}.tmp.{os.getpid()}")
+    tmp_stats = (stats_out.with_name(f".{stats_out.name}.tmp.{os.getpid()}")
+                 if stats_out is not None else None)
+    try:
+        with open(tmp_bed, "w") as fh:
+            for (chrom, s, e, strand), n in sorted(counts.items()):
+                if n >= min_reads:
+                    fh.write(f"{chrom}\t{s}\t{e}\t.\t{n}\t{strand}\n")
+        if stats_out is not None:
+            import json
+            sample_name = sample or bam.stem.removesuffix(".sorted")
+            tmp_stats.write_text(json.dumps({
+                "sample": sample_name,
+                "source": source,
+                "primary_total": total,
+                "mapped": mapped,
+                "unmapped": total - mapped,
+                "paired": paired,
+                "proper_pairs": proper,
+                "alignment_rate": (round(100.0 * mapped / total, 2)
+                                   if total else None),
+            }) + "\n")
+        tmp_bed.replace(out_bed)
+        if tmp_stats is not None:
+            tmp_stats.replace(stats_out)
+    finally:
+        tmp_bed.unlink(missing_ok=True)
+        if tmp_stats is not None:
+            tmp_stats.unlink(missing_ok=True)
     return out_bed
+
+
+def _junction_worker(job: tuple) -> str:
+    """Pickle-safe ProcessPool worker for one BAM."""
+    bam, bed, stats, sample, source, hts_threads = job
+    return str(extract_junctions(
+        Path(bam), Path(bed), stats_out=Path(stats), sample=sample,
+        source=source, hts_threads=hts_threads))
+
+
+def scan_bams(bams: list[Path], bam_dir: Path,
+              bam_platform: dict, bam_source: dict,
+              threads: int) -> tuple[list[Path], dict]:
+    """Scan BAMs in parallel without exceeding the user's CPU budget.
+
+    One worker performs one Python CIGAR loop plus hts_threads decompression
+    workers. With 32 requested threads this gives 6 workers x 4 hts threads
+    for six BAMs, or 8 workers x 3 hts threads for seventeen BAMs.
+    """
+    jobs = []
+    bed_paths = {}
+    for bam in bams:
+        bed = bam_dir / (Path(bam).stem + ".junctions.bed")
+        stats = bam_dir / (Path(bam).stem + ".alignment.json")
+        bed_paths[bam] = bed
+        if lazy([bed], desc=f"junctions {Path(bam).stem}") \
+                and _alignment_stats_complete(stats):
+            continue
+        jobs.append((bam, bed, stats,
+                     Path(bam).stem.removesuffix(".sorted"),
+                     bam_source.get(bam, "BAM")))
+    if jobs:
+        threads = max(1, int(threads))
+        workers = min(len(jobs), max(1, threads // 2))
+        hts_threads = max(1, threads // workers - 1)
+        tracker.note("BAM scan: %d pending; workers=%d; "
+                     "htslib threads/worker=%d",
+                     len(jobs), workers, hts_threads)
+        if workers == 1:
+            for i, job in enumerate(jobs, 1):
+                _junction_worker((*job, hts_threads))
+                tracker.note("BAM scan %d/%d done: %s",
+                             i, len(jobs), job[3])
+        else:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                pending = {pool.submit(_junction_worker, (*job, hts_threads)): job
+                           for job in jobs}
+                for i, future in enumerate(as_completed(pending), 1):
+                    future.result()
+                    tracker.note("BAM scan %d/%d done: %s",
+                                 i, len(jobs), pending[future][3])
+    beds = [bed_paths[bam] for bam in bams]
+    bed_platform = {bed_paths[bam]: bam_platform.get(bam, "short")
+                    for bam in bams}
+    return beds, bed_platform
 
 
 def merge_junctions(beds: list[Path], out_bed: Path) -> Path:
@@ -352,6 +442,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
     short_cov_bams: list[Path] = []   # Illumina-only subset of coverage_bams
     isoseq_cov_bams: list[Path] = []  # long-read real-read subset (confidence L-metric)
     bam_platform: dict = {}           # bam path -> "short" | "isoseq" (junction pooling)
+    bam_source: dict = {}             # bam path -> hisat2/minimap2/pre-aligned BAM
     units: list[dict] = []
     idx = None
     # Pre-aligned BAM inputs bypass align_sample/align_minimap2, which used
@@ -371,6 +462,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
             coverage_bams.append(b)
             short_cov_bams.append(b)
             bam_platform[b] = "short"
+            bam_source[b] = "hisat2"
             units.append({"name": s.name, "bams": [b], "mode": "default",
                           "platform": "short"})
         elif s.use_minimap2:
@@ -379,6 +471,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                                extra_opts=minimap2_opts.for_target(s.name))
             bams.append(b)
             bam_platform[b] = "short" if s.tag == "transcripts" else "isoseq"
+            bam_source[b] = "minimap2"
             if s.tag == "transcripts":
                 # assembled transcripts: 1x coverage per isoform by nature —
                 # stringtie -L assembles nothing from them; use the default
@@ -408,6 +501,8 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
             isoseq_cov_bams.append(b2)  # ...but counts for the long-read metric
             bam_platform[b1] = "short"
             bam_platform[b2] = "isoseq"
+            bam_source[b1] = "hisat2"
+            bam_source[b2] = "minimap2"
             units.append({"name": s.name, "bams": [b1, b2], "mode": "mix",
                           "platform": "short"})
 
@@ -419,6 +514,8 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
             isoseq_cov_bams.append(s.files[1])
             bam_platform[s.files[0]] = "short"
             bam_platform[s.files[1]] = "isoseq"
+            bam_source[s.files[0]] = "pre-aligned BAM"
+            bam_source[s.files[1]] = "pre-aligned BAM"
             units.append({"name": s.name, "bams": list(s.files), "mode": "mix",
                           "platform": "short"})
         else:
@@ -426,6 +523,7 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
             coverage_bams.append(s.files[0])
             is_lr = s.stringtie_longread
             bam_platform[s.files[0]] = "isoseq" if is_lr else "short"
+            bam_source[s.files[0]] = "pre-aligned BAM"
             if is_lr:
                 isoseq_cov_bams.append(s.files[0])
             else:
@@ -437,15 +535,8 @@ def run_rna_branch(vi: ValidatedInputs, out_dir: Path, threads: int,
                           "platform": "isoseq" if is_lr else "short",
                           "lr_preset": "splice" if is_lr else None})
 
-    beds = []
-    bed_platform: dict = {}
-    for bam in bams:
-        stats_path = bam_dir / (Path(bam).stem + ".alignment.json")
-        bed = extract_junctions(
-            bam, bam_dir / (Path(bam).stem + ".junctions.bed"),
-            stats_out=stats_path)
-        beds.append(bed)
-        bed_platform[bed] = bam_platform.get(bam, "short")
+    beds, bed_platform = scan_bams(
+        bams, bam_dir, bam_platform, bam_source, threads)
     merged_bed = merge_junctions(beds, rdir / "junctions.bed") if beds else None
     # per-platform junction DBs for the dual-metric confidence support
     # (S8): junction existence is also platform evidence — a long read
