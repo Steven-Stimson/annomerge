@@ -141,8 +141,10 @@ def _alignment_stats_complete(stats_out: Path | None) -> bool:
         stats = json.loads(stats_out.read_text())
     except (OSError, ValueError):
         return False
-    required = {"sample", "source", "primary_total", "mapped", "unmapped",
-                "paired", "proper_pairs", "alignment_rate"}
+    required = {"sample_name", "alignment_source", "primary_reads_total",
+                "primary_reads_mapped", "primary_reads_unmapped",
+                "primary_reads_paired", "primary_reads_properly_paired",
+                "primary_alignment_rate_pct"}
     return required.issubset(stats)
 
 
@@ -202,15 +204,15 @@ def extract_junctions(bam: Path, out_bed: Path, min_reads: int = 1,
             import json
             sample_name = sample or bam.stem.removesuffix(".sorted")
             tmp_stats.write_text(json.dumps({
-                "sample": sample_name,
-                "source": source,
-                "primary_total": total,
-                "mapped": mapped,
-                "unmapped": total - mapped,
-                "paired": paired,
-                "proper_pairs": proper,
-                "alignment_rate": (round(100.0 * mapped / total, 2)
-                                   if total else None),
+                "sample_name": sample_name,
+                "alignment_source": source,
+                "primary_reads_total": total,
+                "primary_reads_mapped": mapped,
+                "primary_reads_unmapped": total - mapped,
+                "primary_reads_paired": paired,
+                "primary_reads_properly_paired": proper,
+                "primary_alignment_rate_pct": (
+                    round(100.0 * mapped / total, 2) if total else None),
             }) + "\n")
         tmp_bed.replace(out_bed)
         if tmp_stats is not None:

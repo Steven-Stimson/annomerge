@@ -8,29 +8,46 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from annomerge.modules.report import rna_alignment_stats  # noqa: E402
+from annomerge.modules.report import render_html, rna_alignment_stats  # noqa: E402
 
 
 class RnaAlignmentReportTests(unittest.TestCase):
-    def test_prealigned_bam_stats_are_merged_into_report(self):
+    def test_current_schema_renders_every_metric_in_html(self):
         with tempfile.TemporaryDirectory(prefix="annomerge_rna_report_") as tmp:
             bam_dir = Path(tmp) / "02.rnaseq" / "bam"
             bam_dir.mkdir(parents=True)
             (bam_dir / "sample.sorted.alignment.json").write_text(json.dumps({
-                "sample": "sample", "source": "pre-aligned BAM",
-                "primary_total": 1000, "mapped": 957, "unmapped": 43,
-                "paired": 1000, "proper_pairs": 940,
-                "alignment_rate": 95.7,
+                "sample_name": "sample", "alignment_source": "pre-aligned BAM",
+                "primary_reads_total": 1000, "primary_reads_mapped": 957,
+                "primary_reads_unmapped": 43, "primary_reads_paired": 1000,
+                "primary_reads_properly_paired": 940,
+                "primary_alignment_rate_pct": 95.7,
             }))
             rows = rna_alignment_stats(Path(tmp))
             self.assertEqual(rows, [{
-                "sample": "sample", "rate": 95.7,
-                "aligner": "pre-aligned BAM",
-                "total": 1000, "mapped": 957, "unmapped": 43,
-                "paired": 1000, "proper_pairs": 940,
+                "sample_name": "sample", "alignment_source": "pre-aligned BAM",
+                "primary_reads_total": 1000, "primary_reads_mapped": 957,
+                "primary_reads_unmapped": 43, "primary_reads_paired": 1000,
+                "primary_reads_properly_paired": 940,
+                "primary_alignment_rate_pct": 95.7,
             }])
+            report = Path(tmp) / "report.html"
+            render_html({"workflow": {"rna_align": rows,
+                                      "protein": {"n_mapped": 0},
+                                      "goldset": {}},
+                         "versions": {"rows": []}}, report)
+            html = report.read_text()
+            for heading in ("Alignment source", "Primary reads total",
+                            "Primary reads mapped", "Primary reads unmapped",
+                            "Primary paired reads", "Properly paired primary reads",
+                            "Primary alignment rate"):
+                self.assertIn(heading, html)
+            self.assertIn('<td class="num">1000</td>', html)
+            self.assertIn('<td class="num">940</td>', html)
+            self.assertIn('<td class="num">95.70%</td>', html)
+            self.assertIn("not the number of read-pair fragments", html)
 
-    def test_hisat2_log_rate_is_ignored(self):
+    def test_previous_schema_is_mapped_and_hisat2_log_rate_ignored(self):
         with tempfile.TemporaryDirectory(prefix="annomerge_rna_report_") as tmp:
             bam_dir = Path(tmp) / "02.rnaseq" / "bam"
             bam_dir.mkdir(parents=True)
@@ -42,16 +59,15 @@ class RnaAlignmentReportTests(unittest.TestCase):
                 "paired": 200, "proper_pairs": 188,
                 "alignment_rate": 95.5,
             }))
-            rows = rna_alignment_stats(Path(tmp))
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["aligner"], "hisat2")
-            self.assertEqual(rows[0]["rate"], 95.5)
-            self.assertEqual(rows[0]["total"], 200)
-            self.assertEqual(rows[0]["mapped"], 191)
-            self.assertEqual(rows[0]["unmapped"], 9)
-            self.assertEqual(rows[0]["proper_pairs"], 188)
+            row = rna_alignment_stats(Path(tmp))[0]
+            self.assertEqual(row["alignment_source"], "hisat2")
+            self.assertEqual(row["primary_alignment_rate_pct"], 95.5)
+            self.assertEqual(row["primary_reads_total"], 200)
+            self.assertEqual(row["primary_reads_mapped"], 191)
+            self.assertEqual(row["primary_reads_unmapped"], 9)
+            self.assertEqual(row["primary_reads_properly_paired"], 188)
 
-    def test_legacy_json_needs_no_minimap2_log_or_bam_rescan(self):
+    def test_oldest_json_needs_no_minimap2_log_or_bam_rescan(self):
         with tempfile.TemporaryDirectory(prefix="annomerge_rna_report_") as tmp:
             bam_dir = Path(tmp) / "02.rnaseq" / "bam"
             bam_dir.mkdir(parents=True)
@@ -62,9 +78,11 @@ class RnaAlignmentReportTests(unittest.TestCase):
             }))
             rows = rna_alignment_stats(Path(tmp))
             self.assertEqual(rows, [{
-                "sample": "sample", "rate": 90.0, "aligner": "BAM",
-                "total": 100, "mapped": 90, "unmapped": 10,
-                "paired": 0, "proper_pairs": 0,
+                "sample_name": "sample", "alignment_source": "BAM",
+                "primary_reads_total": 100, "primary_reads_mapped": 90,
+                "primary_reads_unmapped": 10, "primary_reads_paired": 0,
+                "primary_reads_properly_paired": 0,
+                "primary_alignment_rate_pct": 90.0,
             }])
 
 

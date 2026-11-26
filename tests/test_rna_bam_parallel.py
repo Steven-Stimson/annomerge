@@ -74,13 +74,13 @@ class ParallelBamScanTests(unittest.TestCase):
                     stats_path = out_dir / bed.name.replace(
                         ".junctions.bed", ".alignment.json")
                     stats = json.loads(stats_path.read_text())
-                    self.assertEqual(stats["source"], "pre-aligned BAM")
-                    self.assertEqual(stats["primary_total"], 2)
-                    self.assertEqual(stats["mapped"], 1)
-                    self.assertEqual(stats["unmapped"], 1)
-                    self.assertEqual(stats["paired"], 1)
-                    self.assertEqual(stats["proper_pairs"], 1)
-                    self.assertEqual(stats["alignment_rate"], 50.0)
+                    self.assertEqual(stats["alignment_source"], "pre-aligned BAM")
+                    self.assertEqual(stats["primary_reads_total"], 2)
+                    self.assertEqual(stats["primary_reads_mapped"], 1)
+                    self.assertEqual(stats["primary_reads_unmapped"], 1)
+                    self.assertEqual(stats["primary_reads_paired"], 1)
+                    self.assertEqual(stats["primary_reads_properly_paired"], 1)
+                    self.assertEqual(stats["primary_alignment_rate_pct"], 50.0)
                 self.assertFalse(list(out_dir.glob("*.tmp.*")))
             for serial, parallel in zip(outputs[1], outputs[4]):
                 self.assertEqual(serial.read_bytes(), parallel.read_bytes())
@@ -98,9 +98,9 @@ class ParallelBamScanTests(unittest.TestCase):
             legacy.write_text(json.dumps({"total": 2, "mapped": 1, "rate": 50.0}))
             scan_bams(bams, root / "out4", platform, source, 4)
             upgraded = json.loads(legacy.read_text())
-            self.assertIn("sample", upgraded)
-            self.assertIn("unmapped", upgraded)
-            self.assertIn("alignment_rate", upgraded)
+            self.assertIn("sample_name", upgraded)
+            self.assertIn("primary_reads_unmapped", upgraded)
+            self.assertIn("primary_alignment_rate_pct", upgraded)
 
 
 if __name__ == "__main__":

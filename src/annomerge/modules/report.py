@@ -696,12 +696,11 @@ def svg_density_marginal(xs: list, ys: list, x_label: str, y_label: str,
 
 # ------------------------------------------------- workflow evidence figures
 def rna_alignment_stats(out: Path) -> list:
-    """Read per-sample RNA alignment statistics written from each BAM.
+    """Return explicitly named, read-level RNA BAM alignment metrics.
 
-    run_rna_branch computes primary mapped / primary total during the same
-    scan used for junction extraction. This function never parses aligner
-    logs and never rescans a BAM. Legacy JSON files with total/rate remain
-    readable; new files provide sample/source/primary_total/alignment_rate.
+    The BAM scan is the only source of new statistics. All three previous
+    JSON schemas remain readable for report regeneration, but the context
+    emitted here uses only the unambiguous current field names.
     """
     rows = []
     bam_dir = Path(out) / "02.rnaseq" / "bam"
@@ -713,26 +712,36 @@ def rna_alignment_stats(out: Path) -> list:
             continue
         fallback_name = stats_file.name.removesuffix(".alignment.json")
         fallback_name = fallback_name.removesuffix(".sorted")
-        sample = stats.get("sample") or fallback_name
-        source = stats.get("source") or "BAM"
-        total = stats.get("primary_total", stats.get("total"))
-        mapped = stats.get("mapped")
-        unmapped = stats.get("unmapped")
+        sample = stats.get("sample_name") or stats.get("sample") or fallback_name
+        source = (stats.get("alignment_source") or stats.get("source")
+                  or stats.get("aligner") or "BAM")
+        total = stats.get("primary_reads_total",
+                          stats.get("primary_total", stats.get("total")))
+        mapped = stats.get("primary_reads_mapped", stats.get("mapped"))
+        unmapped = stats.get("primary_reads_unmapped", stats.get("unmapped"))
         if unmapped is None and total is not None and mapped is not None:
             unmapped = total - mapped
-        rate = stats.get("alignment_rate", stats.get("rate"))
+        paired = stats.get("primary_reads_paired", stats.get("paired"))
+        proper = stats.get("primary_reads_properly_paired",
+                           stats.get("proper_pairs"))
+        rate = stats.get("primary_alignment_rate_pct",
+                         stats.get("alignment_rate", stats.get("rate")))
         if rate is None and total and mapped is not None:
             rate = round(100.0 * mapped / total, 2)
         if total is None or mapped is None or rate is None:
             log.warning("incomplete RNA alignment stats: %s", stats_file)
             continue
-        row = {"sample": sample, "aligner": source,
-               "total": total, "mapped": mapped, "unmapped": unmapped,
-               "paired": stats.get("paired"),
-               "proper_pairs": stats.get("proper_pairs"),
-               "rate": rate}
-        rows.append(row)
-    return sorted(rows, key=lambda r: r["sample"])
+        rows.append({
+            "sample_name": sample,
+            "alignment_source": source,
+            "primary_reads_total": total,
+            "primary_reads_mapped": mapped,
+            "primary_reads_unmapped": unmapped,
+            "primary_reads_paired": paired,
+            "primary_reads_properly_paired": proper,
+            "primary_alignment_rate_pct": rate,
+        })
+    return sorted(rows, key=lambda r: r["sample_name"])
 
 
 def _n_raw_queries(raw_paf: Path) -> int:
@@ -1350,9 +1359,9 @@ def run_report(out: Path, final_gff3: Path, genome_fa: Path,
     }
     from markupsafe import Markup
     wf["rna_chart"] = Markup(svg_bars(
-        [(r["sample"] if r.get("aligner") == "hisat2"
-          else f"{r['sample']} ({r.get('aligner', '?')})",
-          r["rate"]) for r in wf["rna_align"]]))
+        [(r["sample_name"] if r.get("alignment_source") == "hisat2"
+          else f"{r['sample_name']} ({r.get('alignment_source', '?')})",
+          r["primary_alignment_rate_pct"]) for r in wf["rna_align"]]))
     wf["qcov_hist"] = Markup(svg_histogram(
         wf["protein"].get("qcov") or [], title="Query coverage (fraction of protein aligned)"))
     wf["ident_hist"] = Markup(svg_histogram(

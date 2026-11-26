@@ -132,11 +132,12 @@ junction extraction (primary mapped / primary total; secondary and
 supplementary records are excluded from primary-read counts):</p>
 <div class="chart">{{ workflow.rna_chart }}</div>
 <table>
-  <tr><th>Sample</th><th>Aligner / input</th><th class="num">Primary reads</th><th class="num">Mapped reads</th><th class="num">Unmapped reads</th><th class="num">Alignment rate</th></tr>
+  <tr><th>Sample</th><th>Alignment source</th><th class="num">Primary reads total</th><th class="num">Primary reads mapped</th><th class="num">Primary reads unmapped</th><th class="num">Primary paired reads</th><th class="num">Properly paired primary reads</th><th class="num">Primary alignment rate</th></tr>
   {% for r in workflow.rna_align %}
-  <tr><td>{{ r.sample }}</td><td>{{ r.aligner }}</td><td class="num">{% if r.total is defined %}{{ r.total }}{% else %}&mdash;{% endif %}</td><td class="num">{% if r.mapped is defined %}{{ r.mapped }}{% else %}&mdash;{% endif %}</td><td class="num">{% if r.unmapped is defined %}{{ r.unmapped }}{% else %}&mdash;{% endif %}</td><td class="num">{{ "%.2f"|format(r.rate) }}%</td></tr>
+  <tr><td>{{ r.sample_name }}</td><td>{{ r.alignment_source }}</td><td class="num">{{ r.primary_reads_total }}</td><td class="num">{{ r.primary_reads_mapped }}</td><td class="num">{{ r.primary_reads_unmapped }}</td><td class="num">{% if r.primary_reads_paired is not none %}{{ r.primary_reads_paired }}{% else %}&mdash;{% endif %}</td><td class="num">{% if r.primary_reads_properly_paired is not none %}{{ r.primary_reads_properly_paired }}{% else %}&mdash;{% endif %}</td><td class="num">{{ "%.2f"|format(r.primary_alignment_rate_pct) }}%</td></tr>
   {% endfor %}
 </table>
+<p class="note">All counts are read-level primary-record counts. Properly paired primary reads counts reads carrying the aligner&apos;s proper-pair flag, not the number of read-pair fragments.</p>
 {% else %}
 <p class="note">No RNA alignment statistics available.</p>
 {% endif %}

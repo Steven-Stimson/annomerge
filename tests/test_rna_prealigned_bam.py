@@ -73,9 +73,11 @@ class PrealignedBamTests(unittest.TestCase):
                              "chr1\t149\t249\t1\t2\t+\n")
             stats = json.loads((bam_dir / "sample.sorted.alignment.json").read_text())
             self.assertEqual(stats, {
-                "sample": "sample", "source": "pre-aligned BAM",
-                "primary_total": 1, "mapped": 1, "unmapped": 0,
-                "paired": 0, "proper_pairs": 0, "alignment_rate": 100.0,
+                "sample_name": "sample", "alignment_source": "pre-aligned BAM",
+                "primary_reads_total": 1, "primary_reads_mapped": 1,
+                "primary_reads_unmapped": 0, "primary_reads_paired": 0,
+                "primary_reads_properly_paired": 0,
+                "primary_alignment_rate_pct": 100.0,
             })
             self.assertIsNone(result["junctions_isoseq_bed"])
 
