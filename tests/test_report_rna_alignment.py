@@ -8,11 +8,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from annomerge.modules.report import render_html, rna_alignment_stats  # noqa: E402
+from markupsafe import Markup  # noqa: E402
+from annomerge.modules.report import (render_html, rna_alignment_stats,  # noqa: E402
+                                      svg_bars)
 
 
 class RnaAlignmentReportTests(unittest.TestCase):
-    def test_current_schema_renders_every_metric_in_html(self):
+    def test_current_schema_keeps_metrics_but_renders_only_rate_chart(self):
         with tempfile.TemporaryDirectory(prefix="annomerge_rna_report_") as tmp:
             bam_dir = Path(tmp) / "02.rnaseq" / "bam"
             bam_dir.mkdir(parents=True)
@@ -32,20 +34,21 @@ class RnaAlignmentReportTests(unittest.TestCase):
                 "primary_alignment_rate_pct": 95.7,
             }])
             report = Path(tmp) / "report.html"
-            render_html({"workflow": {"rna_align": rows,
+            chart = Markup(svg_bars([
+                ("sample (pre-aligned BAM)", rows[0]["primary_alignment_rate_pct"])
+            ]))
+            render_html({"workflow": {"rna_align": rows, "rna_chart": chart,
                                       "protein": {"n_mapped": 0},
                                       "goldset": {}},
                          "versions": {"rows": []}}, report)
             html = report.read_text()
-            for heading in ("Alignment source", "Primary reads total",
-                            "Primary reads mapped", "Primary reads unmapped",
-                            "Primary paired reads", "Properly paired primary reads",
-                            "Primary alignment rate"):
-                self.assertIn(heading, html)
-            self.assertIn('<td class="num">1000</td>', html)
-            self.assertIn('<td class="num">940</td>', html)
-            self.assertIn('<td class="num">95.70%</td>', html)
-            self.assertIn("not the number of read-pair fragments", html)
+            section = html.split('<h3>2.1 RNA alignment</h3>', 1)[1].split(
+                '<h3>2.2 Homolog protein alignment</h3>', 1)[0]
+            self.assertIn("<svg", section)
+            self.assertIn("95.7%", section)
+            self.assertNotIn("<table", section)
+            self.assertNotIn("Properly paired primary reads", section)
+            self.assertNotIn("read-pair fragments", section)
 
     def test_previous_schema_is_mapped_and_hisat2_log_rate_ignored(self):
         with tempfile.TemporaryDirectory(prefix="annomerge_rna_report_") as tmp:
